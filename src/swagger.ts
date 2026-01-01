@@ -14,7 +14,7 @@ export const setupSwagger = (app: Express) => {
       },
       servers: [
         {
-          url: "http://localhost:5000",
+          url: "https://gaznger-backend.onrender.com",
         },
       ],
     },
