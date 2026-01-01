@@ -69,3 +69,4 @@ router.post("/image", upload.single("image"), async (req, res) => {
     }
 });
 exports.default = router;
+//# sourceMappingURL=upload.js.map

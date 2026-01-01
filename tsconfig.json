@@ -9,13 +9,9 @@
     "strict": true,
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "sourceMap": true
   },
-  "include": [
-    "src/index.ts",
-    "src/routes",
-    "src/models",
-    "src/swagger.ts",
-    "src/types/**/*.d.ts"
-  ]
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
 }

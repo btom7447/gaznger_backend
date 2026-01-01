@@ -46,3 +46,4 @@ const AddressSchema = new mongoose_1.Schema({
     longitude: { type: Number, default: 0 },
 }, { timestamps: true });
 exports.default = mongoose_1.default.model("Address", AddressSchema);
+//# sourceMappingURL=Address.js.map

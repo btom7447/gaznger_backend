@@ -66,3 +66,4 @@ const sendPushNotification = async (deviceTokens, title, body) => {
     }
 };
 exports.sendPushNotification = sendPushNotification;
+//# sourceMappingURL=push.js.map

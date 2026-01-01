@@ -63,3 +63,4 @@ router.post("/send", async (req, res) => {
     }
 });
 exports.default = router;
+//# sourceMappingURL=notifications.js.map

@@ -42,3 +42,4 @@ const RatingSchema = new mongoose_1.Schema({
     comment: { type: String },
 }, { timestamps: true });
 exports.default = mongoose_1.default.model("Rating", RatingSchema);
+//# sourceMappingURL=Rating.js.map

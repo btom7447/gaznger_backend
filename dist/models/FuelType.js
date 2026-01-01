@@ -40,3 +40,4 @@ const FuelTypeSchema = new mongoose_1.Schema({
     pricePerUnit: { type: Number, required: true },
 }, { timestamps: true });
 exports.default = mongoose_1.default.model("FuelType", FuelTypeSchema);
+//# sourceMappingURL=FuelType.js.map

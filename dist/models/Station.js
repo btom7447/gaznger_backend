@@ -53,3 +53,4 @@ const GasStationSchema = new mongoose_1.Schema({
     verified: { type: Boolean, default: false },
 }, { timestamps: true });
 exports.default = mongoose_1.default.model("GasStation", GasStationSchema);
+//# sourceMappingURL=Station.js.map

@@ -21,3 +21,4 @@ app.use("/api/upload", upload_1.default);
 // Swagger docs
 (0, swagger_1.setupSwagger)(app);
 exports.default = app;
+//# sourceMappingURL=app.js.map

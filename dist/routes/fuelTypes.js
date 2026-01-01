@@ -114,3 +114,4 @@ router.post("/", async (req, res) => {
     }
 });
 exports.default = router;
+//# sourceMappingURL=fuelTypes.js.map

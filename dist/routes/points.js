@@ -121,3 +121,4 @@ router.patch("/:userId", async (req, res) => {
     }
 });
 exports.default = router;
+//# sourceMappingURL=points.js.map
