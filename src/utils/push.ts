@@ -28,8 +28,8 @@ export const sendPushNotification = async (
 
   try {
     // ⚡ Type assertion fixes TS error
-    const messaging = admin.messaging() as admin.messaging.Messaging;
-    const response = await messaging.sendMulticast(message);
+  const messaging = admin.messaging() as any;
+  const response = await messaging.sendMulticast(message);
 
     console.log(`Push notification sent: ${response.successCount} success`);
   } catch (err) {
