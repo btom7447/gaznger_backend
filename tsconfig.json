@@ -12,6 +12,7 @@
     "skipLibCheck": true
   },
   "include": [
+    "src/index.ts",
     "src/routes",
     "src/models",
     "src/swagger.ts",
