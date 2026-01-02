@@ -4,6 +4,7 @@ import RefreshToken from "../models/RefreshToken";
 import { hashPassword, comparePassword } from "../utils/hash";
 import { signAccessToken, signRefreshToken } from "../utils/jwt";
 import jwt from "jsonwebtoken";
+import { sendOtpEmail } from "../utils/email";
 
 const router = Router();
 
@@ -66,14 +67,13 @@ const saveRefreshToken = async (userId: string, token: string) => {
 // ===================== REGISTER =====================
 router.post("/register", async (req, res) => {
   try {
-    const { email, phone, password, displayName, profileImage, gender } =
-      req.body;
+    const { email, phone, password, displayName, profileImage, gender } = req.body;
 
     // Check if user already exists
     const existing = await User.findOne({ email });
-    if (existing)
-      return res.status(400).json({ message: "Email already in use" });
+    if (existing) return res.status(400).json({ message: "Email already in use" });
 
+    // Hash the password
     const passwordHash = await hashPassword(password);
 
     // Create user
@@ -82,19 +82,36 @@ router.post("/register", async (req, res) => {
       phone: phone || "",
       passwordHash,
       displayName: displayName || "Guest",
-      gender: gender || "male", // model default is also male, this ensures TypeScript sees it
-      // profileImage will automatically use the schema default function
+      gender: gender || "male", // ensures TypeScript sees it
       profileImage,
+      isVerified: false, // user not verified yet
     });
 
-    const userIdStr = user._id.toString();
+    // Generate 5-digit OTP
+    const otp = Math.floor(10000 + Math.random() * 90000).toString(); // e.g., "54321"
+    const otpExpiry = new Date();
+    otpExpiry.setMinutes(otpExpiry.getMinutes() + 10); // expires in 10 mins
 
+    user.otpCode = otp;
+    user.otpExpiresAt = otpExpiry;
+    await user.save();
+
+    // Send OTP email
+    await sendOtpEmail(user.email, otp);
+
+    // Generate tokens
+    const userIdStr = user._id.toString();
     const accessToken = signAccessToken({ id: userIdStr });
     const refreshToken = signRefreshToken({ id: userIdStr });
-
     await saveRefreshToken(userIdStr, refreshToken);
 
-    res.status(201).json({ user, accessToken, refreshToken });
+    // Send response
+    res.status(201).json({
+      message: "User registered successfully. Please verify your email.",
+      user: { email: user.email, displayName: user.displayName },
+      accessToken,
+      refreshToken,
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err });
@@ -140,6 +157,9 @@ router.post("/login", async (req, res) => {
     const isMatch = await comparePassword(password, user.passwordHash);
     if (!isMatch)
       return res.status(400).json({ message: "Invalid credentials" });
+
+    if (!user.isVerified)
+      return res.status(401).json({ message: "Email not verified" });
 
     const userIdStr = user._id.toString();
 

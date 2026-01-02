@@ -12,6 +12,11 @@ export interface IUser extends Document {
   deviceTokens: string[];
   createdAt: Date;
   updatedAt: Date;
+
+  // Add OTP and verification fields
+  otpCode?: string;
+  otpExpiresAt?: Date;
+  isVerified?: boolean;
 }
 
 // Default profile images
@@ -34,6 +39,11 @@ const UserSchema: Schema<IUser> = new Schema(
     addressBook: [{ type: Schema.Types.ObjectId, ref: "Address" }],
     points: { type: Number, default: 0 },
     deviceTokens: { type: [String], default: [] },
+
+    // OTP and verification
+    otpCode: { type: String },
+    otpExpiresAt: { type: Date },
+    isVerified: { type: Boolean, default: false },
   },
   { timestamps: true }
 );
