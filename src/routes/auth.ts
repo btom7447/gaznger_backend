@@ -149,23 +149,58 @@ router.post("/register", async (req, res) => {
  *       500:
  *         description: Server error
  */
+// ===================== VERIFY OTP =====================
 router.post("/verify-otp", async (req, res) => {
-  const { email, otp } = req.body;
-  const user = await User.findOne({ email });
-  if (!user) return res.status(400).json({ message: "User not found" });
+  try {
+    const { email, otp } = req.body;
 
-  if (!user.otpCode || !user.otpExpiresAt || new Date() > user.otpExpiresAt)
-    return res.status(400).json({ message: "OTP expired" });
+    if (!email || !otp) {
+      return res.status(400).json({
+        message: "Email and OTP are required",
+      });
+    }
 
-  if (user.otpCode !== otp)
-    return res.status(400).json({ message: "Invalid OTP" });
+    const user = await User.findOne({ email });
 
-  user.isVerified = true;
-  user.otpCode = undefined;
-  user.otpExpiresAt = undefined;
-  await user.save();
+    if (!user) {
+      return res.status(400).json({
+        message: "User not found",
+      });
+    }
 
-  res.json({ message: "Email verified successfully" });
+    if (!user.otpCode || !user.otpExpiresAt) {
+      return res.status(400).json({
+        message: "No OTP found. Please request a new one.",
+      });
+    }
+
+    if (new Date() > user.otpExpiresAt) {
+      return res.status(400).json({
+        message: "OTP expired. Please request a new one.",
+      });
+    }
+
+    if (user.otpCode !== otp) {
+      return res.status(400).json({
+        message: "Invalid OTP",
+      });
+    }
+
+    // Mark user as verified
+    user.isVerified = true;
+    user.otpCode = undefined;
+    user.otpExpiresAt = undefined;
+    await user.save();
+
+    return res.status(200).json({
+      message: "Email verified successfully",
+    });
+  } catch (err) {
+    console.error("VERIFY OTP ERROR:", err);
+    return res.status(500).json({
+      message: "Failed to verify OTP",
+    });
+  }
 });
 
 // ===================== RESEND OTP =====================
@@ -195,20 +230,51 @@ router.post("/verify-otp", async (req, res) => {
  *       500:
  *         description: Server error
  */
+// ===================== RESEND OTP =====================
 router.post("/resend-otp", async (req, res) => {
-  const { email } = req.body;
-  const user = await User.findOne({ email });
-  if (!user) return res.status(400).json({ message: "User not found" });
+  try {
+    const { email } = req.body;
 
-  const otp = Math.floor(10000 + Math.random() * 90000).toString();
-  user.otpCode = otp;
-  user.otpExpiresAt = new Date(Date.now() + 10 * 60 * 1000);
-  await user.save();
+    if (!email) {
+      return res.status(400).json({
+        message: "Email is required",
+      });
+    }
 
-  await sendOtpEmail(user.email, otp);
+    const user = await User.findOne({ email });
 
-  res.json({ message: "OTP resent successfully" });
+    if (!user) {
+      return res.status(400).json({
+        message: "User not found",
+      });
+    }
+
+    if (user.isVerified) {
+      return res.status(400).json({
+        message: "User is already verified",
+      });
+    }
+
+    // Generate new OTP
+    const otp = Math.floor(10000 + Math.random() * 90000).toString();
+
+    user.otpCode = otp;
+    user.otpExpiresAt = new Date(Date.now() + 10 * 60 * 1000);
+    await user.save();
+
+    await sendOtpEmail(user.email, otp);
+
+    return res.status(200).json({
+      message: "OTP resent successfully",
+    });
+  } catch (err) {
+    console.error("RESEND OTP ERROR:", err);
+    return res.status(500).json({
+      message: "Failed to resend OTP",
+    });
+  }
 });
+
 
 // ===================== LOGIN =====================
 /**
