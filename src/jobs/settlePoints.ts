@@ -16,10 +16,11 @@ export async function settlePendingPoints() {
 
     user.points += point.change;
     if (user.points < 0) user.points = 0;
-
     await user.save();
 
     point.settled = true;
     await point.save();
   }
+
+  console.log(`Settled ${pointsToSettle.length} points`);
 }

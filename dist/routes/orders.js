@@ -8,13 +8,42 @@ const Order_1 = __importDefault(require("../models/Order"));
 const Station_1 = __importDefault(require("../models/Station"));
 const FuelType_1 = __importDefault(require("../models/FuelType"));
 const Rating_1 = __importDefault(require("../models/Rating"));
+const User_1 = __importDefault(require("../models/User"));
+const Point_1 = __importDefault(require("../models/Point"));
 const router = (0, express_1.Router)();
 /**
- * @swagger
- * tags:
- *   name: Orders
- *   description: Order management
+ * Load points per task from environment variables
+ * Fallbacks provided if not set
  */
+const POINTS_CONFIG = {
+    orderPlaced: Number(process.env.POINTS_ORDER_PLACED),
+    orderDelivered: Number(process.env.POINTS_ORDER_DELIVERED),
+    rateStation: Number(process.env.POINTS_RATE_STATION),
+};
+/**
+ * Helper: create point record (supports pendingUntil & expiresAt)
+ */
+async function awardPoints(userId, points, description, pendingUntil, expiresAt) {
+    const now = new Date();
+    const isPending = pendingUntil && pendingUntil > now;
+    if (!isPending) {
+        const user = await User_1.default.findById(userId);
+        if (user) {
+            user.points += points;
+            if (user.points < 0)
+                user.points = 0;
+            await user.save();
+        }
+    }
+    await Point_1.default.create({
+        user: userId,
+        change: points,
+        type: points > 0 ? "earn" : "redeem",
+        description,
+        pendingUntil: pendingUntil ? new Date(pendingUntil) : undefined,
+        expiresAt: expiresAt ? new Date(expiresAt) : undefined,
+    });
+}
 // ===================== PLACE NEW ORDER =====================
 /**
  * @swagger
@@ -42,7 +71,7 @@ const router = (0, express_1.Router)();
  *                 type: string
  *     responses:
  *       201:
- *         description: Order placed
+ *         description: Order placed and points added
  *       404:
  *         description: Fuel or station not found
  *       500:
@@ -68,6 +97,7 @@ router.post("/", async (req, res) => {
             status: "pending",
             deliveryAddress: deliveryAddressId,
         });
+        await awardPoints(userId, POINTS_CONFIG.orderPlaced, "Points for placing an order");
         res.status(201).json(order);
     }
     catch (err) {
@@ -75,7 +105,7 @@ router.post("/", async (req, res) => {
         res.status(500).json({ message: "Failed to place order" });
     }
 });
-// ===================== GET ALL ORDERS FOR A USER =====================
+// ===================== GET ORDERS BY USER =====================
 /**
  * @swagger
  * /api/orders/user/{userId}:
@@ -185,6 +215,14 @@ router.patch("/:orderId/status", async (req, res) => {
         const order = await Order_1.default.findByIdAndUpdate(req.params.orderId, { status }, { new: true });
         if (!order)
             return res.status(404).json({ message: "Order not found" });
+        const prevStatus = order.status;
+        order.status = status;
+        await order.save();
+        if (status === "delivered" && prevStatus !== "delivered") {
+            const expiresAt = new Date();
+            expiresAt.setDate(expiresAt.getDate() + 30); // points expire in 30 days
+            await awardPoints(order.user.toString(), POINTS_CONFIG.orderDelivered, "Points for order delivered", undefined, expiresAt);
+        }
         res.json(order);
     }
     catch (err) {
@@ -217,13 +255,11 @@ router.patch("/:orderId/status", async (req, res) => {
  *                 type: string
  *               score:
  *                 type: number
- *                 example: 4
  *               comment:
  *                 type: string
- *                 example: "Good service"
  *     responses:
  *       201:
- *         description: Rating created
+ *         description: Rating created and points awarded
  *       400:
  *         description: Cannot rate before delivery
  *       404:
@@ -251,6 +287,7 @@ router.post("/:orderId/rate", async (req, res) => {
         }).lean());
         const avgRating = ratings.reduce((sum, r) => sum + r.score, 0) / ratings.length;
         await Station_1.default.findByIdAndUpdate(order.station, { rating: avgRating });
+        await awardPoints(userId, POINTS_CONFIG.rateStation, "Points for rating a station");
         res.status(201).json(rating);
     }
     catch (err) {

@@ -9,6 +9,7 @@ const RefreshToken_1 = __importDefault(require("../models/RefreshToken"));
 const hash_1 = require("../utils/hash");
 const jwt_1 = require("../utils/jwt");
 const jsonwebtoken_1 = __importDefault(require("jsonwebtoken"));
+const email_1 = require("../utils/email");
 const router = (0, express_1.Router)();
 /**
  * @swagger
@@ -72,6 +73,7 @@ router.post("/register", async (req, res) => {
         const existing = await User_1.default.findOne({ email });
         if (existing)
             return res.status(400).json({ message: "Email already in use" });
+        // Hash the password
         const passwordHash = await (0, hash_1.hashPassword)(password);
         // Create user
         const user = await User_1.default.create({
@@ -79,19 +81,176 @@ router.post("/register", async (req, res) => {
             phone: phone || "",
             passwordHash,
             displayName: displayName || "Guest",
-            gender: gender || "male", // model default is also male, this ensures TypeScript sees it
-            // profileImage will automatically use the schema default function
+            gender: gender || "male", // ensures TypeScript sees it
             profileImage,
+            isVerified: false, // user not verified yet
         });
+        // Generate 5-digit OTP
+        const otp = Math.floor(10000 + Math.random() * 90000).toString(); // e.g., "54321"
+        const otpExpiry = new Date();
+        otpExpiry.setMinutes(otpExpiry.getMinutes() + 10); // expires in 10 mins
+        user.otpCode = otp;
+        user.otpExpiresAt = otpExpiry;
+        await user.save();
+        // Send OTP email
+        await (0, email_1.sendOtpEmail)(user.email, otp);
+        // Generate tokens
         const userIdStr = user._id.toString();
         const accessToken = (0, jwt_1.signAccessToken)({ id: userIdStr });
         const refreshToken = (0, jwt_1.signRefreshToken)({ id: userIdStr });
         await saveRefreshToken(userIdStr, refreshToken);
-        res.status(201).json({ user, accessToken, refreshToken });
+        // Send response
+        res.status(201).json({
+            message: "User registered successfully. Please verify your email.",
+            user: { email: user.email, displayName: user.displayName },
+            accessToken,
+            refreshToken,
+        });
     }
     catch (err) {
         console.error(err);
         res.status(500).json({ error: err });
+    }
+});
+// ===================== VERIFY OTP =====================
+/**
+ * @swagger
+ * /auth/verify-otp:
+ *   post:
+ *     summary: Verify a user's email with the OTP code
+ *     tags: [Auth]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - email
+ *               - otp
+ *             properties:
+ *               email:
+ *                 type: string
+ *                 example: user@example.com
+ *               otp:
+ *                 type: string
+ *                 example: "54321"
+ *     responses:
+ *       200:
+ *         description: Email verified successfully
+ *       400:
+ *         description: Invalid OTP, expired OTP, or user not found
+ *       500:
+ *         description: Server error
+ */
+// ===================== VERIFY OTP =====================
+router.post("/verify-otp", async (req, res) => {
+    try {
+        const { email, otp } = req.body;
+        if (!email || !otp) {
+            return res.status(400).json({
+                message: "Email and OTP are required",
+            });
+        }
+        const user = await User_1.default.findOne({ email });
+        if (!user) {
+            return res.status(400).json({
+                message: "User not found",
+            });
+        }
+        if (!user.otpCode || !user.otpExpiresAt) {
+            return res.status(400).json({
+                message: "No OTP found. Please request a new one.",
+            });
+        }
+        if (new Date() > user.otpExpiresAt) {
+            return res.status(400).json({
+                message: "OTP expired. Please request a new one.",
+            });
+        }
+        if (user.otpCode !== otp) {
+            return res.status(400).json({
+                message: "Invalid OTP",
+            });
+        }
+        // Mark user as verified
+        user.isVerified = true;
+        user.otpCode = undefined;
+        user.otpExpiresAt = undefined;
+        await user.save();
+        return res.status(200).json({
+            message: "Email verified successfully",
+        });
+    }
+    catch (err) {
+        console.error("VERIFY OTP ERROR:", err);
+        return res.status(500).json({
+            message: "Failed to verify OTP",
+        });
+    }
+});
+// ===================== RESEND OTP =====================
+/**
+ * @swagger
+ * /auth/resend-otp:
+ *   post:
+ *     summary: Resend a new OTP to the user's email
+ *     tags: [Auth]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - email
+ *             properties:
+ *               email:
+ *                 type: string
+ *                 example: user@example.com
+ *     responses:
+ *       200:
+ *         description: OTP resent successfully
+ *       400:
+ *         description: User not found
+ *       500:
+ *         description: Server error
+ */
+// ===================== RESEND OTP =====================
+router.post("/resend-otp", async (req, res) => {
+    try {
+        const { email } = req.body;
+        if (!email) {
+            return res.status(400).json({
+                message: "Email is required",
+            });
+        }
+        const user = await User_1.default.findOne({ email });
+        if (!user) {
+            return res.status(400).json({
+                message: "User not found",
+            });
+        }
+        if (user.isVerified) {
+            return res.status(400).json({
+                message: "User is already verified",
+            });
+        }
+        // Generate new OTP
+        const otp = Math.floor(10000 + Math.random() * 90000).toString();
+        user.otpCode = otp;
+        user.otpExpiresAt = new Date(Date.now() + 10 * 60 * 1000);
+        await user.save();
+        await (0, email_1.sendOtpEmail)(user.email, otp);
+        return res.status(200).json({
+            message: "OTP resent successfully",
+        });
+    }
+    catch (err) {
+        console.error("RESEND OTP ERROR:", err);
+        return res.status(500).json({
+            message: "Failed to resend OTP",
+        });
     }
 });
 // ===================== LOGIN =====================
@@ -132,6 +291,8 @@ router.post("/login", async (req, res) => {
         const isMatch = await (0, hash_1.comparePassword)(password, user.passwordHash);
         if (!isMatch)
             return res.status(400).json({ message: "Invalid credentials" });
+        if (!user.isVerified)
+            return res.status(401).json({ message: "Email not verified" });
         const userIdStr = user._id.toString();
         const accessToken = (0, jwt_1.signAccessToken)({ id: userIdStr });
         const refreshToken = (0, jwt_1.signRefreshToken)({ id: userIdStr });

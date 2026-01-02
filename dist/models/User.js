@@ -52,6 +52,10 @@ const UserSchema = new mongoose_1.Schema({
     addressBook: [{ type: mongoose_1.Schema.Types.ObjectId, ref: "Address" }],
     points: { type: Number, default: 0 },
     deviceTokens: { type: [String], default: [] },
+    // OTP and verification
+    otpCode: { type: String },
+    otpExpiresAt: { type: Date },
+    isVerified: { type: Boolean, default: false },
 }, { timestamps: true });
 exports.default = mongoose_1.default.model("User", UserSchema);
 //# sourceMappingURL=User.js.map

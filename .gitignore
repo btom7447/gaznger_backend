@@ -1,4 +1,5 @@
 .env
 node_modules
+dist
 draft.ts
 firebase_private_key.json
