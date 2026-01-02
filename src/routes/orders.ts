@@ -236,7 +236,12 @@ router.patch("/:orderId/status", async (req, res) => {
     );
     if (!order) return res.status(404).json({ message: "Order not found" });
 
-    if (status === "delivered") {
+    const prevStatus = order.status;
+
+    order.status = status;
+    await order.save();
+
+    if (status === "delivered" && prevStatus !== "delivered") {
       const expiresAt = new Date();
       expiresAt.setDate(expiresAt.getDate() + 30); // points expire in 30 days
       await awardPoints(

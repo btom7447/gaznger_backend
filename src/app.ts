@@ -10,6 +10,8 @@ import pointRoutes from "./routes/points";
 import orderRoutes from "./routes/orders";
 import notificationRoutes from "./routes/notifications"; 
 
+import { startCronJobs } from './jobs';
+
 const app = express();
 
 // Middleware
@@ -25,6 +27,7 @@ app.use("/api/points", pointRoutes);
 app.use("/api/orders", orderRoutes);
 app.use("/api/notifications", notificationRoutes);
 
+startCronJobs();
 
 // Swagger docs
 setupSwagger(app);

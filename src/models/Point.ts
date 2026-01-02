@@ -5,11 +5,13 @@ export interface IPoint extends Document {
   change: number;
   type: "earn" | "redeem" | "adjust";
   description?: string;
-  pendingUntil?: Date; 
+  pendingUntil?: Date;
   expiresAt?: Date;
+  settled: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
+
 
 const PointSchema: Schema<IPoint> = new Schema(
   {
@@ -17,6 +19,10 @@ const PointSchema: Schema<IPoint> = new Schema(
     change: { type: Number, required: true },
     type: { type: String, enum: ["earn", "redeem", "adjust"], default: "earn" },
     description: { type: String, default: "" },
+    settled: {
+      type: Boolean,
+      default: false,
+    },
     pendingUntil: { type: Date }, 
     expiresAt: { type: Date },
   },
