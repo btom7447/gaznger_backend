@@ -24,11 +24,21 @@ transporter.verify((err, success) => {
 export const sendOtpEmail = async (email: string, otp: string) => {
   try {
     await transporter.sendMail({
-      from: `"Gaznger" <${process.env.SMTP_USER}>`, // must match Gmail user
+      from: `"Gaznger" <${process.env.SMTP_USER}>`,
       to: email,
-      subject: "Your Gaznger OTP Code",
-      text: `Your verification code is ${otp}. It expires in 10 minutes.`,
+      subject: "Your Gaznger Verification Code",
+      text: `Your Gaznger verification code is ${otp}. This code expires in 10 minutes.`,
+      html: `
+    <div style="font-family: Arial, sans-serif;">
+      <h2>Gaznger Email Verification</h2>
+      <p>Your verification code is:</p>
+      <h1 style="letter-spacing: 4px;">${otp}</h1>
+      <p>This code expires in 10 minutes.</p>
+      <p>If you didn’t request this, you can ignore this email.</p>
+    </div>
+  `,
     });
+
   } catch (err) {
     console.error("Error sending email:", err);
   }
