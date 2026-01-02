@@ -13,9 +13,9 @@ const router = Router();
  * Fallbacks provided if not set
  */
 const POINTS_CONFIG = {
-  orderPlaced: Number(process.env.POINTS_ORDER_PLACED) || 10,
-  orderDelivered: Number(process.env.POINTS_ORDER_DELIVERED) || 5,
-  rateStation: Number(process.env.POINTS_RATE_STATION) || 2,
+  orderPlaced: Number(process.env.POINTS_ORDER_PLACED),
+  orderDelivered: Number(process.env.POINTS_ORDER_DELIVERED),
+  rateStation: Number(process.env.POINTS_RATE_STATION),
 };
 
 /**
