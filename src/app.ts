@@ -6,6 +6,9 @@ import authRoutes from "./routes/auth";
 import fuelTypeRoutes from "./routes/fuelTypes";
 import stationRoutes from "./routes/stations";
 import uploadRoutes from "./routes/upload";
+import pointRoutes from "./routes/points";
+import orderRoutes from "./routes/orders";
+import notificationRoutes from "./routes/notifications"; 
 
 const app = express();
 
@@ -18,6 +21,10 @@ app.use("/auth", authRoutes);
 app.use("/api/fuel-types", fuelTypeRoutes);
 app.use("/api/stations", stationRoutes);
 app.use("/api/upload", uploadRoutes);
+app.use("/api/points", pointRoutes);
+app.use("/api/orders", orderRoutes);
+app.use("/api/notifications", notificationRoutes);
+
 
 // Swagger docs
 setupSwagger(app);
