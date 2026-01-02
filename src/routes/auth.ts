@@ -118,6 +118,98 @@ router.post("/register", async (req, res) => {
   }
 });
 
+// ===================== VERIFY OTP =====================
+/**
+ * @swagger
+ * /auth/verify-otp:
+ *   post:
+ *     summary: Verify a user's email with the OTP code
+ *     tags: [Auth]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - email
+ *               - otp
+ *             properties:
+ *               email:
+ *                 type: string
+ *                 example: user@example.com
+ *               otp:
+ *                 type: string
+ *                 example: "54321"
+ *     responses:
+ *       200:
+ *         description: Email verified successfully
+ *       400:
+ *         description: Invalid OTP, expired OTP, or user not found
+ *       500:
+ *         description: Server error
+ */
+router.post("/verify-otp", async (req, res) => {
+  const { email, otp } = req.body;
+  const user = await User.findOne({ email });
+  if (!user) return res.status(400).json({ message: "User not found" });
+
+  if (!user.otpCode || !user.otpExpiresAt || new Date() > user.otpExpiresAt)
+    return res.status(400).json({ message: "OTP expired" });
+
+  if (user.otpCode !== otp)
+    return res.status(400).json({ message: "Invalid OTP" });
+
+  user.isVerified = true;
+  user.otpCode = undefined;
+  user.otpExpiresAt = undefined;
+  await user.save();
+
+  res.json({ message: "Email verified successfully" });
+});
+
+// ===================== RESEND OTP =====================
+/**
+ * @swagger
+ * /auth/resend-otp:
+ *   post:
+ *     summary: Resend a new OTP to the user's email
+ *     tags: [Auth]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - email
+ *             properties:
+ *               email:
+ *                 type: string
+ *                 example: user@example.com
+ *     responses:
+ *       200:
+ *         description: OTP resent successfully
+ *       400:
+ *         description: User not found
+ *       500:
+ *         description: Server error
+ */
+router.post("/resend-otp", async (req, res) => {
+  const { email } = req.body;
+  const user = await User.findOne({ email });
+  if (!user) return res.status(400).json({ message: "User not found" });
+
+  const otp = Math.floor(10000 + Math.random() * 90000).toString();
+  user.otpCode = otp;
+  user.otpExpiresAt = new Date(Date.now() + 10 * 60 * 1000);
+  await user.save();
+
+  await sendOtpEmail(user.email, otp);
+
+  res.json({ message: "OTP resent successfully" });
+});
+
 // ===================== LOGIN =====================
 /**
  * @swagger
