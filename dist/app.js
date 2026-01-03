@@ -13,6 +13,7 @@ const upload_1 = __importDefault(require("./routes/upload"));
 const points_1 = __importDefault(require("./routes/points"));
 const orders_1 = __importDefault(require("./routes/orders"));
 const notifications_1 = __importDefault(require("./routes/notifications"));
+const tempPoints_1 = __importDefault(require("./routes/tempPoints"));
 const jobs_1 = require("./jobs");
 const app = (0, express_1.default)();
 // Middleware
@@ -27,6 +28,7 @@ app.use("/api/upload", upload_1.default);
 app.use("/api/points", points_1.default);
 app.use("/api/orders", orders_1.default);
 app.use("/api/notifications", notifications_1.default);
+app.use("/api/temp", tempPoints_1.default);
 (0, jobs_1.startCronJobs)();
 // Swagger docs
 (0, swagger_1.setupSwagger)(app);

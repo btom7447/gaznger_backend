@@ -1,16 +1,56 @@
-import { Router } from "express";
+import { Router, Request, Response } from "express";
+import multer from "multer";
+import cloudinary from "../utils/cloudinary";
 import FuelType from "../models/FuelType";
 
 const router = Router();
 
+// ---------------- Multer setup for memory storage ----------------
+const storage = multer.memoryStorage();
+const upload = multer({ storage });
+
 /**
  * @swagger
  * tags:
- *   name: FuelTypes
- *   description: Fuel type management
+ *   - name: FuelTypes
+ *     description: Fuel type management
  */
 
-// ===================== GET ALL FUEL TYPES =====================
+/**
+ * @swagger
+ * components:
+ *   schemas:
+ *     FuelType:
+ *       type: object
+ *       properties:
+ *         _id:
+ *           type: string
+ *           description: Fuel type ID
+ *           example: 64c123abc123abc123abc123
+ *         name:
+ *           type: string
+ *           description: Name of the fuel
+ *           example: Petrol
+ *         unit:
+ *           type: string
+ *           description: Unit of measurement (L or kg)
+ *           example: L
+ *         pricePerUnit:
+ *           type: number
+ *           description: Price per unit
+ *           example: 450
+ *         icon:
+ *           type: string
+ *           description: URL of fuel icon image
+ *           example: https://res.cloudinary.com/demo/image/upload/v1234567890/petrol.png
+ *         createdAt:
+ *           type: string
+ *           format: date-time
+ *         updatedAt:
+ *           type: string
+ *           format: date-time
+ */
+
 /**
  * @swagger
  * /api/fuel-types:
@@ -25,93 +65,118 @@ const router = Router();
  *             schema:
  *               type: array
  *               items:
- *                 type: object
- *                 properties:
- *                   _id:
- *                     type: string
- *                   name:
- *                     type: string
- *                   unit:
- *                     type: string
- *                   pricePerUnit:
- *                     type: number
+ *                 $ref: '#/components/schemas/FuelType'
  *       500:
  *         description: Server error
  */
-router.get("/", async (req, res) => {
+router.get("/", async (_req: Request, res: Response) => {
   try {
     const fuels = await FuelType.find({});
-    res.json(fuels);
+    res.status(200).json(fuels);
   } catch (err) {
-    console.error(err);
+    console.error("Fetch fuel types failed:", err);
     res.status(500).json({ message: "Failed to fetch fuel types" });
   }
 });
 
-// ===================== CREATE NEW FUEL TYPE =====================
 /**
  * @swagger
  * /api/fuel-types:
  *   post:
- *     summary: Create a new fuel type (admin/seed)
+ *     summary: Create a new fuel type with optional image
  *     tags: [FuelTypes]
  *     requestBody:
  *       required: true
  *       content:
- *         application/json:
+ *         multipart/form-data:
  *           schema:
  *             type: object
- *             required: [name, pricePerUnit]
+ *             required:
+ *               - name
+ *               - pricePerUnit
  *             properties:
  *               name:
  *                 type: string
- *                 example: Petrol
+ *                 description: Name of the fuel type
+ *                 example: Diesel
  *               unit:
  *                 type: string
+ *                 description: Unit of measurement (L or kg)
  *                 example: L
  *               pricePerUnit:
  *                 type: number
+ *                 description: Price per unit
  *                 example: 450
+ *               image:
+ *                 type: string
+ *                 format: binary
+ *                 description: Optional image file for fuel type
  *     responses:
  *       201:
- *         description: Fuel type created
+ *         description: Fuel type created successfully
  *         content:
  *           application/json:
  *             schema:
- *               type: object
- *               properties:
- *                 _id:
- *                   type: string
- *                 name:
- *                   type: string
- *                 unit:
- *                   type: string
- *                 pricePerUnit:
- *                   type: number
+ *               $ref: '#/components/schemas/FuelType'
  *       400:
- *         description: Fuel type already exists
+ *         description: Invalid input or fuel type already exists
  *       500:
- *         description: Server error
+ *         description: Server error or image upload failed
  */
-router.post("/", async (req, res) => {
-  try {
-    const { name, unit, pricePerUnit } = req.body;
+router.post(
+  "/",
+  upload.single("image"),
+  async (req: Request, res: Response) => {
+    try {
+      const { name, unit, pricePerUnit } = req.body;
 
-    const existing = await FuelType.findOne({ name });
-    if (existing)
-      return res.status(400).json({ message: "Fuel type already exists" });
+      if (!name || !pricePerUnit) {
+        return res
+          .status(400)
+          .json({ message: "Name and pricePerUnit are required" });
+      }
 
-    const fuel = await FuelType.create({
-      name,
-      unit: unit || "L",
-      pricePerUnit,
-    });
+      const existing = await FuelType.findOne({ name });
+      if (existing)
+        return res.status(400).json({ message: "Fuel type already exists" });
 
-    res.status(201).json(fuel);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Failed to create fuel type" });
+      let iconUrl: string | undefined = undefined;
+      if (req.file && req.file.buffer) {
+        const streamUpload = () =>
+          new Promise<string>((resolve, reject) => {
+            const stream = cloudinary.uploader.upload_stream(
+              { resource_type: "image" },
+              (error, result) => {
+                if (error) return reject(error);
+                if (!result?.secure_url)
+                  return reject(new Error("No URL returned"));
+                resolve(result.secure_url);
+              }
+            );
+            stream.end(req.file!.buffer);
+          });
+
+        try {
+          iconUrl = await streamUpload();
+        } catch (err: any) {
+          console.error("Cloudinary upload failed:", err);
+          return res.status(500).json({ message: "Image upload failed" });
+        }
+      }
+
+      const fuel = await FuelType.create({
+        name,
+        unit: unit || "L",
+        pricePerUnit,
+        icon: iconUrl,
+      });
+
+      res.status(201).json(fuel);
+    } catch (err) {
+      console.error("Create fuel type failed:", err);
+      res.status(500).json({ message: "Failed to create fuel type" });
+    }
   }
-});
+);
 
 export default router;
