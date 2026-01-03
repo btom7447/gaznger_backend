@@ -12,6 +12,6 @@
     "skipLibCheck": true,
     "sourceMap": true
   },
-  "include": ["src/**/*", "test-email.ts"],
+  "include": ["src/**/*", "test-email.ts", "settleAllPoints.js"],
   "exclude": ["node_modules", "dist"]
 }
