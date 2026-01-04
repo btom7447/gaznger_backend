@@ -10,6 +10,7 @@ import pointRoutes from "./routes/points";
 import orderRoutes from "./routes/orders";
 import notificationRoutes from "./routes/notifications"; 
 import tempPointsRoutes from "./routes/tempPoints";
+import addressRoutes from "./routes/address";
 
 import { startCronJobs } from './jobs';
 
@@ -28,6 +29,7 @@ app.use("/api/points", pointRoutes);
 app.use("/api/orders", orderRoutes);
 app.use("/api/notifications", notificationRoutes);
 app.use("/api/temp", tempPointsRoutes);
+app.use("/api/address-book", addressRoutes);
 
 startCronJobs();
 

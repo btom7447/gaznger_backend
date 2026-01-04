@@ -7,6 +7,7 @@ export interface IAddress extends Document {
   city: string;
   state: string;
   country: string;
+  icon: string;
   postalCode: string;
   latitude: number;
   longitude: number;
@@ -23,6 +24,7 @@ const AddressSchema: Schema = new Schema(
     state: { type: String, default: "" },
     country: { type: String, default: "" },
     postalCode: { type: String, default: "" },
+    icon: { type: String, default: "home-outline" },
     latitude: { type: Number, default: 0 },
     longitude: { type: Number, default: 0 },
   },

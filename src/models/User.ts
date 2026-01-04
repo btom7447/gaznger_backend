@@ -7,6 +7,7 @@ export interface IUser extends Document {
   displayName: string;
   profileImage: string;
   gender: "male" | "female";
+  defaultAddress?: mongoose.Types.ObjectId | null;
   addressBook: mongoose.Types.ObjectId[];
   points: number;
   deviceTokens: string[];
@@ -37,6 +38,7 @@ const UserSchema: Schema<IUser> = new Schema(
       },
     },
     addressBook: [{ type: Schema.Types.ObjectId, ref: "Address" }],
+    defaultAddress: { type: Schema.Types.ObjectId, ref: "Address" },
     points: { type: Number, default: 0 },
     deviceTokens: { type: [String], default: [] },
 
