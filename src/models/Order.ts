@@ -9,6 +9,11 @@ export interface IOrder extends Document {
   totalPrice: number;
   status: "pending" | "in-transit" | "delivered";
   deliveryAddress: mongoose.Types.ObjectId;
+
+  // Gas-specific fields
+  cylinderType?: string;
+  deliveryType?: "cylinder_swap" | "home_refill";
+  cylinderImages?: string[];
 }
 
 const OrderSchema: Schema = new Schema(
@@ -29,6 +34,11 @@ const OrderSchema: Schema = new Schema(
       ref: "Address",
       required: true,
     },
+
+    // Gas-specific
+    cylinderType: { type: String },
+    deliveryType: { type: String, enum: ["cylinder_swap", "home_refill"] },
+    cylinderImages: [{ type: String }],
   },
   { timestamps: true }
 );

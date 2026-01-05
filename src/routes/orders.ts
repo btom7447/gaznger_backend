@@ -85,7 +85,16 @@ async function awardPoints(
  */
 router.post("/", async (req, res) => {
   try {
-    const { userId, fuelId, stationId, quantity, deliveryAddressId } = req.body;
+    const {
+      userId,
+      fuelId,
+      stationId,
+      quantity,
+      deliveryAddressId,
+      cylinderType, // optional
+      deliveryType, // optional
+      cylinderImages, // optional
+    } = req.body;
 
     const fuel = await FuelType.findById(fuelId);
     if (!fuel) return res.status(404).json({ message: "Fuel not found" });
@@ -95,7 +104,8 @@ router.post("/", async (req, res) => {
 
     const totalPrice = quantity * fuel.pricePerUnit;
 
-    const order = await Order.create({
+    // Build the order object
+    const orderData: any = {
       user: userId,
       fuel: fuelId,
       station: stationId,
@@ -104,7 +114,16 @@ router.post("/", async (req, res) => {
       totalPrice,
       status: "pending",
       deliveryAddress: deliveryAddressId,
-    });
+    };
+
+    // If fuel is Gas, include gas-specific fields
+    if (fuel.name === "Gas") {
+      orderData.cylinderType = cylinderType;
+      orderData.deliveryType = deliveryType;
+      orderData.cylinderImages = cylinderImages || [];
+    }
+
+    const order = await Order.create(orderData);
 
     await awardPoints(
       userId,
