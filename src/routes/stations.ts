@@ -229,13 +229,16 @@ router.post("/", upload.single("image"), async (req, res) => {
     // Upload image to Cloudinary
     const imageUpload = await new Promise<any>((resolve, reject) => {
       cloudinary.uploader
-        .upload_stream({ resource_type: "image", folder: "stations" }, (error, result) => {
-          if (error) reject(error);
-          else resolve(result);
-        })
-        .end(req.file.buffer);
+        .upload_stream(
+          { resource_type: "image", folder: "stations" },
+          (error, result) => {
+            if (error) reject(error);
+            else resolve(result);
+          }
+        )
+        .end(req.file!.buffer); 
     });
-
+    
     // Create station
     const station = await GasStation.create({
       name,
