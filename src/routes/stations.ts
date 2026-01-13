@@ -199,7 +199,8 @@ router.post("/", upload.single("image"), async (req, res) => {
     // Parse location safely
     let locationParsed;
     try {
-      locationParsed = typeof location === "string" ? JSON.parse(location) : location;
+      locationParsed =
+        typeof location === "string" ? JSON.parse(location) : location;
       if (!locationParsed.lat || !locationParsed.lng) {
         throw new Error("Missing lat or lng in location");
       }
@@ -208,16 +209,30 @@ router.post("/", upload.single("image"), async (req, res) => {
     }
 
     // Parse fuels safely
-    let fuelsParsed;
+    let fuelsParsed: any[] = [];
+
     try {
-      fuelsParsed = typeof fuels === "string" ? JSON.parse(fuels) : fuels;
-      if (!Array.isArray(fuelsParsed) || fuelsParsed.length === 0) {
-        throw new Error("Fuels must be a non-empty array");
+      // If fuels is already an array (some clients send arrays correctly)
+      if (Array.isArray(fuels)) {
+        fuelsParsed = fuels.map((f) =>
+          typeof f === "string" ? JSON.parse(f) : f
+        );
       }
-      // Validate each fuel object
-      fuelsParsed.forEach((f: any) => {
+      // If fuels is a string (Swagger may send JSON string)
+      else if (typeof fuels === "string") {
+        // Wrap in brackets if not already array
+        if (!fuels.trim().startsWith("[")) fuels = `[${fuels}]`;
+        fuelsParsed = JSON.parse(fuels);
+      }
+
+      if (!Array.isArray(fuelsParsed) || fuelsParsed.length === 0)
+        throw new Error("Fuels must be a non-empty array");
+
+      fuelsParsed.forEach((f) => {
         if (!f.fuel || typeof f.pricePerUnit !== "number") {
-          throw new Error("Each fuel must have 'fuel' and numeric 'pricePerUnit'");
+          throw new Error(
+            "Each fuel must have 'fuel' and numeric 'pricePerUnit'"
+          );
         }
       });
     } catch (err) {
