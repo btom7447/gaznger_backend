@@ -1,7 +1,10 @@
 import { Router } from "express";
+import multer from "multer";
 import GasStation from "../models/Station";
+import cloudinary from "../utils/cloudinary";
 
 const router = Router();
+const upload = multer({ storage: multer.memoryStorage() });
 
 /**
  * @swagger
@@ -10,19 +13,18 @@ const router = Router();
  *   description: Gas station management
  */
 
-// ===================== GET ALL STATIONS =====================
+// ===================== GET STATIONS (DYNAMIC FILTER) =====================
 /**
  * @swagger
  * /api/stations:
  *   get:
- *     summary: Get all gas stations with optional filters
+ *     summary: Fetch stations (all, by state/LGA, or by radius)
  *     tags: [Stations]
  *     parameters:
  *       - in: query
  *         name: verified
  *         schema:
  *           type: boolean
- *         description: Filter by verified stations
  *       - in: query
  *         name: state
  *         schema:
@@ -47,7 +49,7 @@ const router = Router();
  *         name: radius
  *         schema:
  *           type: number
- *         description: Radius in km
+ *         description: Radius in KM for location search
  *     responses:
  *       200:
  *         description: List of stations
@@ -60,15 +62,21 @@ router.get("/", async (req, res) => {
 
     const filter: any = {};
 
+    // Basic filters
     if (verified !== undefined) filter.verified = verified === "true";
     if (state) filter.state = state;
     if (lga) filter.lga = lga;
 
+    /**
+     * Radius-based search (optional)
+     * Only applied when lat, lng, and radius are provided
+     */
     if (lat && lng && radius) {
       const latNum = parseFloat(lat as string);
       const lngNum = parseFloat(lng as string);
       const r = parseFloat(radius as string);
 
+      // Simple bounding-box calculation
       const latDiff = r / 111;
       const lngDiff = r / (111 * Math.cos((latNum * Math.PI) / 180));
 
@@ -95,7 +103,7 @@ router.get("/", async (req, res) => {
  * @swagger
  * /api/stations/{id}:
  *   get:
- *     summary: Get a single station by ID
+ *     summary: Get a station by ID
  *     tags: [Stations]
  *     parameters:
  *       - in: path
@@ -103,6 +111,7 @@ router.get("/", async (req, res) => {
  *         required: true
  *         schema:
  *           type: string
+ *         description: Station ID
  *     responses:
  *       200:
  *         description: Station details
@@ -129,15 +138,122 @@ router.get("/:id", async (req, res) => {
  * @swagger
  * /api/stations:
  *   post:
- *     summary: Create a new gas station (admin/seed)
+ *     summary: Create a new gas station
  *     tags: [Stations]
  *     requestBody:
  *       required: true
  *       content:
- *         application/json:
+ *         multipart/form-data:
  *           schema:
  *             type: object
- *             required: [name, address, state, lga, location, fuels, image]
+ *             properties:
+ *               name:
+ *                 type: string
+ *               address:
+ *                 type: string
+ *               state:
+ *                 type: string
+ *               lga:
+ *                 type: string
+ *               location:
+ *                 type: object
+ *                 properties:
+ *                   lat:
+ *                     type: number
+ *                   lng:
+ *                     type: number
+ *                 required:
+ *                   - lat
+ *                   - lng
+ *                 description: Station latitude and longitude
+ *               fuels:
+ *                 type: array
+ *                 items:
+ *                   type: object
+ *                   properties:
+ *                     fuel:
+ *                       type: string
+ *                     price:
+ *                       type: number
+ *                   required:
+ *                     - fuel
+ *                     - price
+ *               verified:
+ *                 type: boolean
+ *               image:
+ *                 type: string
+ *                 format: binary
+ *     responses:
+ *       201:
+ *         description: Station created
+ *       400:
+ *         description: Missing required fields
+ *       500:
+ *         description: Server error
+ */
+router.post("/", upload.single("image"), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: "Station image is required" });
+    }
+
+    const { name, address, state, lga, location, fuels, verified } = req.body;
+
+    if (!name || !address || !state || !lga || !location || !fuels) {
+      return res.status(400).json({ message: "Missing required fields" });
+    }
+
+    // Upload image to Cloudinary
+    const imageUpload = await new Promise<any>((resolve, reject) => {
+      cloudinary.uploader
+        .upload_stream(
+          { resource_type: "image", folder: "stations" },
+          (error, result) => {
+            if (error) reject(error);
+            else resolve(result);
+          }
+        )
+        .end(req.file!.buffer);
+    });
+
+    const station = await GasStation.create({
+      name,
+      address,
+      state,
+      lga,
+      location: JSON.parse(location),
+      fuels: JSON.parse(fuels),
+      image: imageUpload.secure_url,
+      verified: verified === "true" || verified === true,
+    });
+
+    res.status(201).json(station);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to create station" });
+  }
+});
+
+// ===================== UPDATE STATION (WITH IMAGE REPLACEMENT) =====================
+/**
+ * @swagger
+ * /api/stations/{id}:
+ *   put:
+ *     summary: Update a gas station by ID
+ *     tags: [Stations]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Station ID
+ *     requestBody:
+ *       required: false
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
  *             properties:
  *               name:
  *                 type: string
@@ -161,36 +277,114 @@ router.get("/:id", async (req, res) => {
  *                   properties:
  *                     fuel:
  *                       type: string
- *                     pricePerUnit:
+ *                     price:
  *                       type: number
  *               verified:
  *                 type: boolean
- *                 default: false
+ *               image:
+ *                 type: string
+ *                 format: binary
  *     responses:
- *       201:
- *         description: Station created
+ *       200:
+ *         description: Station updated
+ *       404:
+ *         description: Station not found
  *       500:
  *         description: Server error
  */
-router.post("/", async (req, res) => {
+router.put("/:id", upload.single("image"), async (req, res) => {
   try {
-    const { name, address, state, lga, location, fuels, verified, image } = req.body;
+    const station = await GasStation.findById(req.params.id);
+    if (!station) {
+      return res.status(404).json({ message: "Station not found" });
+    }
 
-    const station = await GasStation.create({
-      name,
-      address,
-      state,
-      lga,
-      location,
-      fuels,
-      image,
-      verified: verified || false,
-    });
+    const { name, address, state, lga, location, fuels, verified } = req.body;
 
-    res.status(201).json(station);
+    // Replace image if new one is uploaded
+    if (req.file && station.image) {
+      const publicId = station.image.split("/").pop()?.split(".")[0];
+
+      if (publicId) {
+        await cloudinary.uploader.destroy(`stations/${publicId}`);
+      }
+
+      const imageUpload = await new Promise<any>((resolve, reject) => {
+        cloudinary.uploader
+          .upload_stream(
+            { resource_type: "image", folder: "stations" },
+            (error, result) => {
+              if (error) reject(error);
+              else resolve(result);
+            }
+          )
+          .end(req.file!.buffer);
+      });
+
+      station.image = imageUpload.secure_url;
+    }
+
+    if (name) station.name = name;
+    if (address) station.address = address;
+    if (state) station.state = state;
+    if (lga) station.lga = lga;
+    if (location) station.location = JSON.parse(location);
+    if (fuels) station.fuels = JSON.parse(fuels);
+    if (verified !== undefined)
+      station.verified = verified === "true" || verified === true;
+
+    await station.save();
+
+    res.json(station);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ message: "Failed to create station" });
+    res.status(500).json({ message: "Failed to update station" });
+  }
+});
+
+// ===================== DELETE STATION =====================
+/**
+ * @swagger
+ * /api/stations/{id}:
+ *   delete:
+ *     summary: Delete a gas station by ID
+ *     tags: [Stations]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Station ID
+ *     responses:
+ *       200:
+ *         description: Station deleted successfully
+ *       404:
+ *         description: Station not found
+ *       500:
+ *         description: Server error
+ */
+router.delete("/:id", async (req, res) => {
+  try {
+    const station = await GasStation.findById(req.params.id);
+    if (!station) {
+      return res.status(404).json({ message: "Station not found" });
+    }
+
+    // Remove image from Cloudinary
+    if (station.image) {
+      const publicId = station.image.split("/").pop()?.split(".")[0];
+      if (publicId) {
+        await cloudinary.uploader.destroy(`stations/${publicId}`);
+      }
+    }
+
+    await station.deleteOne();
+
+    res.json({ message: "Station deleted successfully" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to delete station" });
   }
 });
 
