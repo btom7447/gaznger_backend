@@ -192,17 +192,36 @@ router.post("/", upload.single("image"), async (req, res) => {
       });
     }
 
-    // Parse fuels (JSON string -> array)
+    // Check file safely
+    const fileBuffer = req.file?.buffer;
+    if (!fileBuffer)
+      return res.status(400).json({ message: "Station image is required" });
+
+    // Upload image to Cloudinary
+    const imageUpload = await new Promise<any>((resolve, reject) => {
+      cloudinary.uploader
+        .upload_stream(
+          { resource_type: "image", folder: "stations" },
+          (error, result) => (error ? reject(error) : resolve(result))
+        )
+        .end(fileBuffer); // safe
+    });
+
+    // Parse fuels safely (Swagger-friendly)
     let fuelsParsed: any[];
     try {
       if (typeof fuels === "string") {
+        // Swagger sometimes sends single object as string
         fuelsParsed = JSON.parse(fuels);
+        if (!Array.isArray(fuelsParsed)) fuelsParsed = [fuelsParsed];
       } else if (Array.isArray(fuels)) {
         fuelsParsed = fuels.map((f) =>
           typeof f === "string" ? JSON.parse(f) : f
         );
-      } else throw new Error("Invalid fuels");
-      // Validate each fuel
+      } else {
+        throw new Error("Invalid fuels format");
+      }
+
       fuelsParsed.forEach((f) => {
         if (!f.fuel || typeof f.pricePerUnit !== "number") throw new Error();
       });
@@ -212,14 +231,6 @@ router.post("/", upload.single("image"), async (req, res) => {
           "Invalid fuels format. Must be JSON array of { fuel, pricePerUnit }",
       });
     }
-
-    // Upload image to Cloudinary
-    const imageUpload = await new Promise<any>((resolve, reject) => {
-      cloudinary.uploader.upload_stream(
-        { resource_type: "image", folder: "stations" },
-        (error, result) => (error ? reject(error) : resolve(result))
-      ).end(req.file.buffer);
-    });
 
     const station = await GasStation.create({
       name,
@@ -298,6 +309,7 @@ router.put("/:id", upload.single("image"), async (req, res) => {
 
     // Update image if uploaded
     if (req.file) {
+      const fileBuffer = req.file.buffer; // safe inside the 'if'
       if (station.image) {
         const publicId = station.image.split("/").pop()?.split(".")[0];
         if (publicId) await cloudinary.uploader.destroy(`stations/${publicId}`);
@@ -308,9 +320,35 @@ router.put("/:id", upload.single("image"), async (req, res) => {
             { resource_type: "image", folder: "stations" },
             (error, result) => (error ? reject(error) : resolve(result))
           )
-          .end(req.file.buffer);
+          .end(fileBuffer);
       });
       station.image = imageUpload.secure_url;
+    }
+
+    // Update fuels
+    if (fuels) {
+      try {
+        let fuelsParsed: any[];
+        if (typeof fuels === "string") {
+          fuelsParsed = JSON.parse(fuels);
+          if (!Array.isArray(fuelsParsed)) fuelsParsed = [fuelsParsed];
+        } else if (Array.isArray(fuels)) {
+          fuelsParsed = fuels.map((f) =>
+            typeof f === "string" ? JSON.parse(f) : f
+          );
+        } else throw new Error("Invalid fuels format");
+
+        fuelsParsed.forEach((f) => {
+          if (!f.fuel || typeof f.pricePerUnit !== "number") throw new Error();
+        });
+
+        station.fuels = fuelsParsed;
+      } catch {
+        return res.status(400).json({
+          message:
+            "Invalid fuels format. Must be JSON array of { fuel, pricePerUnit }",
+        });
+      }
     }
 
     if (name) station.name = name;
