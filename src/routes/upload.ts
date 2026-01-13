@@ -48,32 +48,29 @@ const upload = multer({ storage });
  *       500:
  *         description: Server error
  */
-router.post(
-  "/image",
-  upload.single("image"),
-  async (req: Express.Request, res) => {
-    try {
-      if (!req.file)
-        return res.status(400).json({ message: "No file uploaded" });
+router.post("/image", upload.single("image"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ message: "No file uploaded" });
 
-      const result = await cloudinary.uploader.upload_stream(
+    const fileBuffer = req.file.buffer;
+
+    const uploadResult = await new Promise<any>((resolve, reject) => {
+      const stream = cloudinary.uploader.upload_stream(
         { resource_type: "image" },
         (error, result) => {
-          if (error) return res.status(500).json({ message: error.message });
-          res.json({ url: result?.secure_url });
+          if (error) reject(error);
+          else resolve(result);
         }
       );
+      stream.end(fileBuffer); // pipe buffer into the Cloudinary stream
+    });
 
-      // Pipe file buffer to Cloudinary
-      if (req.file.buffer) {
-        const stream = result as any;
-        stream.end(req.file.buffer);
-      }
-    } catch (err: any) {
-      console.error(err);
-      res.status(500).json({ message: "Upload failed" });
-    }
+    res.json({ url: uploadResult.secure_url });
+  } catch (err: any) {
+    console.error(err);
+    res.status(500).json({ message: err.message || "Upload failed" });
   }
-);
+});
+
 
 export default router;

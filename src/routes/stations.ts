@@ -199,12 +199,14 @@ router.post("/", upload.single("image"), async (req, res) => {
 
     // Upload image to Cloudinary
     const imageUpload = await new Promise<any>((resolve, reject) => {
-      cloudinary.uploader
-        .upload_stream(
-          { resource_type: "image", folder: "stations" },
-          (error, result) => (error ? reject(error) : resolve(result))
-        )
-        .end(fileBuffer); // safe
+      const stream = cloudinary.uploader.upload_stream(
+        { resource_type: "image", folder: "stations" },
+        (error, result) => {
+          if (error) reject(error);
+          else resolve(result);
+        }
+      );
+      stream.end(req.file!.buffer);
     });
 
     // Parse fuels safely (Swagger-friendly)
@@ -315,12 +317,14 @@ router.put("/:id", upload.single("image"), async (req, res) => {
         if (publicId) await cloudinary.uploader.destroy(`stations/${publicId}`);
       }
       const imageUpload = await new Promise<any>((resolve, reject) => {
-        cloudinary.uploader
-          .upload_stream(
-            { resource_type: "image", folder: "stations" },
-            (error, result) => (error ? reject(error) : resolve(result))
-          )
-          .end(fileBuffer);
+        const stream = cloudinary.uploader.upload_stream(
+          { resource_type: "image", folder: "stations" },
+          (error, result) => {
+            if (error) reject(error);
+            else resolve(result);
+          }
+        );
+        stream.end(req.file!.buffer);
       });
       station.image = imageUpload.secure_url;
     }
