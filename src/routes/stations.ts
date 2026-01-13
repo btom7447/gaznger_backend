@@ -158,7 +158,6 @@ router.get("/:id", async (req, res) => {
  *                 required:
  *                   - lat
  *                   - lng
- *                 description: Station latitude and longitude
  *               fuels:
  *                 type: array
  *                 items:
@@ -166,11 +165,11 @@ router.get("/:id", async (req, res) => {
  *                   properties:
  *                     fuel:
  *                       type: string
- *                     price:
+ *                     pricePerUnit:
  *                       type: number
  *                   required:
  *                     - fuel
- *                     - price
+ *                     - pricePerUnit
  *               verified:
  *                 type: boolean
  *               image:
@@ -186,43 +185,22 @@ router.get("/:id", async (req, res) => {
  */
 router.post("/", upload.single("image"), async (req, res) => {
   try {
-    if (!req.file)
-      return res.status(400).json({ message: "Station image is required" });
+    if (!req.file) return res.status(400).json({ message: "Station image is required" });
 
     const { name, address, state, lga, location, fuels, verified } = req.body;
-    if (!name || !address || !state || !lga || !location || !fuels) {
+    if (!name || !address || !state || !lga || !location || !fuels)
       return res.status(400).json({ message: "Missing required fields" });
-    }
 
-    // Safe parsing
-    let locationParsed;
-    try {
-      locationParsed =
-        typeof location === "string" ? JSON.parse(location) : location;
-    } catch {
-      return res.status(400).json({ message: "Invalid location format" });
-    }
-
-    let fuelsParsed;
-    try {
-      fuelsParsed = typeof fuels === "string" ? JSON.parse(fuels) : fuels;
-      if (!Array.isArray(fuelsParsed))
-        throw new Error("Fuels must be an array");
-    } catch {
-      return res.status(400).json({ message: "Invalid fuels format" });
-    }
+    const locationParsed = typeof location === "string" ? JSON.parse(location) : location;
+    const fuelsParsed = typeof fuels === "string" ? JSON.parse(fuels) : fuels;
+    if (!Array.isArray(fuelsParsed)) return res.status(400).json({ message: "Fuels must be an array" });
 
     // Upload image to Cloudinary
     const imageUpload = await new Promise<any>((resolve, reject) => {
-      cloudinary.uploader
-        .upload_stream(
-          { resource_type: "image", folder: "stations" },
-          (error, result) => {
-            if (error) reject(error);
-            else resolve(result);
-          }
-        )
-        .end(req.file!.buffer);
+      cloudinary.uploader.upload_stream(
+        { resource_type: "image", folder: "stations" },
+        (error, result) => (error ? reject(error) : resolve(result))
+      ).end(req.file!.buffer);
     });
 
     const station = await GasStation.create({
@@ -316,10 +294,7 @@ router.put("/:id", upload.single("image"), async (req, res) => {
         cloudinary.uploader
           .upload_stream(
             { resource_type: "image", folder: "stations" },
-            (error, result) => {
-              if (error) reject(error);
-              else resolve(result);
-            }
+            (error, result) => (error ? reject(error) : resolve(result))
           )
           .end(req.file!.buffer);
       });
@@ -331,27 +306,15 @@ router.put("/:id", upload.single("image"), async (req, res) => {
     if (address) station.address = address;
     if (state) station.state = state;
     if (lga) station.lga = lga;
-
-    if (location) {
-      try {
-        station.location =
-          typeof location === "string" ? JSON.parse(location) : location;
-      } catch {
-        return res.status(400).json({ message: "Invalid location format" });
-      }
-    }
-
+    if (location)
+      station.location =
+        typeof location === "string" ? JSON.parse(location) : location;
     if (fuels) {
-      try {
-        const parsedFuels =
-          typeof fuels === "string" ? JSON.parse(fuels) : fuels;
-        if (!Array.isArray(parsedFuels)) throw new Error();
-        station.fuels = parsedFuels;
-      } catch {
+      const parsedFuels = typeof fuels === "string" ? JSON.parse(fuels) : fuels;
+      if (!Array.isArray(parsedFuels))
         return res.status(400).json({ message: "Invalid fuels format" });
-      }
+      station.fuels = parsedFuels;
     }
-
     if (verified !== undefined)
       station.verified = verified === "true" || verified === true;
 
