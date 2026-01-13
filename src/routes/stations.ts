@@ -179,15 +179,13 @@ router.get("/:id", async (req, res) => {
  *       201:
  *         description: Station created
  *       400:
- *         description: Missing required fields
+ *         description: Missing required fields or invalid fuels format
  *       500:
  *         description: Server error
  */
 router.post("/", upload.single("image"), async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ message: "Station image is required" });
-    }
+    if (!req.file) return res.status(400).json({ message: "Station image is required" });
 
     let { name, address, state, lga, location, fuels, verified } = req.body;
 
@@ -196,60 +194,46 @@ router.post("/", upload.single("image"), async (req, res) => {
       return res.status(400).json({ message: "Missing required fields" });
     }
 
-    // Parse location safely
+    // Parse location
     let locationParsed;
     try {
-      locationParsed =
-        typeof location === "string" ? JSON.parse(location) : location;
-      if (!locationParsed.lat || !locationParsed.lng) {
-        throw new Error("Missing lat or lng in location");
-      }
-    } catch (err) {
+      locationParsed = typeof location === "string" ? JSON.parse(location) : location;
+      if (!locationParsed.lat || !locationParsed.lng) throw new Error();
+    } catch {
       return res.status(400).json({ message: "Invalid location format" });
     }
 
-    // Parse fuels safely
+    // Parse fuels (fixed for Swagger)
     let fuelsParsed: any[] = [];
-
     try {
-      // If fuels is already an array (some clients send arrays correctly)
       if (Array.isArray(fuels)) {
-        fuelsParsed = fuels.map((f) =>
-          typeof f === "string" ? JSON.parse(f) : f
-        );
-      }
-      // If fuels is a string (Swagger may send JSON string)
-      else if (typeof fuels === "string") {
-        // Wrap in brackets if not already array
+        // Swagger sends multiple objects as separate strings sometimes
+        fuelsParsed = fuels.map(f => (typeof f === "string" ? JSON.parse(f) : f));
+      } else if (typeof fuels === "string") {
+        // Wrap single or comma-separated objects into an array
         if (!fuels.trim().startsWith("[")) fuels = `[${fuels}]`;
         fuelsParsed = JSON.parse(fuels);
       }
 
-      if (!Array.isArray(fuelsParsed) || fuelsParsed.length === 0)
-        throw new Error("Fuels must be a non-empty array");
+      if (!Array.isArray(fuelsParsed) || fuelsParsed.length === 0) throw new Error();
 
-      fuelsParsed.forEach((f) => {
+      fuelsParsed.forEach(f => {
         if (!f.fuel || typeof f.pricePerUnit !== "number") {
-          throw new Error(
-            "Each fuel must have 'fuel' and numeric 'pricePerUnit'"
-          );
+          throw new Error();
         }
       });
-    } catch (err) {
+    } catch {
       return res.status(400).json({ message: "Invalid fuels format" });
     }
 
     // Upload image to Cloudinary
     const imageUpload = await new Promise<any>((resolve, reject) => {
       cloudinary.uploader
-        .upload_stream(
-          { resource_type: "image", folder: "stations" },
-          (error, result) => {
-            if (error) reject(error);
-            else resolve(result);
-          }
-        )
-        .end(req.file!.buffer);
+        .upload_stream({ resource_type: "image", folder: "stations" }, (error, result) => {
+          if (error) reject(error);
+          else resolve(result);
+        })
+        .end(req.file.buffer);
     });
 
     // Create station
