@@ -185,24 +185,59 @@ router.get("/:id", async (req, res) => {
  */
 router.post("/", upload.single("image"), async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ message: "Station image is required" });
+    if (!req.file) {
+      return res.status(400).json({ message: "Station image is required" });
+    }
 
-    const { name, address, state, lga, location, fuels, verified } = req.body;
-    if (!name || !address || !state || !lga || !location || !fuels)
+    let { name, address, state, lga, location, fuels, verified } = req.body;
+
+    // Validate required fields
+    if (!name || !address || !state || !lga || !location || !fuels) {
       return res.status(400).json({ message: "Missing required fields" });
+    }
 
-    const locationParsed = typeof location === "string" ? JSON.parse(location) : location;
-    const fuelsParsed = typeof fuels === "string" ? JSON.parse(fuels) : fuels;
-    if (!Array.isArray(fuelsParsed)) return res.status(400).json({ message: "Fuels must be an array" });
+    // Parse location safely
+    let locationParsed;
+    try {
+      locationParsed = typeof location === "string" ? JSON.parse(location) : location;
+      if (!locationParsed.lat || !locationParsed.lng) {
+        throw new Error("Missing lat or lng in location");
+      }
+    } catch (err) {
+      return res.status(400).json({ message: "Invalid location format" });
+    }
+
+    // Parse fuels safely
+    let fuelsParsed;
+    try {
+      fuelsParsed = typeof fuels === "string" ? JSON.parse(fuels) : fuels;
+      if (!Array.isArray(fuelsParsed) || fuelsParsed.length === 0) {
+        throw new Error("Fuels must be a non-empty array");
+      }
+      // Validate each fuel object
+      fuelsParsed.forEach((f: any) => {
+        if (!f.fuel || typeof f.pricePerUnit !== "number") {
+          throw new Error("Each fuel must have 'fuel' and numeric 'pricePerUnit'");
+        }
+      });
+    } catch (err) {
+      return res.status(400).json({ message: "Invalid fuels format" });
+    }
 
     // Upload image to Cloudinary
     const imageUpload = await new Promise<any>((resolve, reject) => {
-      cloudinary.uploader.upload_stream(
-        { resource_type: "image", folder: "stations" },
-        (error, result) => (error ? reject(error) : resolve(result))
-      ).end(req.file!.buffer);
+      cloudinary.uploader
+        .upload_stream(
+          { resource_type: "image", folder: "stations" },
+          (error, result) => {
+            if (error) reject(error);
+            else resolve(result);
+          }
+        )
+        .end(req.file!.buffer);
     });
 
+    // Create station
     const station = await GasStation.create({
       name,
       address,
@@ -216,7 +251,7 @@ router.post("/", upload.single("image"), async (req, res) => {
 
     res.status(201).json(station);
   } catch (err) {
-    console.error(err);
+    console.error("Error creating station:", err);
     res.status(500).json({ message: "Failed to create station" });
   }
 });
