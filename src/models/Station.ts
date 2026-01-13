@@ -8,6 +8,7 @@ export interface IGasStation extends Document {
   location: { lat: number; lng: number };
   fuels: { fuel: Schema.Types.ObjectId; pricePerUnit: number }[];
   rating: number;
+  image: string;
   verified: boolean;
 }
 
@@ -28,6 +29,7 @@ const GasStationSchema: Schema = new Schema(
       },
     ],
     rating: { type: Number, default: 0 },
+    image: { type: String, required: true },
     verified: { type: Boolean, default: false },
   },
   { timestamps: true }

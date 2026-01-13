@@ -137,7 +137,7 @@ router.get("/:id", async (req, res) => {
  *         application/json:
  *           schema:
  *             type: object
- *             required: [name, address, state, lga, location, fuels]
+ *             required: [name, address, state, lga, location, fuels, image]
  *             properties:
  *               name:
  *                 type: string
@@ -174,7 +174,7 @@ router.get("/:id", async (req, res) => {
  */
 router.post("/", async (req, res) => {
   try {
-    const { name, address, state, lga, location, fuels, verified } = req.body;
+    const { name, address, state, lga, location, fuels, verified, image } = req.body;
 
     const station = await GasStation.create({
       name,
@@ -183,6 +183,7 @@ router.post("/", async (req, res) => {
       lga,
       location,
       fuels,
+      image,
       verified: verified || false,
     });
 
