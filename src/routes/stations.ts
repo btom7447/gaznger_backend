@@ -201,23 +201,28 @@ router.post("/", upload.single("image"), async (req, res) => {
         typeof location === "string" ? JSON.parse(location) : location;
       if (!locationParsed.lat || !locationParsed.lng) throw new Error();
     } catch {
-      return res
-        .status(400)
-        .json({
-          message: "Invalid location format. Must be JSON with lat and lng",
-        });
+      return res.status(400).json({
+        message: "Invalid location format. Must be JSON with lat and lng",
+      });
     }
 
     // Parse fuels safely (works with Swagger)
+    // Parse fuels safely (works with Swagger)
     let fuelsParsed: any[] = [];
     try {
-      if (typeof fuels === "string") {
-        // Wrap comma-separated objects into array
+      if (!fuels) throw new Error();
+
+      if (Array.isArray(fuels)) {
+        // Multiple fields sent by Swagger: ["{...}", "{...}"]
+        fuelsParsed = fuels.map((f) => {
+          if (typeof f === "string") return JSON.parse(f);
+          return f;
+        });
+      } else if (typeof fuels === "string") {
+        // Single string, maybe comma-separated like Swagger
         let str = fuels.trim();
-        if (!str.startsWith("[")) str = `[${str}]`;
+        if (!str.startsWith("[")) str = `[${str}]`; // wrap in array
         fuelsParsed = JSON.parse(str);
-      } else if (Array.isArray(fuels)) {
-        fuelsParsed = fuels;
       } else {
         throw new Error();
       }
@@ -367,15 +372,23 @@ router.put("/:id", upload.single("image"), async (req, res) => {
 
     // Parse fuels if provided
     if (fuels) {
+      // Parse fuels safely (works with Swagger)
+      // Parse fuels safely (works with Swagger)
       let fuelsParsed: any[] = [];
       try {
-        if (typeof fuels === "string") {
-          // Wrap comma-separated objects into array
+        if (!fuels) throw new Error();
+
+        if (Array.isArray(fuels)) {
+          // Multiple fields sent by Swagger: ["{...}", "{...}"]
+          fuelsParsed = fuels.map((f) => {
+            if (typeof f === "string") return JSON.parse(f);
+            return f;
+          });
+        } else if (typeof fuels === "string") {
+          // Single string, maybe comma-separated like Swagger
           let str = fuels.trim();
-          if (!str.startsWith("[")) str = `[${str}]`;
+          if (!str.startsWith("[")) str = `[${str}]`; // wrap in array
           fuelsParsed = JSON.parse(str);
-        } else if (Array.isArray(fuels)) {
-          fuelsParsed = fuels;
         } else {
           throw new Error();
         }
@@ -384,8 +397,6 @@ router.put("/:id", upload.single("image"), async (req, res) => {
         fuelsParsed.forEach((f) => {
           if (!f.fuel || typeof f.pricePerUnit !== "number") throw new Error();
         });
-
-        station.fuels = fuelsParsed;
       } catch {
         return res.status(400).json({
           message:
