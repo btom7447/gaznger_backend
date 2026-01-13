@@ -149,27 +149,11 @@ router.get("/:id", async (req, res) => {
  *               lga:
  *                 type: string
  *               location:
- *                 type: object
- *                 properties:
- *                   lat:
- *                     type: number
- *                   lng:
- *                     type: number
- *                 required:
- *                   - lat
- *                   - lng
+ *                 type: string
+ *                 description: JSON string like '{"lat":5.123,"lng":7.456}'
  *               fuels:
- *                 type: array
- *                 items:
- *                   type: object
- *                   properties:
- *                     fuel:
- *                       type: string
- *                     pricePerUnit:
- *                       type: number
- *                   required:
- *                     - fuel
- *                     - pricePerUnit
+ *                 type: string
+ *                 description: JSON array of fuel objects, e.g. '[{"fuel":"id1","pricePerUnit":1200},{"fuel":"id2","pricePerUnit":1050}]'
  *               verified:
  *                 type: boolean
  *               image:
@@ -179,7 +163,7 @@ router.get("/:id", async (req, res) => {
  *       201:
  *         description: Station created
  *       400:
- *         description: Missing required fields or invalid fuels format
+ *         description: Missing required fields or invalid fuels/location format
  *       500:
  *         description: Server error
  */
@@ -190,43 +174,34 @@ router.post("/", upload.single("image"), async (req, res) => {
 
     let { name, address, state, lga, location, fuels, verified } = req.body;
 
+    // Check required fields
     if (!name || !address || !state || !lga || !location || !fuels) {
       return res.status(400).json({ message: "Missing required fields" });
     }
 
-    // Parse location safely
+    // Parse location (JSON string -> object)
     let locationParsed;
     try {
       locationParsed =
         typeof location === "string" ? JSON.parse(location) : location;
-      if (!locationParsed.lat || !locationParsed.lng) throw new Error();
+      if (!locationParsed.lat || !locationParsed.lng)
+        throw new Error("Invalid location");
     } catch {
       return res.status(400).json({
         message: "Invalid location format. Must be JSON with lat and lng",
       });
     }
 
-    // Parse fuels safely (works with Swagger)
-    // Parse fuels safely (works with Swagger)
-    let fuelsParsed: any[] = [];
+    // Parse fuels (JSON string -> array)
+    let fuelsParsed: any[];
     try {
-      if (!fuels) throw new Error();
-
-      if (Array.isArray(fuels)) {
-        // Multiple fields sent by Swagger: ["{...}", "{...}"]
-        fuelsParsed = fuels.map((f) => {
-          if (typeof f === "string") return JSON.parse(f);
-          return f;
-        });
-      } else if (typeof fuels === "string") {
-        // Single string, maybe comma-separated like Swagger
-        let str = fuels.trim();
-        if (!str.startsWith("[")) str = `[${str}]`; // wrap in array
-        fuelsParsed = JSON.parse(str);
-      } else {
-        throw new Error();
-      }
-
+      if (typeof fuels === "string") {
+        fuelsParsed = JSON.parse(fuels);
+      } else if (Array.isArray(fuels)) {
+        fuelsParsed = fuels.map((f) =>
+          typeof f === "string" ? JSON.parse(f) : f
+        );
+      } else throw new Error("Invalid fuels");
       // Validate each fuel
       fuelsParsed.forEach((f) => {
         if (!f.fuel || typeof f.pricePerUnit !== "number") throw new Error();
@@ -240,18 +215,12 @@ router.post("/", upload.single("image"), async (req, res) => {
 
     // Upload image to Cloudinary
     const imageUpload = await new Promise<any>((resolve, reject) => {
-      cloudinary.uploader
-        .upload_stream(
-          { resource_type: "image", folder: "stations" },
-          (error, result) => {
-            if (error) reject(error);
-            else resolve(result);
-          }
-        )
-        .end(req.file!.buffer); // TS non-null assertion
+      cloudinary.uploader.upload_stream(
+        { resource_type: "image", folder: "stations" },
+        (error, result) => (error ? reject(error) : resolve(result))
+      ).end(req.file.buffer);
     });
 
-    // Create station
     const station = await GasStation.create({
       name,
       address,
@@ -270,7 +239,7 @@ router.post("/", upload.single("image"), async (req, res) => {
   }
 });
 
-// ===================== UPDATE STATION (WITH IMAGE REPLACEMENT) =====================
+// ===================== UPDATE STATION =====================
 /**
  * @swagger
  * /api/stations/{id}:
@@ -300,21 +269,11 @@ router.post("/", upload.single("image"), async (req, res) => {
  *               lga:
  *                 type: string
  *               location:
- *                 type: object
- *                 properties:
- *                   lat:
- *                     type: number
- *                   lng:
- *                     type: number
+ *                 type: string
+ *                 description: JSON string like '{"lat":5.123,"lng":7.456}'
  *               fuels:
- *                 type: array
- *                 items:
- *                   type: object
- *                   properties:
- *                     fuel:
- *                       type: string
- *                     price:
- *                       type: number
+ *                 type: string
+ *                 description: JSON array of fuel objects, e.g. '[{"fuel":"id1","pricePerUnit":1200},{"fuel":"id2","pricePerUnit":1050}]'
  *               verified:
  *                 type: boolean
  *               image:
@@ -323,6 +282,8 @@ router.post("/", upload.single("image"), async (req, res) => {
  *     responses:
  *       200:
  *         description: Station updated
+ *       400:
+ *         description: Invalid fuels/location format
  *       404:
  *         description: Station not found
  *       500:
@@ -333,24 +294,22 @@ router.put("/:id", upload.single("image"), async (req, res) => {
     const station = await GasStation.findById(req.params.id);
     if (!station) return res.status(404).json({ message: "Station not found" });
 
-    const { name, address, state, lga, location, fuels, verified } = req.body;
+    let { name, address, state, lga, location, fuels, verified } = req.body;
 
-    // Replace image if uploaded
+    // Update image if uploaded
     if (req.file) {
       if (station.image) {
         const publicId = station.image.split("/").pop()?.split(".")[0];
         if (publicId) await cloudinary.uploader.destroy(`stations/${publicId}`);
       }
-
       const imageUpload = await new Promise<any>((resolve, reject) => {
         cloudinary.uploader
           .upload_stream(
             { resource_type: "image", folder: "stations" },
             (error, result) => (error ? reject(error) : resolve(result))
           )
-          .end(req.file!.buffer);
+          .end(req.file.buffer);
       });
-
       station.image = imageUpload.secure_url;
     }
 
@@ -359,44 +318,32 @@ router.put("/:id", upload.single("image"), async (req, res) => {
     if (state) station.state = state;
     if (lga) station.lga = lga;
 
-    // Parse location if provided
+    // Update location
     if (location) {
       try {
-        station.location =
+        const loc =
           typeof location === "string" ? JSON.parse(location) : location;
-        if (!station.location.lat || !station.location.lng) throw new Error();
+        if (!loc.lat || !loc.lng) throw new Error();
+        station.location = loc;
       } catch {
         return res.status(400).json({ message: "Invalid location format" });
       }
     }
 
-    // Parse fuels if provided
+    // Update fuels
     if (fuels) {
-      // Parse fuels safely (works with Swagger)
-      // Parse fuels safely (works with Swagger)
-      let fuelsParsed: any[] = [];
       try {
-        if (!fuels) throw new Error();
-
-        if (Array.isArray(fuels)) {
-          // Multiple fields sent by Swagger: ["{...}", "{...}"]
-          fuelsParsed = fuels.map((f) => {
-            if (typeof f === "string") return JSON.parse(f);
-            return f;
-          });
-        } else if (typeof fuels === "string") {
-          // Single string, maybe comma-separated like Swagger
-          let str = fuels.trim();
-          if (!str.startsWith("[")) str = `[${str}]`; // wrap in array
-          fuelsParsed = JSON.parse(str);
-        } else {
-          throw new Error();
-        }
-
-        // Validate each fuel
+        let fuelsParsed: any[];
+        if (typeof fuels === "string") fuelsParsed = JSON.parse(fuels);
+        else if (Array.isArray(fuels))
+          fuelsParsed = fuels.map((f) =>
+            typeof f === "string" ? JSON.parse(f) : f
+          );
+        else throw new Error();
         fuelsParsed.forEach((f) => {
           if (!f.fuel || typeof f.pricePerUnit !== "number") throw new Error();
         });
+        station.fuels = fuelsParsed;
       } catch {
         return res.status(400).json({
           message:
