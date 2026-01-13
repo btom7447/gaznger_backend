@@ -208,30 +208,29 @@ router.post("/", upload.single("image"), async (req, res) => {
         });
     }
 
-    // Parse fuels safely
+    // Parse fuels safely (works with Swagger)
     let fuelsParsed: any[] = [];
     try {
       if (typeof fuels === "string") {
-        fuelsParsed = JSON.parse(fuels);
+        // Wrap comma-separated objects into array
+        let str = fuels.trim();
+        if (!str.startsWith("[")) str = `[${str}]`;
+        fuelsParsed = JSON.parse(str);
       } else if (Array.isArray(fuels)) {
         fuelsParsed = fuels;
       } else {
         throw new Error();
       }
 
-      if (!Array.isArray(fuelsParsed) || fuelsParsed.length === 0)
-        throw new Error();
-
+      // Validate each fuel
       fuelsParsed.forEach((f) => {
         if (!f.fuel || typeof f.pricePerUnit !== "number") throw new Error();
       });
     } catch {
-      return res
-        .status(400)
-        .json({
-          message:
-            "Invalid fuels format. Must be JSON array of { fuel, pricePerUnit }",
-        });
+      return res.status(400).json({
+        message:
+          "Invalid fuels format. Must be JSON array of { fuel, pricePerUnit }",
+      });
     }
 
     // Upload image to Cloudinary
@@ -244,9 +243,10 @@ router.post("/", upload.single("image"), async (req, res) => {
             else resolve(result);
           }
         )
-        .end(req.file!.buffer);
+        .end(req.file!.buffer); // TS non-null assertion
     });
 
+    // Create station
     const station = await GasStation.create({
       name,
       address,
@@ -331,18 +331,17 @@ router.put("/:id", upload.single("image"), async (req, res) => {
     const { name, address, state, lga, location, fuels, verified } = req.body;
 
     // Replace image if uploaded
-    if (req.file && station.image) {
-      const publicId = station.image.split("/").pop()?.split(".")[0];
-      if (publicId) await cloudinary.uploader.destroy(`stations/${publicId}`);
+    if (req.file) {
+      if (station.image) {
+        const publicId = station.image.split("/").pop()?.split(".")[0];
+        if (publicId) await cloudinary.uploader.destroy(`stations/${publicId}`);
+      }
 
       const imageUpload = await new Promise<any>((resolve, reject) => {
         cloudinary.uploader
           .upload_stream(
             { resource_type: "image", folder: "stations" },
-            (error, result) => {
-              if (error) reject(error);
-              else resolve(result);
-            }
+            (error, result) => (error ? reject(error) : resolve(result))
           )
           .end(req.file!.buffer);
       });
@@ -360,6 +359,7 @@ router.put("/:id", upload.single("image"), async (req, res) => {
       try {
         station.location =
           typeof location === "string" ? JSON.parse(location) : location;
+        if (!station.location.lat || !station.location.lng) throw new Error();
       } catch {
         return res.status(400).json({ message: "Invalid location format" });
       }
@@ -367,16 +367,30 @@ router.put("/:id", upload.single("image"), async (req, res) => {
 
     // Parse fuels if provided
     if (fuels) {
-      let fuelsParsed: any[];
+      let fuelsParsed: any[] = [];
       try {
-        fuelsParsed = typeof fuels === "string" ? JSON.parse(fuels) : fuels;
-        if (!Array.isArray(fuelsParsed)) throw new Error();
+        if (typeof fuels === "string") {
+          // Wrap comma-separated objects into array
+          let str = fuels.trim();
+          if (!str.startsWith("[")) str = `[${str}]`;
+          fuelsParsed = JSON.parse(str);
+        } else if (Array.isArray(fuels)) {
+          fuelsParsed = fuels;
+        } else {
+          throw new Error();
+        }
+
+        // Validate each fuel
         fuelsParsed.forEach((f) => {
           if (!f.fuel || typeof f.pricePerUnit !== "number") throw new Error();
         });
+
         station.fuels = fuelsParsed;
       } catch {
-        return res.status(400).json({ message: "Invalid fuels format" });
+        return res.status(400).json({
+          message:
+            "Invalid fuels format. Must be JSON array of { fuel, pricePerUnit }",
+        });
       }
     }
 
