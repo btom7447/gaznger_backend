@@ -59,24 +59,17 @@ const upload = multer({ storage: multer.memoryStorage() });
 router.get("/", async (req, res) => {
   try {
     const { verified, state, lga, lat, lng, radius } = req.query;
-
     const filter: any = {};
 
-    // Basic filters
     if (verified !== undefined) filter.verified = verified === "true";
     if (state) filter.state = state;
     if (lga) filter.lga = lga;
 
-    /**
-     * Radius-based search (optional)
-     * Only applied when lat, lng, and radius are provided
-     */
     if (lat && lng && radius) {
       const latNum = parseFloat(lat as string);
       const lngNum = parseFloat(lng as string);
       const r = parseFloat(radius as string);
 
-      // Simple bounding-box calculation
       const latDiff = r / 111;
       const lngDiff = r / (111 * Math.cos((latNum * Math.PI) / 180));
 
@@ -193,14 +186,30 @@ router.get("/:id", async (req, res) => {
  */
 router.post("/", upload.single("image"), async (req, res) => {
   try {
-    if (!req.file) {
+    if (!req.file)
       return res.status(400).json({ message: "Station image is required" });
-    }
 
     const { name, address, state, lga, location, fuels, verified } = req.body;
-
     if (!name || !address || !state || !lga || !location || !fuels) {
       return res.status(400).json({ message: "Missing required fields" });
+    }
+
+    // Safe parsing
+    let locationParsed;
+    try {
+      locationParsed =
+        typeof location === "string" ? JSON.parse(location) : location;
+    } catch {
+      return res.status(400).json({ message: "Invalid location format" });
+    }
+
+    let fuelsParsed;
+    try {
+      fuelsParsed = typeof fuels === "string" ? JSON.parse(fuels) : fuels;
+      if (!Array.isArray(fuelsParsed))
+        throw new Error("Fuels must be an array");
+    } catch {
+      return res.status(400).json({ message: "Invalid fuels format" });
     }
 
     // Upload image to Cloudinary
@@ -221,8 +230,8 @@ router.post("/", upload.single("image"), async (req, res) => {
       address,
       state,
       lga,
-      location: JSON.parse(location),
-      fuels: JSON.parse(fuels),
+      location: locationParsed,
+      fuels: fuelsParsed,
       image: imageUpload.secure_url,
       verified: verified === "true" || verified === true,
     });
@@ -295,19 +304,13 @@ router.post("/", upload.single("image"), async (req, res) => {
 router.put("/:id", upload.single("image"), async (req, res) => {
   try {
     const station = await GasStation.findById(req.params.id);
-    if (!station) {
-      return res.status(404).json({ message: "Station not found" });
-    }
+    if (!station) return res.status(404).json({ message: "Station not found" });
 
     const { name, address, state, lga, location, fuels, verified } = req.body;
 
-    // Replace image if new one is uploaded
     if (req.file && station.image) {
       const publicId = station.image.split("/").pop()?.split(".")[0];
-
-      if (publicId) {
-        await cloudinary.uploader.destroy(`stations/${publicId}`);
-      }
+      if (publicId) await cloudinary.uploader.destroy(`stations/${publicId}`);
 
       const imageUpload = await new Promise<any>((resolve, reject) => {
         cloudinary.uploader
@@ -328,13 +331,31 @@ router.put("/:id", upload.single("image"), async (req, res) => {
     if (address) station.address = address;
     if (state) station.state = state;
     if (lga) station.lga = lga;
-    if (location) station.location = JSON.parse(location);
-    if (fuels) station.fuels = JSON.parse(fuels);
+
+    if (location) {
+      try {
+        station.location =
+          typeof location === "string" ? JSON.parse(location) : location;
+      } catch {
+        return res.status(400).json({ message: "Invalid location format" });
+      }
+    }
+
+    if (fuels) {
+      try {
+        const parsedFuels =
+          typeof fuels === "string" ? JSON.parse(fuels) : fuels;
+        if (!Array.isArray(parsedFuels)) throw new Error();
+        station.fuels = parsedFuels;
+      } catch {
+        return res.status(400).json({ message: "Invalid fuels format" });
+      }
+    }
+
     if (verified !== undefined)
       station.verified = verified === "true" || verified === true;
 
     await station.save();
-
     res.json(station);
   } catch (err) {
     console.error(err);
@@ -367,20 +388,14 @@ router.put("/:id", upload.single("image"), async (req, res) => {
 router.delete("/:id", async (req, res) => {
   try {
     const station = await GasStation.findById(req.params.id);
-    if (!station) {
-      return res.status(404).json({ message: "Station not found" });
-    }
+    if (!station) return res.status(404).json({ message: "Station not found" });
 
-    // Remove image from Cloudinary
     if (station.image) {
       const publicId = station.image.split("/").pop()?.split(".")[0];
-      if (publicId) {
-        await cloudinary.uploader.destroy(`stations/${publicId}`);
-      }
+      if (publicId) await cloudinary.uploader.destroy(`stations/${publicId}`);
     }
 
     await station.deleteOne();
-
     res.json({ message: "Station deleted successfully" });
   } catch (err) {
     console.error(err);
