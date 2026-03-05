@@ -59,10 +59,9 @@ const sendPushNotification = async (deviceTokens, title, body) => {
         // ⚡ Type assertion fixes TS error
         const messaging = admin.messaging();
         const response = await messaging.sendMulticast(message);
-        console.log(`Push notification sent: ${response.successCount} success`);
     }
-    catch (err) {
-        console.error("Failed to send push notification:", err);
+    catch {
+        // Push notification failure is non-fatal
     }
 };
 exports.sendPushNotification = sendPushNotification;

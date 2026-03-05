@@ -46,7 +46,6 @@ router.post("/initialize", requireAuth, async (req, res) => {
       reference: paymentData.reference,
     });
   } catch (err) {
-    console.error("Payment init error:", err);
     res.status(500).json({ message: "Failed to initialize payment" });
   }
 });
@@ -73,7 +72,6 @@ router.post("/verify", requireAuth, async (req, res) => {
 
     res.json({ message: "Payment verified", order });
   } catch (err) {
-    console.error("Payment verify error:", err);
     res.status(500).json({ message: "Failed to verify payment" });
   }
 });
@@ -126,7 +124,6 @@ router.post("/webhook", async (req, res) => {
 
     res.sendStatus(200);
   } catch (err) {
-    console.error("Webhook error:", err);
     res.sendStatus(500);
   }
 });

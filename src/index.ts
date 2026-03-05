@@ -16,8 +16,7 @@ const REQUIRED_ENV_VARS = [
   "FIREBASE_PROJECT_ID",
   "FIREBASE_PRIVATE_KEY",
   "FIREBASE_CLIENT_EMAIL",
-  "SMTP_USER",
-  "SMTP_PASS",
+  "RESEND_API_KEY",
 ];
 
 function validateEnv() {

@@ -12,7 +12,6 @@ import uploadRoutes from "./routes/upload";
 import pointRoutes from "./routes/points";
 import orderRoutes from "./routes/orders";
 import notificationRoutes from "./routes/notifications";
-import tempPointsRoutes from "./routes/tempPoints";
 import addressRoutes from "./routes/address";
 import paymentRoutes from "./routes/payments";
 
@@ -77,7 +76,6 @@ app.use("/api/upload", apiLimiter, uploadRoutes);
 app.use("/api/points", apiLimiter, pointRoutes);
 app.use("/api/orders", apiLimiter, orderRoutes);
 app.use("/api/notifications", apiLimiter, notificationRoutes);
-app.use("/api/temp", apiLimiter, tempPointsRoutes);
 app.use("/api/address-book", apiLimiter, addressRoutes);
 app.use("/api/payments", apiLimiter, paymentRoutes);
 

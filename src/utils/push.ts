@@ -31,8 +31,7 @@ export const sendPushNotification = async (
   const messaging = admin.messaging() as any;
   const response = await messaging.sendMulticast(message);
 
-    console.log(`Push notification sent: ${response.successCount} success`);
-  } catch (err) {
-    console.error("Failed to send push notification:", err);
+  } catch {
+    // Push notification failure is non-fatal
   }
 };

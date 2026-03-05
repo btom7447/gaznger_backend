@@ -37,8 +37,8 @@ const mongoose_1 = __importStar(require("mongoose"));
 const GasStationSchema = new mongoose_1.Schema({
     name: { type: String, required: true },
     address: { type: String, required: true },
-    state: { type: String, required: true }, // new
-    lga: { type: String, required: true }, // new
+    state: { type: String, required: true },
+    lga: { type: String, required: true },
     location: {
         lat: { type: Number, required: true },
         lng: { type: Number, required: true },
@@ -50,7 +50,10 @@ const GasStationSchema = new mongoose_1.Schema({
         },
     ],
     rating: { type: Number, default: 0 },
+    image: { type: String, required: true },
     verified: { type: Boolean, default: false },
 }, { timestamps: true });
+GasStationSchema.index({ state: 1, lga: 1 });
+GasStationSchema.index({ name: "text", address: "text" });
 exports.default = mongoose_1.default.model("GasStation", GasStationSchema);
 //# sourceMappingURL=Station.js.map

@@ -1,8 +1,8 @@
 # Gaznger Backend API
 
-> **Version 1.0** | Node.js/Express REST API for the Gaznger fuel delivery platform.
+> **Version 1.2** | Node.js/Express REST API for the Gaznger fuel delivery platform.
 
-This is the server-side application that powers Gaznger. It provides authentication, order management, station discovery, loyalty points, push notifications, image uploads, and all other data operations consumed by the mobile app.
+This is the server-side application that powers Gaznger. It provides authentication, order management, payment processing (Paystack), station discovery, loyalty points, push notifications, image uploads, and all other data operations consumed by the mobile app.
 
 ---
 
@@ -13,11 +13,12 @@ This is the server-side application that powers Gaznger. It provides authenticat
 - [API Reference](#api-reference)
 - [Data Models](#data-models)
 - [Authentication Flow](#authentication-flow)
+- [Payment Flow](#payment-flow)
 - [Background Jobs](#background-jobs)
 - [Setup & Running](#setup--running)
 - [Environment Variables](#environment-variables)
 - [What Needs Improvement](#what-needs-improvement)
-- [What's Left to Complete](#whats-left-to-complete)
+- [Future Roadmap](#future-roadmap)
 
 ---
 
@@ -34,8 +35,9 @@ This is the server-side application that powers Gaznger. It provides authenticat
 | File Upload | Multer | 2.0.2 |
 | Image Storage | Cloudinary | 2.8.0 |
 | Push Notifications | Firebase Admin SDK (FCM) | 13.6.0 |
-| Email | Nodemailer (Gmail SMTP) | 7.0.12 |
+| Email | Resend | 4.x |
 | Background Jobs | node-cron | 4.2.1 |
+| Payment | Paystack (REST API) | - |
 | API Documentation | Swagger UI Express + swagger-jsdoc | - |
 | CORS | cors | 2.8.5 |
 | Dev Server | ts-node-dev | - |
@@ -52,9 +54,10 @@ server/
 │   ├── swagger.ts             # OpenAPI/Swagger configuration
 │   │
 │   ├── routes/                # API route handlers
-│   │   ├── auth.ts            # Registration, login, OTP, token refresh
+│   │   ├── auth.ts            # Registration, login, OTP, token refresh, forgot/reset password
 │   │   ├── orders.ts          # Order CRUD and status management
-│   │   ├── stations.ts        # Station listing and filtering
+│   │   ├── payments.ts        # Paystack payment initialize, verify, and webhook
+│   │   ├── stations.ts        # Station listing and geospatial filtering
 │   │   ├── fuelTypes.ts       # Fuel type catalog
 │   │   ├── address.ts         # Address book CRUD
 │   │   ├── points.ts          # Loyalty points history and balance
@@ -93,7 +96,8 @@ server/
 ├── dist/                      # Compiled JavaScript output (git-ignored)
 ├── tsconfig.json              # TypeScript configuration
 ├── package.json
-└── .env                       # Environment variables (never commit)
+├── .env.example               # Environment variable template (committed)
+└── .env                       # Local secrets (never commit)
 ```
 
 ---
@@ -110,8 +114,10 @@ Swagger documentation is available at `/api-docs` when the server is running.
 | `POST` | `/auth/login` | None | Login and receive access + refresh tokens |
 | `POST` | `/auth/verify-otp` | None | Verify email OTP code |
 | `POST` | `/auth/resend-otp` | None | Resend OTP to email |
+| `POST` | `/auth/forgot-password` | None | Send password reset OTP to email |
 | `POST` | `/auth/reset-password` | None | Reset password using OTP |
 | `POST` | `/auth/refresh` | None | Exchange refresh token for a new access token |
+| `POST` | `/auth/logout` | JWT | Invalidate the current refresh token |
 | `GET` | `/auth/me` | JWT | Get the current authenticated user's profile |
 | `PUT` | `/auth/me` | JWT | Update user profile (name, phone, gender, image) |
 
@@ -126,7 +132,7 @@ Swagger documentation is available at `/api-docs` when the server is running.
 
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
-| `GET` | `/api/stations` | JWT | List stations; supports `?state=` and `?lga=` query filters |
+| `GET` | `/api/stations` | JWT | List stations; supports `?lat=&lng=&radius=` geospatial filter |
 | `GET` | `/api/stations/:id` | JWT | Get a single station by ID |
 | `POST` | `/api/stations/:id/rate` | JWT | Submit a rating for a station |
 
@@ -134,10 +140,19 @@ Swagger documentation is available at `/api-docs` when the server is running.
 
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
-| `GET` | `/api/orders` | JWT | Get all orders for the authenticated user |
+| `GET` | `/api/orders` | JWT | Get paginated orders for the authenticated user |
 | `POST` | `/api/orders` | JWT | Place a new fuel delivery order |
 | `GET` | `/api/orders/:id` | JWT | Get a specific order by ID |
 | `PUT` | `/api/orders/:id/status` | JWT | Update order status (driver/admin) |
+| `PATCH` | `/api/orders/:id/cancel` | JWT | Cancel a pending order |
+
+### Payments — `/api/payments`
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| `POST` | `/api/payments/initialize` | JWT | Initialize a Paystack payment; returns `authorizationUrl` + `reference` |
+| `POST` | `/api/payments/verify` | JWT | Verify a Paystack payment by reference |
+| `POST` | `/api/payments/webhook` | Paystack Sig | Paystack webhook handler (updates order + payment status) |
 
 ### Address Book — `/api/address-book`
 
@@ -145,7 +160,7 @@ Swagger documentation is available at `/api-docs` when the server is running.
 |--------|----------|------|-------------|
 | `GET` | `/api/address-book` | JWT | List all saved addresses for the user |
 | `POST` | `/api/address-book` | JWT | Add a new address |
-| `PUT` | `/api/address-book/:id` | JWT | Update an existing address |
+| `PUT` | `/api/address-book/:id` | JWT | Update an existing address (or set as default) |
 | `DELETE` | `/api/address-book/:id` | JWT | Delete an address |
 
 ### Points — `/api/points`
@@ -158,8 +173,9 @@ Swagger documentation is available at `/api-docs` when the server is running.
 
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
-| `GET` | `/api/notifications` | JWT | Get all notifications for the user |
-| `POST` | `/api/notifications/read/:id` | JWT | Mark a notification as read |
+| `GET` | `/api/notifications` | JWT | Get paginated notifications for the user |
+| `PATCH` | `/api/notifications/:id/read` | JWT | Mark a single notification as read |
+| `PATCH` | `/api/notifications/read-all` | JWT | Mark all notifications as read |
 
 ### Image Upload — `/api/upload`
 
@@ -181,7 +197,6 @@ Swagger documentation is available at `/api-docs` when the server is running.
   lastName: String,
   gender: String,
   profileImage: String (Cloudinary URL),
-  addressBook: [ObjectId -> Address],
   points: Number,
   deviceTokens: [String] (FCM tokens),
   isVerified: Boolean,
@@ -198,11 +213,13 @@ Swagger documentation is available at `/api-docs` when the server is running.
   station: ObjectId -> Station,
   cylinderType: String,
   quantity: Number,
-  price: Number,
+  totalPrice: Number,
   status: Enum [pending, confirmed, in_transit, delivered, cancelled],
-  deliveryAddress: String,
+  deliveryAddress: ObjectId -> Address,
   deliveryType: Enum [home, pickup],
-  cylinderImage: String (Cloudinary URL),
+  cylinderImages: [String] (Cloudinary URLs),
+  paymentReference: String,
+  paymentStatus: Enum [pending, paid, failed],
   createdAt: Date
 }
 ```
@@ -212,8 +229,8 @@ Swagger documentation is available at `/api-docs` when the server is running.
 {
   name: String,
   address: String,
-  location: { type: "Point", coordinates: [lng, lat] },
-  fuelPrices: [{ fuelType: String, price: Number }],
+  location: { lat: Number, lng: Number },
+  fuels: [{ fuel: ObjectId -> FuelType, pricePerUnit: Number }],
   rating: Number,
   totalRatings: Number,
   image: String (Cloudinary URL),
@@ -281,8 +298,43 @@ Gaznger uses a **JWT access token + refresh token** pattern with email OTP verif
    └── Accepts { refreshToken }
    └── Validates against DB, issues new accessToken
 
-6. Logout
-   └── Client discards tokens; refresh token can be revoked in DB
+6. Forgot Password (POST /auth/forgot-password)
+   └── Accepts { email } → sends OTP email
+
+7. Reset Password (POST /auth/reset-password)
+   └── Accepts { email, otp, newPassword }
+   └── Verifies OTP, hashes new password, invalidates refresh tokens
+
+8. Logout (POST /auth/logout)
+   └── Deletes refresh token from DB
+```
+
+---
+
+## Payment Flow
+
+Gaznger uses **Paystack hosted checkout**:
+
+```
+1. Create Order (POST /api/orders)
+   └── Returns { _id, totalPrice }
+
+2. Initialize Payment (POST /api/payments/initialize)
+   └── Accepts { orderId }
+   └── Calls Paystack API → returns { authorizationUrl, reference }
+   └── Mobile opens authorizationUrl in a WebView
+
+3. User completes payment on Paystack's hosted page
+
+4. Verify Payment (POST /api/payments/verify)
+   └── Accepts { reference }
+   └── Calls Paystack API to confirm payment
+   └── Updates Order: paymentStatus = "paid", status = "confirmed"
+   └── Awards loyalty points (pending)
+
+5. Paystack Webhook (POST /api/payments/webhook)
+   └── Verifies Paystack-Signature header
+   └── Handles charge.success event as an additional confirmation
 ```
 
 ---
@@ -316,14 +368,15 @@ This delayed settlement pattern allows for an order cancellation window where po
 - MongoDB (local instance or Atlas cluster)
 - A Firebase project with a service account (for push notifications)
 - A Cloudinary account (for image uploads)
-- A Gmail account with an App Password (for SMTP email)
+- A Resend account with an API key (for transactional email)
+- A Paystack account with secret key (for payments)
 
 ### Install & Run (Development)
 
 ```bash
 cd server
 npm install
-cp .env.example .env   # fill in all required variables
+cp .env.example .env.local   # fill in all required variables
 npm run dev
 ```
 
@@ -359,6 +412,7 @@ Navigate to `http://localhost:5000/api-docs` in your browser to view the interac
 | `FIREBASE_CLIENT_EMAIL` | Yes | Firebase service account email |
 | `EMAIL_USER` | Yes | Gmail address used to send OTP and transactional emails |
 | `EMAIL_PASS` | Yes | Gmail App Password (not your regular Gmail password) |
+| `PAYSTACK_SECRET_KEY` | Yes | Paystack secret key (`sk_live_*` or `sk_test_*`) |
 | `POINTS_ORDER_PLACED` | No | Points awarded when order is placed (default: 100) |
 | `POINTS_ORDER_DELIVERED` | No | Points awarded on delivery (default: 50) |
 | `POINTS_STATION_RATED` | No | Points awarded for rating a station (default: 50) |
@@ -369,51 +423,49 @@ Navigate to `http://localhost:5000/api-docs` in your browser to view the interac
 
 ### Security (Critical — Fix Before Production)
 
-- **Rotate the JWT secret** — the current secret is `supersecretkey`; replace with a cryptographically random 256-bit string
+- **Rotate the JWT secret** — replace with a cryptographically random 256-bit string
 - **Restrict CORS origin** — `app.ts` currently sets `origin: "*"`; restrict to your frontend domain(s)
 - **Add rate limiting** — install `express-rate-limit` on `/auth` endpoints to prevent brute-force and OTP abuse
 - **Add HTTP security headers** — integrate `helmet.js` as the first middleware
-- **Input validation** — add server-side schema validation (Zod or Joi) on all `req.body` inputs; never trust client data
-- **Sanitize inputs** — add `express-mongo-sanitize` to prevent NoSQL injection via query operator injection
-- **Audit all exposed endpoints** — some routes may be missing the `auth` middleware check
+- **Input validation** — add server-side schema validation (Zod or Joi) on all `req.body` inputs
+- **Sanitize inputs** — add `express-mongo-sanitize` to prevent NoSQL injection
+- **Audit all exposed endpoints** — verify every route that needs `auth` middleware has it applied
 
 ### Code Quality
 
-- **No test coverage** — zero automated tests; add Jest + Supertest for route integration tests and unit tests for utilities
-- **Inconsistent error responses** — different routes return errors in different shapes; standardize to `{ success: false, message: string, errors?: [] }`
-- **Replace `console.log` with structured logging** — use Winston or Pino with log levels and JSON output for production observability
-- **TypeScript strictness** — a few places cast to `any`; define proper types for all request/response payloads
-- **Duplicate logic** — OTP generation and email sending are repeated in multiple route files; extract to shared utility functions
+- **No test coverage** — add Jest + Supertest for route integration tests and unit tests for utilities
+- **Inconsistent error responses** — standardize to `{ success: false, message: string, errors?: [] }`
+- **Replace `console.log` with structured logging** — use Winston or Pino with log levels and JSON output
+- **TypeScript strictness** — define proper types for all request/response payloads; remove `any` casts
+- **Duplicate logic** — OTP generation/email sending repeated across route files; extract to shared utilities
 
 ### Architecture
 
-- **No role-based access control (RBAC)** — all authenticated users have the same permissions; add `role: "customer" | "driver" | "admin"` to the User model and enforce it in middleware
+- **No role-based access control (RBAC)** — add `role: "customer" | "driver" | "admin"` to User model and enforce in middleware
 - **No API versioning** — prefix routes with `/v1/` to allow non-breaking future changes
-- **No request logging middleware** — add `morgan` for HTTP access logs in development and production
-- **No database indexing** — add indexes on:
+- **No request logging middleware** — add `morgan` for HTTP access logs
+- **Missing database indexes** — add:
   - `Station.location` (2dsphere index for geospatial queries)
-  - `Station.state` + `Station.lga` (compound index for filter queries)
-  - `Order.user` + `Order.status` (for order history queries)
+  - `Order.user` + `Order.status` (compound index for order history)
   - `Point.user` + `Point.status` (for points settlement job)
 
 ### Performance
 
 - **No caching** — fuel types and station lists are queried from MongoDB on every request; cache with Redis or an in-memory LRU cache
-- **No pagination** — station and order list endpoints return all documents; add cursor or offset-based pagination
+- **No pagination on all endpoints** — ensure all list endpoints support cursor or offset-based pagination
 
 ---
 
-## What's Left to Complete
+## Future Roadmap
 
-### Phase 1 — Critical for Launch
+### Phase 1 — Driver & Operations
 
 | Feature | Description |
 |---------|-------------|
-| **Payment Integration** | Webhook endpoints for Paystack or Flutterwave to confirm payment and update order status |
-| **Order Assignment** | Logic to assign a confirmed order to an available driver (manual or automatic) |
-| **Driver Endpoints** | API routes for a driver to: view assigned orders, update status to `in_transit` / `delivered` |
-| **Driver Authentication** | Separate driver registration or invite flow with `role: "driver"` |
-| **Real-time Updates** | Integrate Socket.io or Server-Sent Events to push order status changes to the mobile app live |
+| **Order Assignment** | Logic to assign confirmed orders to available drivers (manual or rule-based) |
+| **Driver Endpoints** | API routes for drivers to view assigned orders, update status to `in_transit` / `delivered` |
+| **Driver Authentication** | Driver registration or admin invite flow with `role: "driver"` |
+| **Real-time Updates** | Socket.io or Server-Sent Events to push order status changes live to the mobile app |
 | **SMS OTP** | Integrate Termii or Twilio to send OTP via SMS as an alternative to email |
 
 ### Phase 2 — Enhanced Platform
@@ -422,23 +474,22 @@ Navigate to `http://localhost:5000/api-docs` in your browser to view the interac
 |---------|-------------|
 | **Admin Endpoints** | CRUD for stations, fuel types, user management, and order oversight |
 | **Station Inventory** | Track available fuel quantities per station; flag stations as out-of-stock |
-| **Geospatial Queries** | Use MongoDB `$near` operator to return stations sorted by distance from user coordinates |
 | **Order Pricing Engine** | Calculate total price server-side based on fuel type, quantity, and delivery distance |
 | **Ratings Aggregation** | Recalculate station average rating when a new rating is submitted |
-| **Email Templates** | Replace plain-text OTP emails with styled HTML templates (using Handlebars or MJML) |
+| **Email Templates** | Replace plain-text OTP emails with styled HTML templates (Handlebars or MJML) |
+| **Paystack Recurring** | Support saved cards and one-click reorder payments |
 
 ### Phase 3 — Production & Scale
 
 | Feature | Description |
 |---------|-------------|
 | **Docker Containerization** | Dockerfile + docker-compose for portable, consistent deployments |
-| **CI/CD Pipeline** | GitHub Actions workflow: lint → test → build → deploy on push to main |
-| **Environment-specific Config** | Separate `.env.development`, `.env.staging`, `.env.production` configurations |
+| **CI/CD Pipeline** | GitHub Actions: lint → test → build → deploy on push to main |
 | **Database Migrations** | Scripts to safely apply schema changes to a live MongoDB database |
 | **Analytics Endpoints** | Aggregate endpoints for revenue, order volume, top stations, user retention |
-| **API Rate Limiting Dashboard** | Monitor and configure rate limits per endpoint or per user |
 | **Monitoring & Alerts** | Integrate Datadog, New Relic, or self-hosted Prometheus/Grafana |
+| **Multi-tenancy** | Support multiple operators/franchises under one platform |
 
 ---
 
-*Gaznger Backend v1.0 — Node.js · Express · MongoDB · TypeScript*
+*Gaznger Backend v1.2 — Node.js · Express · MongoDB · TypeScript · Paystack*

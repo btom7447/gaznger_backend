@@ -6,5 +6,4 @@ export async function cleanupExpiredPoints() {
     expiresAt: { $lt: now },
     settled: false,
   });
-  console.log(`Deleted ${result.deletedCount} expired unsettled points`);
 }

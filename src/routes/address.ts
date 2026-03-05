@@ -14,7 +14,7 @@ router.get("/", requireAuth, async (req, res) => {
     const addresses = await Address.find({ user: req.userId }).sort({ createdAt: -1 }).lean();
     res.json(addresses);
   } catch (err) {
-    console.error(err);
+
     res.status(500).json({ message: "Failed to fetch addresses" });
   }
 });
@@ -33,7 +33,7 @@ router.post("/", requireAuth, validate(createAddressSchema), async (req, res) =>
 
     res.status(201).json(address);
   } catch (err) {
-    console.error(err);
+
     res.status(500).json({ message: "Failed to add address" });
   }
 });
@@ -49,7 +49,7 @@ router.patch("/:addressId", requireAuth, validate(updateAddressSchema), async (r
     if (!address) return res.status(404).json({ message: "Address not found" });
     res.json(address);
   } catch (err) {
-    console.error(err);
+
     res.status(500).json({ message: "Failed to update address" });
   }
 });
@@ -75,7 +75,7 @@ router.delete("/:addressId", requireAuth, async (req, res) => {
 
     res.json({ message: "Address deleted" });
   } catch (err) {
-    console.error(err);
+
     res.status(500).json({ message: "Failed to delete address" });
   }
 });
@@ -96,7 +96,7 @@ router.patch("/default/:addressId", requireAuth, async (req, res) => {
 
     res.json({ message: "Default address updated", defaultAddress: user.defaultAddress });
   } catch (err) {
-    console.error(err);
+
     res.status(500).json({ message: "Failed to set default address" });
   }
 });

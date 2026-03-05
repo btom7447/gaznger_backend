@@ -7,7 +7,11 @@ exports.connectDB = void 0;
 const mongoose_1 = __importDefault(require("mongoose"));
 const connectDB = async () => {
     try {
-        const conn = await mongoose_1.default.connect(process.env.MONGO_URI || "");
+        const conn = await mongoose_1.default.connect(process.env.MONGO_URI, {
+            maxPoolSize: 10,
+            serverSelectionTimeoutMS: 5000,
+            retryWrites: true,
+        });
         console.log(`MongoDB connected: ${conn.connection.host}`);
     }
     catch (error) {

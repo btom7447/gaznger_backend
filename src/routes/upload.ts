@@ -36,7 +36,7 @@ router.post("/image", requireAuth, upload.single("image"), async (req, res) => {
 
     res.json({ url: uploadResult.secure_url });
   } catch (err: any) {
-    console.error(err);
+
     res.status(500).json({ message: "Upload failed" });
   }
 });

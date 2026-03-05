@@ -10,7 +10,6 @@ const requireAuth = (req, res, next) => {
     const payload = (0, jwt_1.verifyToken)(token);
     if (!payload)
         return res.status(401).json({ message: "Invalid token" });
-    // attach user id to request
     req.userId = payload.id;
     next();
 };

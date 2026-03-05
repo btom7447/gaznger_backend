@@ -48,10 +48,8 @@ export async function settlePendingPoints() {
     );
 
     await session.commitTransaction();
-    console.log(`Settled ${pointsToSettle.length} pending points`);
   } catch (err) {
     await session.abortTransaction();
-    console.error("Point settlement failed:", err);
   } finally {
     session.endSession();
   }

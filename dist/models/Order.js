@@ -43,7 +43,7 @@ const OrderSchema = new mongoose_1.Schema({
     totalPrice: { type: Number, required: true },
     status: {
         type: String,
-        enum: ["pending", "in-transit", "delivered"],
+        enum: ["pending", "confirmed", "in-transit", "delivered", "cancelled"],
         default: "pending",
     },
     deliveryAddress: {
@@ -51,6 +51,19 @@ const OrderSchema = new mongoose_1.Schema({
         ref: "Address",
         required: true,
     },
+    paymentStatus: {
+        type: String,
+        enum: ["unpaid", "paid", "refunded"],
+        default: "unpaid",
+    },
+    paymentRef: { type: String },
+    // Gas-specific
+    cylinderType: { type: String },
+    deliveryType: { type: String, enum: ["cylinder_swap", "home_refill"] },
+    cylinderImages: [{ type: String }],
 }, { timestamps: true });
+OrderSchema.index({ user: 1, status: 1 });
+OrderSchema.index({ createdAt: -1 });
+OrderSchema.index({ paymentRef: 1 });
 exports.default = mongoose_1.default.model("Order", OrderSchema);
 //# sourceMappingURL=Order.js.map

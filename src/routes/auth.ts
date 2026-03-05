@@ -74,7 +74,7 @@ router.post("/register", validate(registerSchema), async (req, res) => {
       refreshToken,
     });
   } catch (err) {
-    console.error(err);
+
     res.status(500).json({ message: "Internal server error" });
   }
 });
@@ -103,7 +103,6 @@ router.post("/verify-otp", validate(verifyOtpSchema), async (req, res) => {
 
     return res.status(200).json({ message: "Email verified successfully" });
   } catch (err) {
-    console.error("VERIFY OTP ERROR:", err);
     return res.status(500).json({ message: "Internal server error" });
   }
 });
@@ -128,7 +127,6 @@ router.post("/resend-otp", validate(resendOtpSchema), async (req, res) => {
 
     return res.status(200).json({ message: "OTP resent successfully" });
   } catch (err) {
-    console.error("RESEND OTP ERROR:", err);
     return res.status(500).json({ message: "Internal server error" });
   }
 });
@@ -152,7 +150,6 @@ router.post("/forgot-password", validate(forgotPasswordSchema), async (req, res)
 
     return res.status(200).json({ message: "If that email exists, an OTP has been sent." });
   } catch (err) {
-    console.error("FORGOT PASSWORD ERROR:", err);
     return res.status(500).json({ message: "Internal server error" });
   }
 });
@@ -184,7 +181,6 @@ router.post("/reset-password", validate(resetPasswordSchema), async (req, res) =
 
     return res.status(200).json({ message: "Password reset successfully. Please log in again." });
   } catch (err) {
-    console.error("RESET PASSWORD ERROR:", err);
     return res.status(500).json({ message: "Internal server error" });
   }
 });
@@ -208,9 +204,23 @@ router.post("/login", validate(loginSchema), async (req, res) => {
     const refreshToken = signRefreshToken({ id: userIdStr });
     await saveRefreshToken(userIdStr, refreshToken);
 
-    res.json({ user, accessToken, refreshToken });
+    res.json({
+      user: {
+        _id: user._id,
+        email: user.email,
+        displayName: user.displayName,
+        phone: user.phone,
+        gender: user.gender,
+        profileImage: user.profileImage,
+        isVerified: user.isVerified,
+        points: user.points,
+        deviceTokens: user.deviceTokens,
+      },
+      accessToken,
+      refreshToken,
+    });
   } catch (err) {
-    console.error(err);
+
     res.status(500).json({ message: "Internal server error" });
   }
 });
@@ -233,7 +243,7 @@ router.post("/refresh-token", async (req, res) => {
     const accessToken = signAccessToken({ id: payload.id });
     res.json({ accessToken });
   } catch (err) {
-    console.error(err);
+
     res.status(500).json({ message: "Internal server error" });
   }
 });
@@ -261,7 +271,7 @@ router.get("/me", requireAuth, async (req, res) => {
     if (!user) return res.status(404).json({ message: "User not found" });
     res.json(user);
   } catch (err) {
-    console.error(err);
+
     res.status(500).json({ message: "Internal server error" });
   }
 });
@@ -286,7 +296,7 @@ router.put("/me", requireAuth, validate(updateProfileSchema), async (req, res) =
     if (!user) return res.status(404).json({ message: "User not found" });
     res.json(user);
   } catch (err) {
-    console.error(err);
+
     res.status(500).json({ message: "Internal server error" });
   }
 });
@@ -303,7 +313,7 @@ router.post("/device-token", requireAuth, async (req, res) => {
 
     res.json({ message: "Device token registered" });
   } catch (err) {
-    console.error(err);
+
     res.status(500).json({ message: "Internal server error" });
   }
 });
@@ -320,7 +330,7 @@ router.delete("/device-token", requireAuth, async (req, res) => {
 
     res.json({ message: "Device token removed" });
   } catch (err) {
-    console.error(err);
+
     res.status(500).json({ message: "Internal server error" });
   }
 });

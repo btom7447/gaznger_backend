@@ -8,6 +8,7 @@ import Point from "../models/Point";
 import { requireAuth } from "../middleware/auth";
 import { validate } from "../middleware/validate";
 import { createOrderSchema } from "../validators/order.validators";
+import { parsePagination } from "../utils/pagination";
 
 const router = Router();
 
@@ -90,7 +91,7 @@ router.post("/", requireAuth, validate(createOrderSchema), async (req, res) => {
 
     res.status(201).json(order);
   } catch (err) {
-    console.error(err);
+
     res.status(500).json({ message: "Failed to place order" });
   }
 });
@@ -98,7 +99,7 @@ router.post("/", requireAuth, validate(createOrderSchema), async (req, res) => {
 // ===================== GET MY ORDERS (with filter & pagination) =====================
 router.get("/", requireAuth, async (req, res) => {
   try {
-    const { status, startDate, endDate, page = "1", limit = "20" } = req.query;
+    const { status, startDate, endDate } = req.query;
 
     const filter: any = { user: req.userId };
     if (status) filter.status = status;
@@ -108,9 +109,7 @@ router.get("/", requireAuth, async (req, res) => {
       if (endDate) filter.createdAt.$lte = new Date(endDate as string);
     }
 
-    const pageNum = Math.max(1, parseInt(page as string, 10));
-    const limitNum = Math.min(100, Math.max(1, parseInt(limit as string, 10)));
-    const skip = (pageNum - 1) * limitNum;
+    const { page: pageNum, limit: limitNum, skip } = parsePagination(req.query as Record<string, unknown>);
 
     const [orders, total] = await Promise.all([
       Order.find(filter)
@@ -131,7 +130,7 @@ router.get("/", requireAuth, async (req, res) => {
       totalPages: Math.ceil(total / limitNum),
     });
   } catch (err) {
-    console.error(err);
+
     res.status(500).json({ message: "Failed to fetch orders" });
   }
 });
@@ -152,7 +151,7 @@ router.get("/:orderId", requireAuth, async (req, res) => {
 
     res.json(order);
   } catch (err) {
-    console.error(err);
+
     res.status(500).json({ message: "Failed to fetch order" });
   }
 });
@@ -186,7 +185,7 @@ router.patch("/:orderId/status", requireAuth, async (req, res) => {
 
     res.json(order);
   } catch (err) {
-    console.error(err);
+
     res.status(500).json({ message: "Failed to update order status" });
   }
 });
@@ -223,7 +222,7 @@ router.patch("/:orderId/cancel", requireAuth, async (req, res) => {
 
     res.json({ message: "Order cancelled", order });
   } catch (err) {
-    console.error(err);
+
     res.status(500).json({ message: "Failed to cancel order" });
   }
 });
@@ -257,7 +256,7 @@ router.post("/:orderId/rate", requireAuth, async (req, res) => {
 
     res.status(201).json(rating);
   } catch (err) {
-    console.error(err);
+
     res.status(500).json({ message: "Failed to rate station" });
   }
 });

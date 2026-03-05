@@ -26,7 +26,7 @@ router.get("/", async (_req: Request, res: Response) => {
     const fuels = await FuelType.find({});
     res.status(200).json(fuels);
   } catch (err) {
-    console.error("Fetch fuel types failed:", err);
+
     res.status(500).json({ message: "Failed to fetch fuel types" });
   }
 });
@@ -61,7 +61,7 @@ router.post("/", requireAuth, upload.single("image"), async (req: Request, res: 
       try {
         iconUrl = await streamUpload();
       } catch (err: any) {
-        console.error("Cloudinary upload failed:", err);
+
         return res.status(500).json({ message: "Image upload failed" });
       }
     }
@@ -75,7 +75,7 @@ router.post("/", requireAuth, upload.single("image"), async (req: Request, res: 
 
     res.status(201).json(fuel);
   } catch (err) {
-    console.error("Create fuel type failed:", err);
+
     res.status(500).json({ message: "Failed to create fuel type" });
   }
 });

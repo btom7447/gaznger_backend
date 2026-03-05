@@ -10,19 +10,16 @@ const FuelType_1 = __importDefault(require("../models/FuelType"));
 const Rating_1 = __importDefault(require("../models/Rating"));
 const User_1 = __importDefault(require("../models/User"));
 const Point_1 = __importDefault(require("../models/Point"));
+const auth_1 = require("../middleware/auth");
+const validate_1 = require("../middleware/validate");
+const order_validators_1 = require("../validators/order.validators");
+const pagination_1 = require("../utils/pagination");
 const router = (0, express_1.Router)();
-/**
- * Load points per task from environment variables
- * Fallbacks provided if not set
- */
 const POINTS_CONFIG = {
-    orderPlaced: Number(process.env.POINTS_ORDER_PLACED),
-    orderDelivered: Number(process.env.POINTS_ORDER_DELIVERED),
-    rateStation: Number(process.env.POINTS_RATE_STATION),
+    orderPlaced: Number(process.env.POINTS_ORDER_PLACED) || 100,
+    orderDelivered: Number(process.env.POINTS_ORDER_DELIVERED) || 50,
+    rateStation: Number(process.env.POINTS_RATE_STATION) || 50,
 };
-/**
- * Helper: create point record (supports pendingUntil & expiresAt)
- */
 async function awardPoints(userId, points, description, pendingUntil, expiresAt) {
     const now = new Date();
     const isPending = pendingUntil && pendingUntil > now;
@@ -45,41 +42,9 @@ async function awardPoints(userId, points, description, pendingUntil, expiresAt)
     });
 }
 // ===================== PLACE NEW ORDER =====================
-/**
- * @swagger
- * /api/orders:
- *   post:
- *     summary: Place a new fuel order
- *     tags: [Orders]
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             required: [userId, fuelId, stationId, quantity, deliveryAddressId]
- *             properties:
- *               userId:
- *                 type: string
- *               fuelId:
- *                 type: string
- *               stationId:
- *                 type: string
- *               quantity:
- *                 type: number
- *               deliveryAddressId:
- *                 type: string
- *     responses:
- *       201:
- *         description: Order placed and points added
- *       404:
- *         description: Fuel or station not found
- *       500:
- *         description: Server error
- */
-router.post("/", async (req, res) => {
+router.post("/", auth_1.requireAuth, (0, validate_1.validate)(order_validators_1.createOrderSchema), async (req, res) => {
     try {
-        const { userId, fuelId, stationId, quantity, deliveryAddressId } = req.body;
+        const { fuelId, stationId, quantity, deliveryAddressId, cylinderType, deliveryType, cylinderImages, } = req.body;
         const fuel = await FuelType_1.default.findById(fuelId);
         if (!fuel)
             return res.status(404).json({ message: "Fuel not found" });
@@ -87,8 +52,8 @@ router.post("/", async (req, res) => {
         if (!station)
             return res.status(404).json({ message: "Station not found" });
         const totalPrice = quantity * fuel.pricePerUnit;
-        const order = await Order_1.default.create({
-            user: userId,
+        const orderData = {
+            user: req.userId,
             fuel: fuelId,
             station: stationId,
             quantity,
@@ -96,123 +61,83 @@ router.post("/", async (req, res) => {
             totalPrice,
             status: "pending",
             deliveryAddress: deliveryAddressId,
-        });
-        await awardPoints(userId, POINTS_CONFIG.orderPlaced, "Points for placing an order");
+        };
+        if (fuel.name === "Gas") {
+            orderData.cylinderType = cylinderType;
+            orderData.deliveryType = deliveryType;
+            orderData.cylinderImages = cylinderImages || [];
+        }
+        const order = await Order_1.default.create(orderData);
+        await awardPoints(req.userId, POINTS_CONFIG.orderPlaced, "Points for placing an order");
         res.status(201).json(order);
     }
     catch (err) {
-        console.error(err);
         res.status(500).json({ message: "Failed to place order" });
     }
 });
-// ===================== GET ORDERS BY USER =====================
-/**
- * @swagger
- * /api/orders/user/{userId}:
- *   get:
- *     summary: Get all orders for a specific user
- *     tags: [Orders]
- *     parameters:
- *       - in: path
- *         name: userId
- *         required: true
- *         schema:
- *           type: string
- *     responses:
- *       200:
- *         description: List of user orders
- *       500:
- *         description: Server error
- */
-router.get("/user/:userId", async (req, res) => {
+// ===================== GET MY ORDERS (with filter & pagination) =====================
+router.get("/", auth_1.requireAuth, async (req, res) => {
     try {
-        const orders = await Order_1.default.find({ user: req.params.userId })
-            .populate("fuel")
-            .populate("station")
-            .populate("deliveryAddress")
-            .sort({ createdAt: -1 });
-        res.json(orders);
+        const { status, startDate, endDate } = req.query;
+        const filter = { user: req.userId };
+        if (status)
+            filter.status = status;
+        if (startDate || endDate) {
+            filter.createdAt = {};
+            if (startDate)
+                filter.createdAt.$gte = new Date(startDate);
+            if (endDate)
+                filter.createdAt.$lte = new Date(endDate);
+        }
+        const { page: pageNum, limit: limitNum, skip } = (0, pagination_1.parsePagination)(req.query);
+        const [orders, total] = await Promise.all([
+            Order_1.default.find(filter)
+                .populate("fuel")
+                .populate("station")
+                .populate("deliveryAddress")
+                .sort({ createdAt: -1 })
+                .skip(skip)
+                .limit(limitNum)
+                .lean(),
+            Order_1.default.countDocuments(filter),
+        ]);
+        res.json({
+            data: orders,
+            total,
+            page: pageNum,
+            totalPages: Math.ceil(total / limitNum),
+        });
     }
     catch (err) {
-        console.error(err);
         res.status(500).json({ message: "Failed to fetch orders" });
     }
 });
 // ===================== GET ORDER BY ID =====================
-/**
- * @swagger
- * /api/orders/{orderId}:
- *   get:
- *     summary: Get order by ID
- *     tags: [Orders]
- *     parameters:
- *       - in: path
- *         name: orderId
- *         required: true
- *         schema:
- *           type: string
- *     responses:
- *       200:
- *         description: Order details
- *       404:
- *         description: Order not found
- *       500:
- *         description: Server error
- */
-router.get("/:orderId", async (req, res) => {
+router.get("/:orderId", auth_1.requireAuth, async (req, res) => {
     try {
         const order = await Order_1.default.findById(req.params.orderId)
             .populate("fuel")
             .populate("station")
-            .populate("deliveryAddress");
+            .populate("deliveryAddress")
+            .lean();
         if (!order)
             return res.status(404).json({ message: "Order not found" });
+        if (order.user.toString() !== req.userId)
+            return res.status(403).json({ message: "Forbidden" });
         res.json(order);
     }
     catch (err) {
-        console.error(err);
         res.status(500).json({ message: "Failed to fetch order" });
     }
 });
 // ===================== UPDATE ORDER STATUS =====================
-/**
- * @swagger
- * /api/orders/{orderId}/status:
- *   patch:
- *     summary: Update status of an order
- *     tags: [Orders]
- *     parameters:
- *       - in: path
- *         name: orderId
- *         required: true
- *         schema:
- *           type: string
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             properties:
- *               status:
- *                 type: string
- *                 enum: [pending, in-transit, delivered]
- *     responses:
- *       200:
- *         description: Updated order
- *       400:
- *         description: Invalid status
- *       404:
- *         description: Order not found
- *       500:
- *         description: Server error
- */
-router.patch("/:orderId/status", async (req, res) => {
+router.patch("/:orderId/status", auth_1.requireAuth, async (req, res) => {
     try {
         const { status } = req.body;
-        if (!["pending", "in-transit", "delivered"].includes(status))
+        const validStatuses = ["pending", "confirmed", "in-transit", "delivered", "cancelled"];
+        if (!validStatuses.includes(status))
             return res.status(400).json({ message: "Invalid status" });
-        const order = await Order_1.default.findByIdAndUpdate(req.params.orderId, { status }, { new: true });
+        const order = await Order_1.default.findById(req.params.orderId);
         if (!order)
             return res.status(404).json({ message: "Order not found" });
         const prevStatus = order.status;
@@ -220,78 +145,72 @@ router.patch("/:orderId/status", async (req, res) => {
         await order.save();
         if (status === "delivered" && prevStatus !== "delivered") {
             const expiresAt = new Date();
-            expiresAt.setDate(expiresAt.getDate() + 30); // points expire in 30 days
+            expiresAt.setDate(expiresAt.getDate() + 30);
             await awardPoints(order.user.toString(), POINTS_CONFIG.orderDelivered, "Points for order delivered", undefined, expiresAt);
         }
         res.json(order);
     }
     catch (err) {
-        console.error(err);
         res.status(500).json({ message: "Failed to update order status" });
     }
 });
-// ===================== RATE A STATION =====================
-/**
- * @swagger
- * /api/orders/{orderId}/rate:
- *   post:
- *     summary: Rate a station for an order
- *     tags: [Orders]
- *     parameters:
- *       - in: path
- *         name: orderId
- *         required: true
- *         schema:
- *           type: string
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             required: [userId, score]
- *             properties:
- *               userId:
- *                 type: string
- *               score:
- *                 type: number
- *               comment:
- *                 type: string
- *     responses:
- *       201:
- *         description: Rating created and points awarded
- *       400:
- *         description: Cannot rate before delivery
- *       404:
- *         description: Order not found
- *       500:
- *         description: Server error
- */
-router.post("/:orderId/rate", async (req, res) => {
+// ===================== CANCEL ORDER =====================
+router.patch("/:orderId/cancel", auth_1.requireAuth, async (req, res) => {
     try {
-        const { userId, score, comment } = req.body;
         const order = await Order_1.default.findById(req.params.orderId);
         if (!order)
             return res.status(404).json({ message: "Order not found" });
+        if (order.user.toString() !== req.userId)
+            return res.status(403).json({ message: "Forbidden" });
+        if (order.status !== "pending")
+            return res.status(400).json({ message: "Only pending orders can be cancelled" });
+        order.status = "cancelled";
+        await order.save();
+        // Reverse the points awarded for placing this order
+        const reversal = -POINTS_CONFIG.orderPlaced;
+        const user = await User_1.default.findById(req.userId);
+        if (user) {
+            user.points = Math.max(0, user.points + reversal);
+            await user.save();
+        }
+        await Point_1.default.create({
+            user: req.userId,
+            change: reversal,
+            type: "adjust",
+            description: "Points reversed for cancelled order",
+            settled: true,
+        });
+        res.json({ message: "Order cancelled", order });
+    }
+    catch (err) {
+        res.status(500).json({ message: "Failed to cancel order" });
+    }
+});
+// ===================== RATE A STATION =====================
+router.post("/:orderId/rate", auth_1.requireAuth, async (req, res) => {
+    try {
+        const { score, comment } = req.body;
+        const order = await Order_1.default.findById(req.params.orderId);
+        if (!order)
+            return res.status(404).json({ message: "Order not found" });
+        if (order.user.toString() !== req.userId)
+            return res.status(403).json({ message: "Forbidden" });
         if (order.status !== "delivered")
             return res.status(400).json({ message: "Cannot rate before delivery" });
         const rating = await Rating_1.default.create({
-            user: userId,
+            user: req.userId,
             station: order.station,
             order: order._id,
             score,
             comment,
         });
-        const ratings = (await Rating_1.default.find({
-            station: order.station,
-        }).lean());
+        const ratings = (await Rating_1.default.find({ station: order.station }).lean());
         const avgRating = ratings.reduce((sum, r) => sum + r.score, 0) / ratings.length;
         await Station_1.default.findByIdAndUpdate(order.station, { rating: avgRating });
-        await awardPoints(userId, POINTS_CONFIG.rateStation, "Points for rating a station");
+        await awardPoints(req.userId, POINTS_CONFIG.rateStation, "Points for rating a station");
         res.status(201).json(rating);
     }
     catch (err) {
-        console.error(err);
         res.status(500).json({ message: "Failed to rate station" });
     }
 });

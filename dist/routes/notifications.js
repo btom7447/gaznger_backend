@@ -5,31 +5,36 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 const express_1 = require("express");
 const Notification_1 = __importDefault(require("../models/Notification"));
-const push_1 = require("../utils/push");
-const User_1 = __importDefault(require("../models/User"));
+const auth_1 = require("../middleware/auth");
+const pagination_1 = require("../utils/pagination");
 const router = (0, express_1.Router)();
-/**
- * @swagger
- * tags:
- *   name: Notifications
- *   description: User notifications management
- */
-// GET user notifications
-router.get("/:userId", async (req, res) => {
+// GET my notifications (paginated)
+router.get("/", auth_1.requireAuth, async (req, res) => {
     try {
-        const notifications = await Notification_1.default.find({
-            user: req.params.userId,
-        }).sort({ createdAt: -1 });
-        res.json(notifications);
+        const { page: pageNum, limit: limitNum, skip } = (0, pagination_1.parsePagination)(req.query);
+        const [notifications, total] = await Promise.all([
+            Notification_1.default.find({ user: req.userId })
+                .sort({ createdAt: -1 })
+                .skip(skip)
+                .limit(limitNum)
+                .lean(),
+            Notification_1.default.countDocuments({ user: req.userId }),
+        ]);
+        res.json({
+            data: notifications,
+            total,
+            page: pageNum,
+            totalPages: Math.ceil(total / limitNum),
+        });
     }
     catch (err) {
         res.status(500).json({ message: "Failed to fetch notifications" });
     }
 });
-// Mark notification as read
-router.patch("/:id/read", async (req, res) => {
+// Mark a single notification as read
+router.patch("/:id/read", auth_1.requireAuth, async (req, res) => {
     try {
-        const notification = await Notification_1.default.findByIdAndUpdate(req.params.id, { read: true }, { new: true });
+        const notification = await Notification_1.default.findOneAndUpdate({ _id: req.params.id, user: req.userId }, { read: true }, { new: true });
         if (!notification)
             return res.status(404).json({ message: "Notification not found" });
         res.json(notification);
@@ -38,28 +43,14 @@ router.patch("/:id/read", async (req, res) => {
         res.status(500).json({ message: "Failed to update notification" });
     }
 });
-// Send notification to a user (admin/system)
-router.post("/send", async (req, res) => {
+// Mark all notifications as read
+router.patch("/read-all", auth_1.requireAuth, async (req, res) => {
     try {
-        const { userId, type, title, body, push = false } = req.body;
-        const user = await User_1.default.findById(userId);
-        if (!user)
-            return res.status(404).json({ message: "User not found" });
-        // Save notification in DB
-        const notification = await Notification_1.default.create({
-            user: user._id,
-            type,
-            title,
-            body,
-        });
-        // Optionally send push notification
-        if (push && user.deviceTokens.length > 0) {
-            await (0, push_1.sendPushNotification)(user.deviceTokens, title, body);
-        }
-        res.status(201).json(notification);
+        await Notification_1.default.updateMany({ user: req.userId, read: false }, { read: true });
+        res.json({ message: "All notifications marked as read" });
     }
     catch (err) {
-        res.status(500).json({ message: "Failed to send notification" });
+        res.status(500).json({ message: "Failed to update notifications" });
     }
 });
 exports.default = router;

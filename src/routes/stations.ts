@@ -3,6 +3,7 @@ import multer from "multer";
 import GasStation from "../models/Station";
 import cloudinary from "../utils/cloudinary";
 import { requireAuth } from "../middleware/auth";
+import { parsePagination } from "../utils/pagination";
 
 const router = Router();
 
@@ -31,8 +32,6 @@ router.get("/", async (req, res) => {
       lng,
       radius,
       search,
-      page = "1",
-      limit = "20",
     } = req.query;
 
     const filter: any = {};
@@ -60,9 +59,7 @@ router.get("/", async (req, res) => {
       filter["location.lng"] = { $gte: lngNum - lngDiff, $lte: lngNum + lngDiff };
     }
 
-    const pageNum = Math.max(1, parseInt(page as string, 10));
-    const limitNum = Math.min(100, Math.max(1, parseInt(limit as string, 10)));
-    const skip = (pageNum - 1) * limitNum;
+    const { page: pageNum, limit: limitNum, skip } = parsePagination(req.query as Record<string, unknown>);
 
     const [stations, total] = await Promise.all([
       GasStation.find(filter).populate("fuels.fuel").skip(skip).limit(limitNum).lean(),
@@ -76,7 +73,7 @@ router.get("/", async (req, res) => {
       totalPages: Math.ceil(total / limitNum),
     });
   } catch (err) {
-    console.error(err);
+
     res.status(500).json({ message: "Failed to fetch stations" });
   }
 });
@@ -88,7 +85,7 @@ router.get("/:id", async (req, res) => {
     if (!station) return res.status(404).json({ message: "Station not found" });
     res.json(station);
   } catch (err) {
-    console.error(err);
+
     res.status(500).json({ message: "Failed to fetch station" });
   }
 });
@@ -155,7 +152,7 @@ router.post("/", requireAuth, upload.single("image"), async (req, res) => {
 
     res.status(201).json(station);
   } catch (err) {
-    console.error("Error creating station:", err);
+
     res.status(500).json({ message: "Failed to create station" });
   }
 });
@@ -227,7 +224,7 @@ router.put("/:id", requireAuth, upload.single("image"), async (req, res) => {
     await station.save();
     res.json(station);
   } catch (err) {
-    console.error("Error updating station:", err);
+
     res.status(500).json({ message: "Failed to update station" });
   }
 });
@@ -246,7 +243,7 @@ router.delete("/:id", requireAuth, async (req, res) => {
     await station.deleteOne();
     res.json({ message: "Station deleted successfully" });
   } catch (err) {
-    console.error(err);
+
     res.status(500).json({ message: "Failed to delete station" });
   }
 });

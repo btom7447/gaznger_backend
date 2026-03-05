@@ -42,6 +42,7 @@ const AddressSchema = new mongoose_1.Schema({
     state: { type: String, default: "" },
     country: { type: String, default: "" },
     postalCode: { type: String, default: "" },
+    icon: { type: String, default: "home-outline" },
     latitude: { type: Number, default: 0 },
     longitude: { type: Number, default: 0 },
 }, { timestamps: true });
