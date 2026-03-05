@@ -14,7 +14,6 @@ export const requireAuth = (
   const payload = verifyToken(token);
   if (!payload) return res.status(401).json({ message: "Invalid token" });
 
-  // attach user id to request
-  (req as any).userId = (payload as any).id;
+  req.userId = (payload as any).id;
   next();
 };

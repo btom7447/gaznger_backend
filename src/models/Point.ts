@@ -12,21 +12,20 @@ export interface IPoint extends Document {
   updatedAt: Date;
 }
 
-
 const PointSchema: Schema<IPoint> = new Schema(
   {
     user: { type: Schema.Types.ObjectId, ref: "User", required: true },
     change: { type: Number, required: true },
     type: { type: String, enum: ["earn", "redeem", "adjust"], default: "earn" },
     description: { type: String, default: "" },
-    settled: {
-      type: Boolean,
-      default: false,
-    },
-    pendingUntil: { type: Date }, 
+    settled: { type: Boolean, default: false },
+    pendingUntil: { type: Date },
     expiresAt: { type: Date },
   },
   { timestamps: true }
 );
+
+PointSchema.index({ user: 1, settled: 1 });
+PointSchema.index({ expiresAt: 1 });
 
 export default mongoose.model<IPoint>("Point", PointSchema);

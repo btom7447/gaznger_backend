@@ -5,22 +5,18 @@ import FuelType from "../models/FuelType";
 import Rating, { IRating } from "../models/Rating";
 import User from "../models/User";
 import Point from "../models/Point";
+import { requireAuth } from "../middleware/auth";
+import { validate } from "../middleware/validate";
+import { createOrderSchema } from "../validators/order.validators";
 
 const router = Router();
 
-/**
- * Load points per task from environment variables
- * Fallbacks provided if not set
- */
 const POINTS_CONFIG = {
-  orderPlaced: Number(process.env.POINTS_ORDER_PLACED),
-  orderDelivered: Number(process.env.POINTS_ORDER_DELIVERED),
-  rateStation: Number(process.env.POINTS_RATE_STATION),
+  orderPlaced: Number(process.env.POINTS_ORDER_PLACED) || 100,
+  orderDelivered: Number(process.env.POINTS_ORDER_DELIVERED) || 50,
+  rateStation: Number(process.env.POINTS_RATE_STATION) || 50,
 };
 
-/**
- * Helper: create point record (supports pendingUntil & expiresAt)
- */
 async function awardPoints(
   userId: string,
   points: number,
@@ -51,49 +47,16 @@ async function awardPoints(
 }
 
 // ===================== PLACE NEW ORDER =====================
-/**
- * @swagger
- * /api/orders:
- *   post:
- *     summary: Place a new fuel order
- *     tags: [Orders]
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             required: [userId, fuelId, stationId, quantity, deliveryAddressId]
- *             properties:
- *               userId:
- *                 type: string
- *               fuelId:
- *                 type: string
- *               stationId:
- *                 type: string
- *               quantity:
- *                 type: number
- *               deliveryAddressId:
- *                 type: string
- *     responses:
- *       201:
- *         description: Order placed and points added
- *       404:
- *         description: Fuel or station not found
- *       500:
- *         description: Server error
- */
-router.post("/", async (req, res) => {
+router.post("/", requireAuth, validate(createOrderSchema), async (req, res) => {
   try {
     const {
-      userId,
       fuelId,
       stationId,
       quantity,
       deliveryAddressId,
-      cylinderType, // optional
-      deliveryType, // optional
-      cylinderImages, // optional
+      cylinderType,
+      deliveryType,
+      cylinderImages,
     } = req.body;
 
     const fuel = await FuelType.findById(fuelId);
@@ -104,9 +67,8 @@ router.post("/", async (req, res) => {
 
     const totalPrice = quantity * fuel.pricePerUnit;
 
-    // Build the order object
     const orderData: any = {
-      user: userId,
+      user: req.userId,
       fuel: fuelId,
       station: stationId,
       quantity,
@@ -116,7 +78,6 @@ router.post("/", async (req, res) => {
       deliveryAddress: deliveryAddressId,
     };
 
-    // If fuel is Gas, include gas-specific fields
     if (fuel.name === "Gas") {
       orderData.cylinderType = cylinderType;
       orderData.deliveryType = deliveryType;
@@ -125,11 +86,7 @@ router.post("/", async (req, res) => {
 
     const order = await Order.create(orderData);
 
-    await awardPoints(
-      userId,
-      POINTS_CONFIG.orderPlaced,
-      "Points for placing an order"
-    );
+    await awardPoints(req.userId, POINTS_CONFIG.orderPlaced, "Points for placing an order");
 
     res.status(201).json(order);
   } catch (err) {
@@ -138,34 +95,41 @@ router.post("/", async (req, res) => {
   }
 });
 
-// ===================== GET ORDERS BY USER =====================
-/**
- * @swagger
- * /api/orders/user/{userId}:
- *   get:
- *     summary: Get all orders for a specific user
- *     tags: [Orders]
- *     parameters:
- *       - in: path
- *         name: userId
- *         required: true
- *         schema:
- *           type: string
- *     responses:
- *       200:
- *         description: List of user orders
- *       500:
- *         description: Server error
- */
-router.get("/user/:userId", async (req, res) => {
+// ===================== GET MY ORDERS (with filter & pagination) =====================
+router.get("/", requireAuth, async (req, res) => {
   try {
-    const orders = await Order.find({ user: req.params.userId })
-      .populate("fuel")
-      .populate("station")
-      .populate("deliveryAddress")
-      .sort({ createdAt: -1 });
+    const { status, startDate, endDate, page = "1", limit = "20" } = req.query;
 
-    res.json(orders);
+    const filter: any = { user: req.userId };
+    if (status) filter.status = status;
+    if (startDate || endDate) {
+      filter.createdAt = {};
+      if (startDate) filter.createdAt.$gte = new Date(startDate as string);
+      if (endDate) filter.createdAt.$lte = new Date(endDate as string);
+    }
+
+    const pageNum = Math.max(1, parseInt(page as string, 10));
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit as string, 10)));
+    const skip = (pageNum - 1) * limitNum;
+
+    const [orders, total] = await Promise.all([
+      Order.find(filter)
+        .populate("fuel")
+        .populate("station")
+        .populate("deliveryAddress")
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limitNum)
+        .lean(),
+      Order.countDocuments(filter),
+    ]);
+
+    res.json({
+      data: orders,
+      total,
+      page: pageNum,
+      totalPages: Math.ceil(total / limitNum),
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Failed to fetch orders" });
@@ -173,34 +137,18 @@ router.get("/user/:userId", async (req, res) => {
 });
 
 // ===================== GET ORDER BY ID =====================
-/**
- * @swagger
- * /api/orders/{orderId}:
- *   get:
- *     summary: Get order by ID
- *     tags: [Orders]
- *     parameters:
- *       - in: path
- *         name: orderId
- *         required: true
- *         schema:
- *           type: string
- *     responses:
- *       200:
- *         description: Order details
- *       404:
- *         description: Order not found
- *       500:
- *         description: Server error
- */
-router.get("/:orderId", async (req, res) => {
+router.get("/:orderId", requireAuth, async (req, res) => {
   try {
     const order = await Order.findById(req.params.orderId)
       .populate("fuel")
       .populate("station")
-      .populate("deliveryAddress");
+      .populate("deliveryAddress")
+      .lean();
 
     if (!order) return res.status(404).json({ message: "Order not found" });
+
+    if (order.user.toString() !== req.userId)
+      return res.status(403).json({ message: "Forbidden" });
 
     res.json(order);
   } catch (err) {
@@ -210,60 +158,23 @@ router.get("/:orderId", async (req, res) => {
 });
 
 // ===================== UPDATE ORDER STATUS =====================
-/**
- * @swagger
- * /api/orders/{orderId}/status:
- *   patch:
- *     summary: Update status of an order
- *     tags: [Orders]
- *     parameters:
- *       - in: path
- *         name: orderId
- *         required: true
- *         schema:
- *           type: string
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             properties:
- *               status:
- *                 type: string
- *                 enum: [pending, in-transit, delivered]
- *     responses:
- *       200:
- *         description: Updated order
- *       400:
- *         description: Invalid status
- *       404:
- *         description: Order not found
- *       500:
- *         description: Server error
- */
-
-router.patch("/:orderId/status", async (req, res) => {
+router.patch("/:orderId/status", requireAuth, async (req, res) => {
   try {
     const { status } = req.body;
-    if (!["pending", "in-transit", "delivered"].includes(status))
+    const validStatuses = ["pending", "confirmed", "in-transit", "delivered", "cancelled"];
+    if (!validStatuses.includes(status))
       return res.status(400).json({ message: "Invalid status" });
 
-    const order = await Order.findByIdAndUpdate(
-      req.params.orderId,
-      { status },
-      { new: true }
-    );
+    const order = await Order.findById(req.params.orderId);
     if (!order) return res.status(404).json({ message: "Order not found" });
 
     const prevStatus = order.status;
-
     order.status = status;
     await order.save();
 
     if (status === "delivered" && prevStatus !== "delivered") {
       const expiresAt = new Date();
-      expiresAt.setDate(expiresAt.getDate() + 30); // points expire in 30 days
+      expiresAt.setDate(expiresAt.getDate() + 30);
       await awardPoints(
         order.user.toString(),
         POINTS_CONFIG.orderDelivered,
@@ -280,71 +191,69 @@ router.patch("/:orderId/status", async (req, res) => {
   }
 });
 
-// ===================== RATE A STATION =====================
-/**
- * @swagger
- * /api/orders/{orderId}/rate:
- *   post:
- *     summary: Rate a station for an order
- *     tags: [Orders]
- *     parameters:
- *       - in: path
- *         name: orderId
- *         required: true
- *         schema:
- *           type: string
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             required: [userId, score]
- *             properties:
- *               userId:
- *                 type: string
- *               score:
- *                 type: number
- *               comment:
- *                 type: string
- *     responses:
- *       201:
- *         description: Rating created and points awarded
- *       400:
- *         description: Cannot rate before delivery
- *       404:
- *         description: Order not found
- *       500:
- *         description: Server error
- */
-router.post("/:orderId/rate", async (req, res) => {
+// ===================== CANCEL ORDER =====================
+router.patch("/:orderId/cancel", requireAuth, async (req, res) => {
   try {
-    const { userId, score, comment } = req.body;
     const order = await Order.findById(req.params.orderId);
     if (!order) return res.status(404).json({ message: "Order not found" });
+
+    if (order.user.toString() !== req.userId)
+      return res.status(403).json({ message: "Forbidden" });
+
+    if (order.status !== "pending")
+      return res.status(400).json({ message: "Only pending orders can be cancelled" });
+
+    order.status = "cancelled";
+    await order.save();
+
+    // Reverse the points awarded for placing this order
+    const reversal = -POINTS_CONFIG.orderPlaced;
+    const user = await User.findById(req.userId);
+    if (user) {
+      user.points = Math.max(0, user.points + reversal);
+      await user.save();
+    }
+    await Point.create({
+      user: req.userId,
+      change: reversal,
+      type: "adjust",
+      description: "Points reversed for cancelled order",
+      settled: true,
+    });
+
+    res.json({ message: "Order cancelled", order });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to cancel order" });
+  }
+});
+
+// ===================== RATE A STATION =====================
+router.post("/:orderId/rate", requireAuth, async (req, res) => {
+  try {
+    const { score, comment } = req.body;
+    const order = await Order.findById(req.params.orderId);
+    if (!order) return res.status(404).json({ message: "Order not found" });
+
+    if (order.user.toString() !== req.userId)
+      return res.status(403).json({ message: "Forbidden" });
+
     if (order.status !== "delivered")
       return res.status(400).json({ message: "Cannot rate before delivery" });
 
     const rating = await Rating.create({
-      user: userId,
+      user: req.userId,
       station: order.station,
       order: order._id,
       score,
       comment,
     });
 
-    const ratings = (await Rating.find({
-      station: order.station,
-    }).lean()) as IRating[];
-    const avgRating =
-      ratings.reduce((sum, r) => sum + r.score, 0) / ratings.length;
+    const ratings = (await Rating.find({ station: order.station }).lean()) as IRating[];
+    const avgRating = ratings.reduce((sum, r) => sum + r.score, 0) / ratings.length;
     await GasStation.findByIdAndUpdate(order.station, { rating: avgRating });
 
-    await awardPoints(
-      userId,
-      POINTS_CONFIG.rateStation,
-      "Points for rating a station"
-    );
+    await awardPoints(req.userId, POINTS_CONFIG.rateStation, "Points for rating a station");
 
     res.status(201).json(rating);
   } catch (err) {

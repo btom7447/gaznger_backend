@@ -14,13 +14,11 @@ export interface IUser extends Document {
   createdAt: Date;
   updatedAt: Date;
 
-  // Add OTP and verification fields
   otpCode?: string;
   otpExpiresAt?: Date;
   isVerified?: boolean;
 }
 
-// Default profile images
 const defaultMaleImage = "https://avatar.iran.liara.run/public/19";
 const defaultFemaleImage = "https://avatar.iran.liara.run/public/57";
 
@@ -42,12 +40,13 @@ const UserSchema: Schema<IUser> = new Schema(
     points: { type: Number, default: 0 },
     deviceTokens: { type: [String], default: [] },
 
-    // OTP and verification
     otpCode: { type: String },
     otpExpiresAt: { type: Date },
     isVerified: { type: Boolean, default: false },
   },
   { timestamps: true }
 );
+
+UserSchema.index({ email: 1 });
 
 export default mongoose.model<IUser>("User", UserSchema);

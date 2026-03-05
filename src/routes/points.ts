@@ -1,98 +1,43 @@
 import { Router } from "express";
 import User from "../models/User";
 import Point from "../models/Point";
+import Order from "../models/Order";
+import { requireAuth } from "../middleware/auth";
 
 const router = Router();
 
-/**
- * Helper: compute user's effective points (ignoring pending & expired)
- */
-async function getEffectivePoints(userId: string) {
-  const now = new Date();
-
-  const points = await Point.find({
-    user: userId,
-    $and: [
-      {
-        $or: [
-          { pendingUntil: { $lte: now } },
-          { pendingUntil: { $exists: false } },
-        ],
-      },
-      {
-        $or: [{ expiresAt: { $gte: now } }, { expiresAt: { $exists: false } }],
-      },
-    ],
-  });
-
-  return points.reduce((sum, p) => sum + p.change, 0);
-}
-
-// ===================== GET CURRENT POINTS =====================
-/**
- * @swagger
- * /api/points/{userId}:
- *   get:
- *     summary: Get current effective points for a user
- *     tags: [Points]
- *     parameters:
- *       - in: path
- *         name: userId
- *         required: true
- *         schema:
- *           type: string
- *     responses:
- *       200:
- *         description: Current points
- *       404:
- *         description: User not found
- *       500:
- *         description: Server error
- */
-router.get("/:userId", async (req, res) => {
+// ===================== GET MY POINTS =====================
+router.get("/", requireAuth, async (req, res) => {
   try {
-    const user = await User.findById(req.params.userId);
+    const user = await User.findById(req.userId).select("points").lean();
     if (!user) return res.status(404).json({ message: "User not found" });
-
-    // Just return the user.points field (already updated by settlement job)
-    res.json({ userId: user._id, points: user.points || 0 });
+    res.json({ userId: req.userId, points: user.points || 0 });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Failed to fetch points" });
   }
 });
 
-// ===================== GET POINT HISTORY =====================
-/**
- * @swagger
- * /api/points/{userId}/history:
- *   get:
- *     summary: Get full point transaction history for a user
- *     tags: [Points]
- *     parameters:
- *       - in: path
- *         name: userId
- *         required: true
- *         schema:
- *           type: string
- *     responses:
- *       200:
- *         description: Array of point transactions
- *       500:
- *         description: Server error
- */
-
-router.get("/:userId/history", async (req, res) => {
+// ===================== GET MY POINT HISTORY (paginated) =====================
+router.get("/history", requireAuth, async (req, res) => {
   try {
     const now = new Date();
-    const pointsHistory = await Point.find({ user: req.params.userId })
-      .sort({ createdAt: -1 })
-      .lean(); // lean() gives plain objects for easier manipulation
+    const { page = "1", limit = "20" } = req.query;
+    const pageNum = Math.max(1, parseInt(page as string, 10));
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit as string, 10)));
+    const skip = (pageNum - 1) * limitNum;
 
-    // Add status field to each point
+    const [pointsHistory, total] = await Promise.all([
+      Point.find({ user: req.userId })
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limitNum)
+        .lean(),
+      Point.countDocuments({ user: req.userId }),
+    ]);
+
     const enrichedHistory = pointsHistory.map((p) => {
       let status: "pending" | "available" | "expired" = "available";
-
       if (p.pendingUntil && new Date(p.pendingUntil) > now) {
         status = "pending";
       } else if (p.expiresAt && new Date(p.expiresAt) < now) {
@@ -100,60 +45,73 @@ router.get("/:userId/history", async (req, res) => {
       } else if (p.settled === false) {
         status = "pending";
       }
-
       return { ...p, status };
     });
 
-    res.json(enrichedHistory);
+    res.json({
+      data: enrichedHistory,
+      total,
+      page: pageNum,
+      totalPages: Math.ceil(total / limitNum),
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Failed to fetch point history" });
   }
 });
 
-// ===================== PATCH/UPDATE POINTS =====================
-/**
- * @swagger
- * /api/points/{userId}:
- *   patch:
- *     summary: Add or reduce points for a user
- *     tags: [Points]
- *     parameters:
- *       - in: path
- *         name: userId
- *         required: true
- *         schema:
- *           type: string
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             required: [change]
- *             properties:
- *               change:
- *                 type: number
- *                 description: Positive to add points, negative to reduce
- *               description:
- *                 type: string
- *               pendingUntil:
- *                 type: string
- *                 format: date-time
- *               expiresAt:
- *                 type: string
- *                 format: date-time
- *     responses:
- *       200:
- *         description: Updated effective points
- *       400:
- *         description: Invalid points change
- *       404:
- *         description: User not found
- *       500:
- *         description: Server error
- */
-router.patch("/:userId", async (req, res) => {
+// ===================== REDEEM POINTS =====================
+router.post("/redeem", requireAuth, async (req, res) => {
+  try {
+    const { orderId, pointsToRedeem } = req.body;
+
+    if (!orderId || typeof pointsToRedeem !== "number" || pointsToRedeem <= 0)
+      return res.status(400).json({ message: "orderId and a positive pointsToRedeem are required" });
+
+    const user = await User.findById(req.userId);
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    if (user.points < pointsToRedeem)
+      return res.status(400).json({ message: "Insufficient points balance" });
+
+    const order = await Order.findById(orderId);
+    if (!order) return res.status(404).json({ message: "Order not found" });
+
+    if (order.user.toString() !== req.userId)
+      return res.status(403).json({ message: "Forbidden" });
+
+    if (order.status !== "pending")
+      return res.status(400).json({ message: "Points can only be redeemed on pending orders" });
+
+    // Each point is worth ₦1 in discount (customize as needed)
+    const discountAmount = pointsToRedeem;
+    order.totalPrice = Math.max(0, order.totalPrice - discountAmount);
+    await order.save();
+
+    user.points -= pointsToRedeem;
+    await user.save();
+
+    await Point.create({
+      user: req.userId,
+      change: -pointsToRedeem,
+      type: "redeem",
+      description: `Redeemed ${pointsToRedeem} points on order #${order._id.toString().slice(-6).toUpperCase()}`,
+      settled: true,
+    });
+
+    res.json({
+      message: `${pointsToRedeem} points redeemed. Order discount: ₦${discountAmount}`,
+      newPointsBalance: user.points,
+      updatedOrderTotal: order.totalPrice,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to redeem points" });
+  }
+});
+
+// ===================== ADMIN: UPDATE POINTS =====================
+router.patch("/:userId", requireAuth, async (req, res) => {
   try {
     const { change, description, pendingUntil, expiresAt } = req.body;
 
@@ -166,14 +124,12 @@ router.patch("/:userId", async (req, res) => {
     const now = new Date();
     const isPending = pendingUntil && new Date(pendingUntil) > now;
 
-    // Immediately update user.points if not pending
     if (!isPending) {
       user.points += change;
       if (user.points < 0) user.points = 0;
       await user.save();
     }
 
-    // Always create a Point document for history
     await Point.create({
       user: user._id.toString(),
       change,
@@ -181,10 +137,9 @@ router.patch("/:userId", async (req, res) => {
       description: description || "",
       pendingUntil: pendingUntil ? new Date(pendingUntil) : undefined,
       expiresAt: expiresAt ? new Date(expiresAt) : undefined,
-      settled: !isPending, // mark as settled if immediately applied
+      settled: !isPending,
     });
 
-    // Return the updated user.points directly
     res.json({ userId: user._id, points: user.points || 0 });
   } catch (err) {
     console.error(err);

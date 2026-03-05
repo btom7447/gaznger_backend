@@ -5,10 +5,12 @@ export interface IOrder extends Document {
   fuel: mongoose.Types.ObjectId;
   station: mongoose.Types.ObjectId;
   quantity: number;
-  unit: string; // "L" or "kg"
+  unit: string;
   totalPrice: number;
-  status: "pending" | "in-transit" | "delivered";
+  status: "pending" | "confirmed" | "in-transit" | "delivered" | "cancelled";
   deliveryAddress: mongoose.Types.ObjectId;
+  paymentStatus: "unpaid" | "paid" | "refunded";
+  paymentRef?: string;
 
   // Gas-specific fields
   cylinderType?: string;
@@ -26,7 +28,7 @@ const OrderSchema: Schema = new Schema(
     totalPrice: { type: Number, required: true },
     status: {
       type: String,
-      enum: ["pending", "in-transit", "delivered"],
+      enum: ["pending", "confirmed", "in-transit", "delivered", "cancelled"],
       default: "pending",
     },
     deliveryAddress: {
@@ -34,6 +36,12 @@ const OrderSchema: Schema = new Schema(
       ref: "Address",
       required: true,
     },
+    paymentStatus: {
+      type: String,
+      enum: ["unpaid", "paid", "refunded"],
+      default: "unpaid",
+    },
+    paymentRef: { type: String },
 
     // Gas-specific
     cylinderType: { type: String },
@@ -42,5 +50,9 @@ const OrderSchema: Schema = new Schema(
   },
   { timestamps: true }
 );
+
+OrderSchema.index({ user: 1, status: 1 });
+OrderSchema.index({ createdAt: -1 });
+OrderSchema.index({ paymentRef: 1 });
 
 export default mongoose.model<IOrder>("Order", OrderSchema);

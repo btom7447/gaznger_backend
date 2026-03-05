@@ -1,26 +1,58 @@
+import mongoose from "mongoose";
 import Point from "../models/Point";
 import User from "../models/User";
 
 export async function settlePendingPoints() {
   const now = new Date();
+  const session = await mongoose.startSession();
 
-  const pointsToSettle = await Point.find({
-    settled: false,
-    pendingUntil: { $lte: now },
-    $or: [{ expiresAt: { $gte: now } }, { expiresAt: { $exists: false } }],
-  });
+  try {
+    session.startTransaction();
 
-  for (const point of pointsToSettle) {
-    const user = await User.findById(point.user);
-    if (!user) continue;
+    const pointsToSettle = await Point.find({
+      settled: false,
+      pendingUntil: { $lte: now },
+      $or: [{ expiresAt: { $gte: now } }, { expiresAt: { $exists: false } }],
+    }).lean();
 
-    user.points += point.change;
-    if (user.points < 0) user.points = 0;
-    await user.save();
+    if (pointsToSettle.length === 0) {
+      await session.abortTransaction();
+      return;
+    }
 
-    point.settled = true;
-    await point.save();
+    // Group changes by user
+    const userTotals: Record<string, number> = {};
+    const pointIds: mongoose.Types.ObjectId[] = [];
+
+    for (const point of pointsToSettle) {
+      const uid = point.user.toString();
+      userTotals[uid] = (userTotals[uid] || 0) + point.change;
+      pointIds.push(point._id as mongoose.Types.ObjectId);
+    }
+
+    // Bulk update user point balances
+    const bulkOps = Object.entries(userTotals).map(([userId, total]) => ({
+      updateOne: {
+        filter: { _id: new mongoose.Types.ObjectId(userId) },
+        update: { $inc: { points: total } },
+      },
+    }));
+
+    await User.bulkWrite(bulkOps, { session });
+
+    // Mark all as settled in one query
+    await Point.updateMany(
+      { _id: { $in: pointIds } },
+      { $set: { settled: true } },
+      { session }
+    );
+
+    await session.commitTransaction();
+    console.log(`Settled ${pointsToSettle.length} pending points`);
+  } catch (err) {
+    await session.abortTransaction();
+    console.error("Point settlement failed:", err);
+  } finally {
+    session.endSession();
   }
-
-  console.log(`Settled ${pointsToSettle.length} points`);
 }

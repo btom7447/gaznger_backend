@@ -16,7 +16,7 @@ const RefreshTokenSchema: Schema = new Schema(
   { timestamps: true }
 );
 
-export default mongoose.model<IRefreshToken>(
-  "RefreshToken",
-  RefreshTokenSchema
-);
+// Auto-delete expired tokens from MongoDB
+RefreshTokenSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+
+export default mongoose.model<IRefreshToken>("RefreshToken", RefreshTokenSchema);

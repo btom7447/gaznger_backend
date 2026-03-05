@@ -1,58 +1,27 @@
 import { Router } from "express";
 import multer from "multer";
 import cloudinary from "../utils/cloudinary";
-import { Express } from "express";
+import { requireAuth } from "../middleware/auth";
 
 const router = Router();
 
-// Multer setup for memory storage (buffer)
-const storage = multer.memoryStorage();
-const upload = multer({ storage });
+const ALLOWED_MIME_TYPES = ["image/jpeg", "image/png", "image/webp"];
 
-/**
- * @swagger
- * tags:
- *   name: Upload
- *   description: Image upload endpoints
- */
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (ALLOWED_MIME_TYPES.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error("Invalid file type. Only JPEG, PNG, and WebP are allowed."));
+    }
+  },
+});
 
-/**
- * @swagger
- * /api/upload/image:
- *   post:
- *     summary: Upload an image to Cloudinary
- *     tags: [Upload]
- *     requestBody:
- *       required: true
- *       content:
- *         multipart/form-data:
- *           schema:
- *             type: object
- *             properties:
- *               image:
- *                 type: string
- *                 format: binary
- *     responses:
- *       200:
- *         description: Image uploaded successfully
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 url:
- *                   type: string
- *                   example: "https://res.cloudinary.com/demo/image/upload/v1234567890/sample.jpg"
- *       400:
- *         description: No file uploaded
- *       500:
- *         description: Server error
- */
-router.post("/image", upload.single("image"), async (req, res) => {
+router.post("/image", requireAuth, upload.single("image"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: "No file uploaded" });
-
-    const fileBuffer = req.file.buffer;
 
     const uploadResult = await new Promise<any>((resolve, reject) => {
       const stream = cloudinary.uploader.upload_stream(
@@ -62,15 +31,14 @@ router.post("/image", upload.single("image"), async (req, res) => {
           else resolve(result);
         }
       );
-      stream.end(fileBuffer); // pipe buffer into the Cloudinary stream
+      stream.end(req.file!.buffer);
     });
 
     res.json({ url: uploadResult.secure_url });
   } catch (err: any) {
     console.error(err);
-    res.status(500).json({ message: err.message || "Upload failed" });
+    res.status(500).json({ message: "Upload failed" });
   }
 });
-
 
 export default router;
