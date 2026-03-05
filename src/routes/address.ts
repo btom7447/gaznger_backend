@@ -86,7 +86,7 @@ router.patch("/default/:addressId", requireAuth, async (req, res) => {
     const user = await User.findById(req.userId);
     if (!user) return res.status(404).json({ message: "User not found" });
 
-    const addressId = new mongoose.Types.ObjectId(req.params.addressId);
+    const addressId = new mongoose.Types.ObjectId(req.params.addressId as string);
 
     if (!user.addressBook.some((id) => id.equals(addressId)))
       return res.status(400).json({ message: "Address does not belong to user" });
