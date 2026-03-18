@@ -7,6 +7,7 @@ export const registerSchema = z.object({
   phone: z.string().refine(val => !val || val.length >= 10, "Phone number must be at least 10 digits").optional(),
   gender: z.enum(["male", "female"]).optional(),
   profileImage: z.string().url("Invalid image URL").optional(),
+  role: z.enum(["customer", "vendor", "rider"]).optional().default("customer"),
 });
 
 export const loginSchema = z.object({
@@ -16,7 +17,7 @@ export const loginSchema = z.object({
 
 export const verifyOtpSchema = z.object({
   email: z.string().email("Invalid email address"),
-  otp: z.string().length(5, "OTP must be exactly 5 digits"),
+  otp: z.string().length(6, "OTP must be exactly 6 digits"),
 });
 
 export const resendOtpSchema = z.object({
@@ -29,7 +30,7 @@ export const forgotPasswordSchema = z.object({
 
 export const resetPasswordSchema = z.object({
   email: z.string().email("Invalid email address"),
-  otp: z.string().length(5, "OTP must be exactly 5 digits"),
+  otp: z.string().length(6, "OTP must be exactly 6 digits"),
   newPassword: z.string().min(8, "Password must be at least 8 characters"),
 });
 

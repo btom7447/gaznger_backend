@@ -2,13 +2,16 @@ import { Router } from "express";
 import Order from "../models/Order";
 import GasStation from "../models/Station";
 import FuelType from "../models/FuelType";
+import Address from "../models/Address";
 import Rating, { IRating } from "../models/Rating";
 import User from "../models/User";
 import Point from "../models/Point";
 import { requireAuth } from "../middleware/auth";
 import { validate } from "../middleware/validate";
-import { createOrderSchema } from "../validators/order.validators";
+import { createOrderSchema, updateOrderStatusSchema, rateOrderSchema } from "../validators/order.validators";
 import { parsePagination } from "../utils/pagination";
+import { notifyUser } from "../utils/notify";
+import { haversineDistance, calcDeliveryFee } from "../utils/haversine";
 
 const router = Router();
 
@@ -60,13 +63,55 @@ router.post("/", requireAuth, validate(createOrderSchema), async (req, res) => {
       cylinderImages,
     } = req.body;
 
-    const fuel = await FuelType.findById(fuelId);
+    // Enforce one active order at a time
+    const activeOrder = await Order.findOne({
+      user: req.userId,
+      status: { $in: ["pending", "confirmed", "assigned", "in-transit"] },
+    });
+    if (activeOrder)
+      return res.status(409).json({ message: "You already have an active order. Cancel it or wait for it to complete before placing a new one." });
+
+    const [fuel, station, address] = await Promise.all([
+      FuelType.findById(fuelId),
+      GasStation.findById(stationId),
+      Address.findById(deliveryAddressId),
+    ]);
+
     if (!fuel) return res.status(404).json({ message: "Fuel not found" });
-
-    const station = await GasStation.findById(stationId);
     if (!station) return res.status(404).json({ message: "Station not found" });
+    if (!station.isActive) return res.status(400).json({ message: "Station is currently closed" });
+    if (!address) return res.status(404).json({ message: "Delivery address not found" });
 
-    const totalPrice = quantity * fuel.pricePerUnit;
+    // Use station's per-fuel price (vendor-set), falling back to FuelType global price
+    const stationFuelEntry = station.fuels.find(
+      (f) => f.fuel.toString() === fuelId
+    );
+    if (!stationFuelEntry) {
+      return res.status(400).json({ message: "This fuel is not available at the selected station" });
+    }
+    if (stationFuelEntry.available === false) {
+      return res.status(400).json({ message: "This fuel is currently unavailable at the selected station" });
+    }
+
+    const pricePerUnit = stationFuelEntry.pricePerUnit;
+    const fuelCost = Math.round(quantity * pricePerUnit);
+
+    // Calculate delivery fee via haversine if both coords are present
+    let deliveryFee = 0;
+    const stationHasCoords = station.location.lat !== 0 && station.location.lng !== 0;
+    const addressHasCoords = address.latitude !== 0 && address.longitude !== 0;
+    if (stationHasCoords && addressHasCoords) {
+      const distanceKm = haversineDistance(
+        { lat: station.location.lat, lng: station.location.lng },
+        { lat: address.latitude, lng: address.longitude }
+      );
+      deliveryFee = calcDeliveryFee(distanceKm);
+    } else {
+      // Fallback: use base fee only when coords are unavailable
+      deliveryFee = Number(process.env.DELIVERY_BASE_FEE) || 500;
+    }
+
+    const totalPrice = fuelCost + deliveryFee;
 
     const orderData: any = {
       user: req.userId,
@@ -74,6 +119,8 @@ router.post("/", requireAuth, validate(createOrderSchema), async (req, res) => {
       station: stationId,
       quantity,
       unit: fuel.unit,
+      fuelCost,
+      deliveryFee,
       totalPrice,
       status: "pending",
       deliveryAddress: deliveryAddressId,
@@ -89,9 +136,32 @@ router.post("/", requireAuth, validate(createOrderSchema), async (req, res) => {
 
     await awardPoints(req.userId, POINTS_CONFIG.orderPlaced, "Points for placing an order");
 
+    // Notify customer: order placed + points
+    await notifyUser(
+      req.userId,
+      "order",
+      "Order Placed",
+      `Your ${fuel.name} order (${quantity} ${fuel.unit}) has been placed successfully.`
+    );
+    await notifyUser(
+      req.userId,
+      "points",
+      "Points Earned!",
+      `You earned ${POINTS_CONFIG.orderPlaced} Gaznger Points for placing an order.`
+    );
+
+    // Notify vendor: new order at their station
+    if (station.vendorId) {
+      await notifyUser(
+        station.vendorId.toString(),
+        "new_order",
+        "New Order Received",
+        `A new ${fuel.name} order (${quantity} ${fuel.unit}) has been placed at your station.`
+      );
+    }
+
     res.status(201).json(order);
   } catch (err) {
-
     res.status(500).json({ message: "Failed to place order" });
   }
 });
@@ -157,12 +227,9 @@ router.get("/:orderId", requireAuth, async (req, res) => {
 });
 
 // ===================== UPDATE ORDER STATUS =====================
-router.patch("/:orderId/status", requireAuth, async (req, res) => {
+router.patch("/:orderId/status", requireAuth, validate(updateOrderStatusSchema), async (req, res) => {
   try {
     const { status } = req.body;
-    const validStatuses = ["pending", "confirmed", "in-transit", "delivered", "cancelled"];
-    if (!validStatuses.includes(status))
-      return res.status(400).json({ message: "Invalid status" });
 
     const order = await Order.findById(req.params.orderId);
     if (!order) return res.status(404).json({ message: "Order not found" });
@@ -171,16 +238,20 @@ router.patch("/:orderId/status", requireAuth, async (req, res) => {
     order.status = status;
     await order.save();
 
+    // Notify on relevant status transitions
+    const userId = order.user.toString();
+    if (status === "confirmed" && prevStatus !== "confirmed") {
+      await notifyUser(userId, "order", "Order Confirmed", "Your order has been confirmed by the station.");
+    }
+    if ((status === "in_transit" || status === "in-transit") && prevStatus !== status) {
+      await notifyUser(userId, "delivery", "On the Way!", "Your fuel is on its way. Track your rider in real time.");
+    }
     if (status === "delivered" && prevStatus !== "delivered") {
       const expiresAt = new Date();
       expiresAt.setDate(expiresAt.getDate() + 30);
-      await awardPoints(
-        order.user.toString(),
-        POINTS_CONFIG.orderDelivered,
-        "Points for order delivered",
-        undefined,
-        expiresAt
-      );
+      await awardPoints(userId, POINTS_CONFIG.orderDelivered, "Points for order delivered", undefined, expiresAt);
+      await notifyUser(userId, "delivered", "Fuel Delivered!", "Your fuel order has been delivered. Enjoy!");
+      await notifyUser(userId, "points", "Points Earned!", `You earned ${POINTS_CONFIG.orderDelivered} Gaznger Points for this delivery.`);
     }
 
     res.json(order);
@@ -220,15 +291,21 @@ router.patch("/:orderId/cancel", requireAuth, async (req, res) => {
       settled: true,
     });
 
+    await notifyUser(
+      req.userId,
+      "cancelled",
+      "Order Cancelled",
+      "Your order has been cancelled and any earned points have been reversed."
+    );
+
     res.json({ message: "Order cancelled", order });
   } catch (err) {
-
     res.status(500).json({ message: "Failed to cancel order" });
   }
 });
 
 // ===================== RATE A STATION =====================
-router.post("/:orderId/rate", requireAuth, async (req, res) => {
+router.post("/:orderId/rate", requireAuth, validate(rateOrderSchema), async (req, res) => {
   try {
     const { score, comment } = req.body;
     const order = await Order.findById(req.params.orderId);
@@ -239,6 +316,10 @@ router.post("/:orderId/rate", requireAuth, async (req, res) => {
 
     if (order.status !== "delivered")
       return res.status(400).json({ message: "Cannot rate before delivery" });
+
+    const existingRating = await Rating.findOne({ order: order._id });
+    if (existingRating)
+      return res.status(409).json({ message: "You have already rated this order" });
 
     const rating = await Rating.create({
       user: req.userId,

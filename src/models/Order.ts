@@ -6,11 +6,18 @@ export interface IOrder extends Document {
   station: mongoose.Types.ObjectId;
   quantity: number;
   unit: string;
+  fuelCost: number;
+  deliveryFee: number;
   totalPrice: number;
-  status: "pending" | "confirmed" | "in-transit" | "delivered" | "cancelled";
+  status: "pending" | "confirmed" | "assigned" | "in-transit" | "delivered" | "cancelled";
   deliveryAddress: mongoose.Types.ObjectId;
   paymentStatus: "unpaid" | "paid" | "refunded";
   paymentRef?: string;
+  cancellationReason?: string;
+  riderId?: mongoose.Types.ObjectId;
+  riderAssignedAt?: Date;
+  dispatchAttempt: number;
+  dispatchExpiresAt?: Date;
 
   // Gas-specific fields
   cylinderType?: string;
@@ -25,10 +32,12 @@ const OrderSchema: Schema = new Schema(
     station: { type: Schema.Types.ObjectId, ref: "GasStation", required: true },
     quantity: { type: Number, required: true },
     unit: { type: String, required: true },
+    fuelCost: { type: Number, required: true },
+    deliveryFee: { type: Number, required: true, default: 0 },
     totalPrice: { type: Number, required: true },
     status: {
       type: String,
-      enum: ["pending", "confirmed", "in-transit", "delivered", "cancelled"],
+      enum: ["pending", "confirmed", "assigned", "in-transit", "delivered", "cancelled"],
       default: "pending",
     },
     deliveryAddress: {
@@ -42,6 +51,10 @@ const OrderSchema: Schema = new Schema(
       default: "unpaid",
     },
     paymentRef: { type: String },
+    riderId: { type: Schema.Types.ObjectId, ref: "User" },
+    riderAssignedAt: { type: Date },
+    dispatchAttempt: { type: Number, default: 0 },
+    dispatchExpiresAt: { type: Date },
 
     // Gas-specific
     cylinderType: { type: String },

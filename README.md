@@ -1,8 +1,8 @@
-# Gaznger Backend API
+# Gaznger — Backend API
 
-> **Version 1.2** | Node.js/Express REST API for the Gaznger fuel delivery platform.
+> **Version 2.0** | Node.js / Express REST API powering the Gaznger multi-role fuel delivery platform.
 
-This is the server-side application that powers Gaznger. It provides authentication, order management, payment processing (Paystack), station discovery, loyalty points, push notifications, image uploads, and all other data operations consumed by the mobile app.
+This service handles all platform operations: authentication, multi-role order management, vendor station control, rider dispatch, delivery tracking, earnings settlement, loyalty points, Paystack payments, FCM push notifications, Resend transactional email, and Cloudinary image storage.
 
 ---
 
@@ -13,34 +13,36 @@ This is the server-side application that powers Gaznger. It provides authenticat
 - [API Reference](#api-reference)
 - [Data Models](#data-models)
 - [Authentication Flow](#authentication-flow)
+- [Dispatch System](#dispatch-system)
 - [Payment Flow](#payment-flow)
+- [Middleware](#middleware)
 - [Background Jobs](#background-jobs)
 - [Setup & Running](#setup--running)
 - [Environment Variables](#environment-variables)
-- [What Needs Improvement](#what-needs-improvement)
-- [Future Roadmap](#future-roadmap)
+- [Known Limitations & TODO](#known-limitations--todo)
 
 ---
 
 ## Tech Stack
 
-| Concern | Library / Tool | Version |
-|---------|---------------|---------|
+| Concern | Library | Version |
+|---------|---------|---------|
 | Runtime | Node.js | 18+ |
-| Language | TypeScript | 5.x |
-| Framework | Express | 5.2.1 |
-| Database | MongoDB (Atlas) · Mongoose | 9.1.1 |
-| Authentication | JSON Web Tokens (jsonwebtoken) | 9.0.3 |
-| Password Hashing | bcrypt | 6.0.0 |
-| File Upload | Multer | 2.0.2 |
-| Image Storage | Cloudinary | 2.8.0 |
-| Push Notifications | Firebase Admin SDK (FCM) | 13.6.0 |
-| Email | Resend | 4.x |
-| Background Jobs | node-cron | 4.2.1 |
-| Payment | Paystack (REST API) | - |
-| API Documentation | Swagger UI Express + swagger-jsdoc | - |
-| CORS | cors | 2.8.5 |
-| Dev Server | ts-node-dev | - |
+| Language | TypeScript | ^5.9 |
+| Framework | Express | ^5.2 |
+| Database | MongoDB Atlas · Mongoose | ^9.1 |
+| Auth | jsonwebtoken | ^9.0 |
+| Password Hashing | bcrypt | ^6.0 |
+| Validation | zod | ^4.3 |
+| File Upload | multer | ^2.0 |
+| Image Storage | Cloudinary SDK | ^2.8 |
+| Push Notifications | firebase-admin (FCM) | ^13.6 |
+| Email | Resend | ^6.9 |
+| Payments | Paystack REST API | — |
+| Background Jobs | node-cron | ^4.2 |
+| Security | helmet · express-rate-limit | — |
+| API Docs | swagger-ui-express + swagger-jsdoc | — |
+| Dev Server | ts-node-dev | — |
 
 ---
 
@@ -49,226 +51,286 @@ This is the server-side application that powers Gaznger. It provides authenticat
 ```
 server/
 ├── src/
-│   ├── index.ts               # Entry point: loads env, connects DB, starts server
-│   ├── app.ts                 # Express app setup: middleware, routes, Swagger, cron
-│   ├── swagger.ts             # OpenAPI/Swagger configuration
+│   ├── index.ts                   # Entry: load env, connect DB, start server
+│   ├── app.ts                     # Express setup: middleware, routes, Swagger
+│   ├── swagger.ts                 # OpenAPI / Swagger config
 │   │
-│   ├── routes/                # API route handlers
-│   │   ├── auth.ts            # Registration, login, OTP, token refresh, forgot/reset password
-│   │   ├── orders.ts          # Order CRUD and status management
-│   │   ├── payments.ts        # Paystack payment initialize, verify, and webhook
-│   │   ├── stations.ts        # Station listing and geospatial filtering
-│   │   ├── fuelTypes.ts       # Fuel type catalog
-│   │   ├── address.ts         # Address book CRUD
-│   │   ├── points.ts          # Loyalty points history and balance
-│   │   ├── notifications.ts   # User notification management
-│   │   ├── upload.ts          # Cloudinary image upload endpoint
-│   │   └── tempPoints.ts      # Temporary/pending points handling
+│   ├── routes/
+│   │   ├── auth.ts                # Register, login, OTP, refresh, forgot/reset
+│   │   ├── orders.ts              # Customer order CRUD, status, cancel, rate
+│   │   ├── vendor.ts              # Vendor orders, station, inventory, earnings
+│   │   ├── rider.ts               # Rider profile, availability, deliveries, earnings
+│   │   ├── admin.ts               # Admin stats, users, stations, riders, settlement
+│   │   ├── payments.ts            # Paystack initialize, verify, webhook
+│   │   ├── stations.ts            # Public station list + admin CRUD
+│   │   ├── fuelTypes.ts           # Fuel type catalogue
+│   │   ├── address.ts             # Customer address book
+│   │   ├── points.ts              # Loyalty points balance, history, redeem
+│   │   ├── notifications.ts       # Notification centre
+│   │   └── upload.ts              # Cloudinary image upload
 │   │
-│   ├── models/                # Mongoose schemas and models
-│   │   ├── User.ts            # User profile and account data
-│   │   ├── Order.ts           # Fuel delivery orders
-│   │   ├── Station.ts         # Gas station data
-│   │   ├── FuelType.ts        # Fuel type catalog entries
-│   │   ├── Address.ts         # User delivery addresses
-│   │   ├── Point.ts           # Loyalty point transactions
-│   │   ├── Rating.ts          # Station ratings
-│   │   ├── Notification.ts    # User notifications
-│   │   └── RefreshToken.ts    # JWT refresh token storage
+│   ├── models/
+│   │   ├── User.ts                # email, password, role, points, deviceTokens
+│   │   ├── Order.ts               # Fuel delivery order (fuelCost, deliveryFee, riderId…)
+│   │   ├── Station.ts             # Station (location, fuels[{fuel,price,available}], vendorId)
+│   │   ├── FuelType.ts            # Fuel type catalogue entry
+│   │   ├── Delivery.ts            # Rider dispatch record (one per candidate rider per order)
+│   │   ├── RiderProfile.ts        # Rider vehicle, availability, location, earnings
+│   │   ├── Earning.ts             # Rider/vendor earning per delivery
+│   │   ├── Address.ts             # Customer delivery address
+│   │   ├── Point.ts               # Loyalty point transaction
+│   │   ├── Rating.ts              # Station rating (one per order)
+│   │   ├── Notification.ts        # User notification
+│   │   └── RefreshToken.ts        # JWT refresh token storage
 │   │
 │   ├── middleware/
-│   │   └── auth.ts            # JWT verification middleware (protects routes)
+│   │   ├── auth.ts                # requireAuth · requireCustomer · requireVendor · requireRider · requireAdmin
+│   │   ├── validate.ts            # Zod schema validation
+│   │   └── errorHandler.ts        # Global error handler
+│   │
+│   ├── validators/
+│   │   ├── auth.validators.ts
+│   │   ├── order.validators.ts    # createOrder · updateOrderStatus · rateOrder
+│   │   └── address.validators.ts
 │   │
 │   ├── utils/
-│   │   ├── hash.ts            # bcrypt password hashing helpers
-│   │   ├── jwt.ts             # JWT sign/verify helpers
-│   │   ├── email.ts           # Nodemailer email sending
-│   │   ├── cloudinary.ts      # Cloudinary upload helper
-│   │   └── push.ts            # Firebase FCM push notification helper
+│   │   ├── jwt.ts                 # signAccessToken · signRefreshToken · verify*
+│   │   ├── hash.ts                # hashPassword · comparePassword (bcrypt)
+│   │   ├── email.ts               # sendOtpEmail (Resend)
+│   │   ├── cloudinary.ts          # Cloudinary client config
+│   │   ├── paystack.ts            # initializePayment · verifyPayment
+│   │   ├── push.ts                # sendPushNotification (FCM)
+│   │   ├── notify.ts              # notifyUser — DB notification + push
+│   │   ├── haversine.ts           # haversineDistance · calcDeliveryFee
+│   │   └── pagination.ts          # parsePagination query helper
 │   │
 │   ├── jobs/
-│   │   ├── settlePoints.ts    # Cron job: settle pending loyalty points
-│   │   └── index.ts           # Job scheduler / registration
+│   │   ├── dispatchRiders.ts      # Broadcast dispatch to nearest available riders
+│   │   ├── settlePoints.ts        # Settle pending loyalty points
+│   │   ├── cleanupPoints.ts       # Expire old point records
+│   │   └── index.ts               # Register all cron jobs
 │   │
-│   └── config/
-│       └── db.ts              # MongoDB connection setup
+│   ├── scripts/
+│   │   └── seed.ts                # DB seeder — 4 test accounts + fuel types + station
+│   │
+│   ├── config/
+│   │   └── db.ts                  # Mongoose connection
+│   │
+│   └── types/
+│       └── express.d.ts           # Augments Express Request with userId: string
 │
-├── dist/                      # Compiled JavaScript output (git-ignored)
-├── tsconfig.json              # TypeScript configuration
+├── dist/                          # Compiled JS output (git-ignored)
+├── tsconfig.json
 ├── package.json
-├── .env.example               # Environment variable template (committed)
-└── .env                       # Local secrets (never commit)
+├── .env.example                   # Variable template (committed — no secrets)
+└── .env                           # Local/production secrets (git-ignored)
 ```
 
 ---
 
 ## API Reference
 
-Swagger documentation is available at `/api-docs` when the server is running.
+Interactive docs: `http://localhost:5000/api-docs`
+
+> All `/api/*` routes require `Authorization: Bearer <accessToken>` unless noted.
 
 ### Authentication — `/auth`
 
-| Method | Endpoint | Auth | Description |
-|--------|----------|------|-------------|
-| `POST` | `/auth/register` | None | Register a new user account |
-| `POST` | `/auth/login` | None | Login and receive access + refresh tokens |
-| `POST` | `/auth/verify-otp` | None | Verify email OTP code |
-| `POST` | `/auth/resend-otp` | None | Resend OTP to email |
-| `POST` | `/auth/forgot-password` | None | Send password reset OTP to email |
-| `POST` | `/auth/reset-password` | None | Reset password using OTP |
-| `POST` | `/auth/refresh` | None | Exchange refresh token for a new access token |
-| `POST` | `/auth/logout` | JWT | Invalidate the current refresh token |
-| `GET` | `/auth/me` | JWT | Get the current authenticated user's profile |
-| `PUT` | `/auth/me` | JWT | Update user profile (name, phone, gender, image) |
-
-### Fuel Types — `/api/fuel-types`
+> Rate-limited: 10 requests per 15 minutes per IP.
 
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
-| `GET` | `/api/fuel-types` | JWT | Get all available fuel types |
-| `POST` | `/api/fuel-types` | JWT | Create a new fuel type entry (admin) |
+| `POST` | `/auth/register` | None | Create account + send OTP email; accepts `role` field |
+| `POST` | `/auth/verify-otp` | None | Verify email OTP; marks `isVerified: true` |
+| `POST` | `/auth/resend-otp` | None | Resend OTP |
+| `POST` | `/auth/login` | None | Returns `{ user, accessToken, refreshToken }` |
+| `POST` | `/auth/forgot-password` | None | Send password-reset OTP |
+| `POST` | `/auth/reset-password` | None | Verify OTP + set new password; revokes refresh tokens |
+| `POST` | `/auth/refresh-token` | None | Rotate refresh token; returns new pair |
+| `POST` | `/auth/logout` | None | Delete refresh token from DB |
+| `GET`  | `/auth/me` | JWT | Get current user |
+| `PUT`  | `/auth/me` | JWT | Update profile (displayName, phone, gender, profileImage) |
+| `POST` | `/auth/device-token` | JWT | Register FCM device token |
+| `DELETE` | `/auth/device-token` | JWT | Remove FCM device token |
+
+### Customer Orders — `/api/orders`
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/api/orders` | Place order — calculates delivery fee, validates station fuel availability, notifies vendor |
+| `GET`  | `/api/orders` | Paginated order list; filter by `status`, `startDate`, `endDate` |
+| `GET`  | `/api/orders/:id` | Get single order (ownership checked) |
+| `PATCH` | `/api/orders/:id/status` | Update status (admin/internal use) |
+| `PATCH` | `/api/orders/:id/cancel` | Cancel pending order; reverses placement points |
+| `POST` | `/api/orders/:id/rate` | Rate station 1–5 after delivery; awards points |
+
+### Vendor — `/api/vendor`
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET`  | `/api/vendor/profile` | Get vendor user + station info |
+| `GET`  | `/api/vendor/orders` | Paginated orders for this vendor; filter by `status` |
+| `PATCH` | `/api/vendor/orders/:id/confirm` | Confirm pending order; triggers dispatch cron on next tick |
+| `PATCH` | `/api/vendor/orders/:id/reject` | Reject pending or confirmed order |
+| `PATCH` | `/api/vendor/station/fuels` | Update fuel price and/or availability |
+| `PATCH` | `/api/vendor/station` | Update station name, hours, isActive toggle |
+| `GET`  | `/api/vendor/earnings` | Paginated earnings + pending/settled aggregate |
+
+### Rider — `/api/rider`
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/api/rider/setup` | Complete onboarding; creates RiderProfile |
+| `GET`  | `/api/rider/profile` | Get rider profile |
+| `PATCH` | `/api/rider/availability` | Toggle `isAvailable` |
+| `PATCH` | `/api/rider/location` | Update `currentLocation` `{ lat, lng }` (polled every 30 s) |
+| `GET`  | `/api/rider/active` | Get current in-progress delivery |
+| `PATCH` | `/api/rider/deliveries/:id/accept` | Accept dispatch; cancel competing records; notify customer |
+| `PATCH` | `/api/rider/deliveries/:id/pickup` | Confirm fuel pickup; order → `in-transit` |
+| `PATCH` | `/api/rider/deliveries/:id/complete` | Complete delivery; credit rider + vendor earnings |
+| `GET`  | `/api/rider/deliveries` | Paginated delivery history |
+| `GET`  | `/api/rider/earnings` | Paginated earnings + pending/settled aggregate |
+
+### Admin — `/api/admin`
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET`  | `/api/admin/stats` | Platform snapshot: users, orders, revenue, active riders |
+| `GET`  | `/api/admin/users` | Paginated user list |
+| `PATCH` | `/api/admin/users/:id/role` | Update user role |
+| `GET`  | `/api/admin/stations` | All stations |
+| `PATCH` | `/api/admin/stations/:id/verify` | Mark station verified |
+| `PATCH` | `/api/admin/stations/:id/active` | Toggle station active state |
+| `GET`  | `/api/admin/orders` | All orders with status filter |
+| `GET`  | `/api/admin/riders` | All rider profiles |
+| `PATCH` | `/api/admin/riders/:id/verify` | Mark rider verified |
+| `PATCH` | `/api/admin/earnings/settle` | Manually trigger earnings settlement |
 
 ### Stations — `/api/stations`
 
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
-| `GET` | `/api/stations` | JWT | List stations; supports `?lat=&lng=&radius=` geospatial filter |
-| `GET` | `/api/stations/:id` | JWT | Get a single station by ID |
-| `POST` | `/api/stations/:id/rate` | JWT | Submit a rating for a station |
+| `GET`  | `/api/stations` | None | List stations; params: `lat`, `lng`, `radius`, `state`, `lga`, `search` |
+| `GET`  | `/api/stations/:id` | None | Get station (populates fuel types) |
+| `POST` | `/api/stations` | Admin | Create station |
+| `PUT`  | `/api/stations/:id` | Admin | Update station |
+| `DELETE` | `/api/stations/:id` | Admin | Delete station |
 
-### Orders — `/api/orders`
+### Other Routes
 
-| Method | Endpoint | Auth | Description |
-|--------|----------|------|-------------|
-| `GET` | `/api/orders` | JWT | Get paginated orders for the authenticated user |
-| `POST` | `/api/orders` | JWT | Place a new fuel delivery order |
-| `GET` | `/api/orders/:id` | JWT | Get a specific order by ID |
-| `PUT` | `/api/orders/:id/status` | JWT | Update order status (driver/admin) |
-| `PATCH` | `/api/orders/:id/cancel` | JWT | Cancel a pending order |
-
-### Payments — `/api/payments`
-
-| Method | Endpoint | Auth | Description |
-|--------|----------|------|-------------|
-| `POST` | `/api/payments/initialize` | JWT | Initialize a Paystack payment; returns `authorizationUrl` + `reference` |
-| `POST` | `/api/payments/verify` | JWT | Verify a Paystack payment by reference |
-| `POST` | `/api/payments/webhook` | Paystack Sig | Paystack webhook handler (updates order + payment status) |
-
-### Address Book — `/api/address-book`
-
-| Method | Endpoint | Auth | Description |
-|--------|----------|------|-------------|
-| `GET` | `/api/address-book` | JWT | List all saved addresses for the user |
-| `POST` | `/api/address-book` | JWT | Add a new address |
-| `PUT` | `/api/address-book/:id` | JWT | Update an existing address (or set as default) |
-| `DELETE` | `/api/address-book/:id` | JWT | Delete an address |
-
-### Points — `/api/points`
-
-| Method | Endpoint | Auth | Description |
-|--------|----------|------|-------------|
-| `GET` | `/api/points` | JWT | Get loyalty points balance and transaction history |
-
-### Notifications — `/api/notifications`
-
-| Method | Endpoint | Auth | Description |
-|--------|----------|------|-------------|
-| `GET` | `/api/notifications` | JWT | Get paginated notifications for the user |
-| `PATCH` | `/api/notifications/:id/read` | JWT | Mark a single notification as read |
-| `PATCH` | `/api/notifications/read-all` | JWT | Mark all notifications as read |
-
-### Image Upload — `/api/upload`
-
-| Method | Endpoint | Auth | Description |
-|--------|----------|------|-------------|
-| `POST` | `/api/upload` | JWT | Upload an image file; returns Cloudinary URL |
+| Group | Prefix | Key Endpoints |
+|-------|--------|---------------|
+| Fuel Types | `/api/fuel-types` | `GET` list, `POST` create (admin) |
+| Address Book | `/api/address-book` | CRUD + set default |
+| Points | `/api/points` | balance, history, redeem |
+| Notifications | `/api/notifications` | list, mark read, unread count, delete |
+| Upload | `/api/upload/image` | Cloudinary image upload |
+| Payments | `/api/payments` | initialize, verify, webhook |
 
 ---
 
 ## Data Models
 
 ### User
-```
+```ts
 {
-  email: String (unique),
-  phone: String,
-  password: String (hashed),
-  firstName: String,
-  lastName: String,
-  gender: String,
-  profileImage: String (Cloudinary URL),
-  points: Number,
-  deviceTokens: [String] (FCM tokens),
-  isVerified: Boolean,
-  otp: String,
-  otpExpiry: Date
+  email: string          // unique
+  phone: string
+  passwordHash: string
+  displayName: string
+  gender: "male" | "female"
+  role: "customer" | "vendor" | "rider" | "admin"
+  isOnboarded: boolean
+  profileImage: string   // Cloudinary URL
+  points: number         // settled loyalty balance
+  deviceTokens: string[] // FCM tokens
+  isVerified: boolean
+  defaultAddress?: ObjectId
 }
 ```
 
 ### Order
-```
+```ts
 {
-  user: ObjectId -> User,
-  fuelType: ObjectId -> FuelType,
-  station: ObjectId -> Station,
-  cylinderType: String,
-  quantity: Number,
-  totalPrice: Number,
-  status: Enum [pending, confirmed, in_transit, delivered, cancelled],
-  deliveryAddress: ObjectId -> Address,
-  deliveryType: Enum [home, pickup],
-  cylinderImages: [String] (Cloudinary URLs),
-  paymentReference: String,
-  paymentStatus: Enum [pending, paid, failed],
-  createdAt: Date
+  user: ObjectId           // → User (customer)
+  fuel: ObjectId           // → FuelType
+  station: ObjectId        // → Station
+  quantity: number
+  unit: string
+  fuelCost: number         // quantity × station pricePerUnit
+  deliveryFee: number      // Haversine-calculated
+  totalPrice: number       // fuelCost + deliveryFee (reduced by points redemption)
+  status: "pending" | "confirmed" | "assigned" | "in-transit" | "delivered" | "cancelled"
+  paymentStatus: "pending" | "paid" | "failed"
+  paymentRef?: string
+  deliveryAddress: ObjectId
+  riderId?: ObjectId
+  riderAssignedAt?: Date
+  dispatchAttempt: number
+  dispatchExpiresAt?: Date
+  cylinderType?: string
+  deliveryType?: "cylinder_swap" | "home_refill"
+  cylinderImages?: string[]
+}
+```
+
+### Delivery (one per candidate rider per order)
+```ts
+{
+  order: ObjectId       // → Order
+  rider: ObjectId       // → User (rider)
+  station: ObjectId     // → Station
+  status: "pending" | "accepted" | "picked_up" | "delivered" | "failed"
+  riderEarnings: number  // pre-computed on dispatch
+  platformEarnings: number
+  pickupTime?: Date
+  deliveryTime?: Date
+}
+```
+
+### RiderProfile
+```ts
+{
+  user: ObjectId        // → User (unique)
+  vehicleType: "motorcycle" | "tricycle" | "van"
+  vehiclePlate: string
+  isAvailable: boolean
+  isVerified: boolean
+  currentLocation?: { lat: number; lng: number }
+  rating: number
+  totalDeliveries: number
+  bankAccount?: { bankName; accountNumber; accountName; paystackRecipientCode? }
+}
+```
+
+### Earning
+```ts
+{
+  user: ObjectId       // → User (rider or vendor)
+  role: "rider" | "vendor"
+  order: ObjectId
+  delivery: ObjectId
+  amount: number
+  type: "delivery_fee" | "fuel_sale"
+  status: "pending" | "settled"
 }
 ```
 
 ### Station
-```
+```ts
 {
-  name: String,
-  address: String,
-  location: { lat: Number, lng: Number },
-  fuels: [{ fuel: ObjectId -> FuelType, pricePerUnit: Number }],
-  rating: Number,
-  totalRatings: Number,
-  image: String (Cloudinary URL),
-  state: String,
-  lga: String
-}
-```
-
-### FuelType
-```
-{
-  name: String,
-  description: String,
-  icon: String,
-  unit: String (litres / kg / etc.)
-}
-```
-
-### Point
-```
-{
-  user: ObjectId -> User,
-  amount: Number,
-  event: Enum [order_placed, order_delivered, station_rated],
-  status: Enum [pending, settled],
-  orderId: ObjectId -> Order,
-  createdAt: Date
-}
-```
-
-### Notification
-```
-{
-  user: ObjectId -> User,
-  title: String,
-  body: String,
-  isRead: Boolean,
-  createdAt: Date
+  name: string
+  address: string
+  state: string
+  lga: string
+  location: { lat: number; lng: number }
+  fuels: Array<{ fuel: ObjectId; pricePerUnit: number; available: boolean }>
+  rating: number
+  image: string       // Cloudinary URL
+  verified: boolean
+  vendorId?: ObjectId
+  isActive: boolean
+  operatingHours?: { open: string; close: string }
 }
 ```
 
@@ -276,122 +338,145 @@ Swagger documentation is available at `/api-docs` when the server is running.
 
 ## Authentication Flow
 
-Gaznger uses a **JWT access token + refresh token** pattern with email OTP verification:
+```
+1. Register   POST /auth/register  { email, password, role }
+              └── Creates user (isVerified: false)
+              └── Sends 6-digit OTP (10-min expiry)
+              └── Returns { accessToken, refreshToken, user }
+
+2. Verify     POST /auth/verify-otp
+              └── Checks OTP + expiry → isVerified: true
+
+3. Login      POST /auth/login
+              └── Verifies password + isVerified
+              └── Returns new accessToken (15 min) + refreshToken (7 days)
+
+4. Requests   Authorization: Bearer <accessToken>
+              └── requireAuth verifies JWT → attaches req.userId
+
+5. Refresh    POST /auth/refresh-token
+              └── Deletes old token from DB (rotation)
+              └── Returns new pair
+
+6. Onboarding index.tsx checks user.isOnboarded
+              └── false → role-specific onboarding wizard
+              └── true  → role-based home tab
+```
+
+---
+
+## Dispatch System
 
 ```
-1. Register (POST /auth/register)
-   └── Creates user, sends OTP email, returns { message }
+Cron: every 1 minute — dispatchRiders()
 
-2. Verify OTP (POST /auth/verify-otp)
-   └── Marks user as verified
+Step 1 — Handle timeouts:
+  Find Delivery records where status=pending and dispatchExpiresAt < now
+  If order.dispatchAttempt < RIDER_DISPATCH_MAX_ROUNDS → reset for re-broadcast
+  Else → cancel order (no rider available)
 
-3. Login (POST /auth/login)
-   └── Returns { accessToken, refreshToken, user }
-       └── accessToken: short-lived (e.g., 15 min)
-       └── refreshToken: long-lived (e.g., 30 days), stored in DB
+Step 2 — Dispatch confirmed orders:
+  Find orders where status=confirmed and dispatchAttempt=0 (or next round due)
+  Query RiderProfile where isAvailable=true, isVerified=true within radius
+  Sort by distance (Haversine from station)
+  Create Delivery records for up to 3 nearest riders
+  Pre-compute riderEarnings = deliveryFee × (1 - PLATFORM_DELIVERY_COMMISSION/100)
+  Send 'dispatch' push notification to each candidate
+  Set order.dispatchExpiresAt = now + RIDER_DISPATCH_TIMEOUT_SECONDS
 
-4. Authenticated Requests
-   └── Include: Authorization: Bearer <accessToken>
-   └── Middleware verifies token and attaches user to req.user
-
-5. Token Refresh (POST /auth/refresh)
-   └── Accepts { refreshToken }
-   └── Validates against DB, issues new accessToken
-
-6. Forgot Password (POST /auth/forgot-password)
-   └── Accepts { email } → sends OTP email
-
-7. Reset Password (POST /auth/reset-password)
-   └── Accepts { email, otp, newPassword }
-   └── Verifies OTP, hashes new password, invalidates refresh tokens
-
-8. Logout (POST /auth/logout)
-   └── Deletes refresh token from DB
+Rider accepts: PATCH /api/rider/deliveries/:id/accept
+  → order.status = "assigned"
+  → Competing Delivery records deleted
+  → Customer notified "Rider Assigned"
 ```
 
 ---
 
 ## Payment Flow
 
-Gaznger uses **Paystack hosted checkout**:
-
 ```
-1. Create Order (POST /api/orders)
-   └── Returns { _id, totalPrice }
+1. Place Order    POST /api/orders
+                  └── Returns { _id, totalPrice, fuelCost, deliveryFee }
 
-2. Initialize Payment (POST /api/payments/initialize)
-   └── Accepts { orderId }
-   └── Calls Paystack API → returns { authorizationUrl, reference }
-   └── Mobile opens authorizationUrl in a WebView
+2. Init Payment   POST /api/payments/initialize  { orderId }
+                  └── Calls Paystack API
+                  └── Stores reference on order
+                  └── Returns { authorizationUrl, reference }
 
-3. User completes payment on Paystack's hosted page
+3. User pays on Paystack hosted page (WebView)
 
-4. Verify Payment (POST /api/payments/verify)
-   └── Accepts { reference }
-   └── Calls Paystack API to confirm payment
-   └── Updates Order: paymentStatus = "paid", status = "confirmed"
-   └── Awards loyalty points (pending)
+4. Verify         POST /api/payments/verify  { reference }
+                  └── Paystack API confirms status === "success"
+                  └── order.paymentStatus = "paid", order.status = "confirmed"
+                  └── Vendor notified "new_order"
 
-5. Paystack Webhook (POST /api/payments/webhook)
-   └── Verifies Paystack-Signature header
-   └── Handles charge.success event as an additional confirmation
+5. Webhook        POST /api/payments/webhook
+                  └── HMAC-SHA512 signature validated
+                  └── Handles charge.success as fallback
+                  └── Idempotent — skips if already paid
 ```
+
+> **Note:** Paystack integration is currently a stub pending business account setup. The WebView screen exists; it will activate once `PAYSTACK_SECRET_KEY` is set to a live key.
+
+---
+
+## Middleware
+
+| Middleware | Description |
+|------------|-------------|
+| `requireAuth` | Verifies Bearer JWT; attaches `req.userId`; returns 401 if missing/invalid |
+| `requireCustomer` | Role check after requireAuth; returns 403 if role ≠ `"customer"` |
+| `requireVendor` | Role check; returns 403 if role ≠ `"vendor"` |
+| `requireRider` | Role check; returns 403 if role ≠ `"rider"` |
+| `requireAdmin` | Role check; returns 403 if role ≠ `"admin"` |
+| `validate(schema)` | Zod parse of `req.body`; returns 400 with `{ errors }` on failure |
+| MongoDB sanitizer | Strips `$`-prefixed keys from body/query — prevents NoSQL injection |
+
+Rate limits: auth `10 req/15 min`, API `100 req/min` per IP.
 
 ---
 
 ## Background Jobs
 
-### `settlePoints` (node-cron)
-
-Scheduled to run periodically (see `jobs/settlePoints.ts`).
-
-- Queries all `Point` documents with `status: "pending"`
-- Updates matching points to `status: "settled"`
-- Credits the settled points to the user's `points` balance on the `User` document
-
-This delayed settlement pattern allows for an order cancellation window where points can be revoked before they are confirmed.
-
-**Points Configuration (via `.env`):**
-| Event | Points Awarded |
-|-------|---------------|
-| Order placed | 100 pts |
-| Order delivered | 50 pts |
-| Station rated | 50 pts |
+| Job | Schedule | Description |
+|-----|----------|-------------|
+| `dispatchRiders` | Every minute | Broadcast dispatch to nearest available riders; handle timeouts |
+| `settlePoints` | Every 10 minutes | Credit settled loyalty points to user balances |
+| `cleanupPoints` | Nightly | Remove expired point records |
 
 ---
 
 ## Setup & Running
 
-### Prerequisites
-
-- Node.js 18+
-- MongoDB (local instance or Atlas cluster)
-- A Firebase project with a service account (for push notifications)
-- A Cloudinary account (for image uploads)
-- A Resend account with an API key (for transactional email)
-- A Paystack account with secret key (for payments)
-
-### Install & Run (Development)
+### Development
 
 ```bash
 cd server
 npm install
-cp .env.example .env.local   # fill in all required variables
-npm run dev
+cp .env.example .env   # fill in all required variables
+npm run dev            # ts-node-dev with hot reload on :5000
 ```
 
-The server starts on `http://localhost:5000` with hot-reload via `ts-node-dev`.
-
-### Build & Run (Production)
+### Seed test data
 
 ```bash
-npm run build    # compiles TypeScript to dist/
-npm start        # runs the compiled dist/index.js
+npm run seed
 ```
 
-### API Documentation
+Creates 4 accounts (customer / vendor / rider / admin), fuel types, a test station, and a rider profile. All passwords: `Password@123`. Safe to re-run.
 
-Navigate to `http://localhost:5000/api-docs` in your browser to view the interactive Swagger UI.
+### Type Check
+
+```bash
+npx tsc --noEmit
+```
+
+### Production Build
+
+```bash
+npm run build   # tsc → dist/
+npm start       # node dist/index.js
+```
 
 ---
 
@@ -399,97 +484,42 @@ Navigate to `http://localhost:5000/api-docs` in your browser to view the interac
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `PORT` | Yes | Server port (default: 5000) |
+| `PORT` | Yes | HTTP port (default: 5000) |
 | `MONGO_URI` | Yes | MongoDB Atlas connection string |
-| `JWT_SECRET` | Yes | Secret for signing JWT access tokens — **use a long random string in production** |
-| `JWT_REFRESH_SECRET` | Yes | Separate secret for refresh tokens |
+| `JWT_SECRET` | Yes | Access token secret — `openssl rand -hex 32` |
+| `JWT_REFRESH_SECRET` | Yes | Refresh token secret — must differ from JWT_SECRET |
 | `CLOUDINARY_CLOUD_NAME` | Yes | Cloudinary cloud name |
 | `CLOUDINARY_API_KEY` | Yes | Cloudinary API key |
 | `CLOUDINARY_API_SECRET` | Yes | Cloudinary API secret |
-| `GOOGLE_MAPS_API_KEY` | No | Google Maps API key (for geocoding) |
 | `FIREBASE_PROJECT_ID` | Yes | Firebase project ID |
-| `FIREBASE_PRIVATE_KEY` | Yes | Firebase service account private key (include `\n` newlines) |
 | `FIREBASE_CLIENT_EMAIL` | Yes | Firebase service account email |
-| `EMAIL_USER` | Yes | Gmail address used to send OTP and transactional emails |
-| `EMAIL_PASS` | Yes | Gmail App Password (not your regular Gmail password) |
-| `PAYSTACK_SECRET_KEY` | Yes | Paystack secret key (`sk_live_*` or `sk_test_*`) |
-| `POINTS_ORDER_PLACED` | No | Points awarded when order is placed (default: 100) |
-| `POINTS_ORDER_DELIVERED` | No | Points awarded on delivery (default: 50) |
-| `POINTS_STATION_RATED` | No | Points awarded for rating a station (default: 50) |
+| `FIREBASE_PRIVATE_KEY` | Yes | Firebase private key (quoted, `\n` newlines) |
+| `RESEND_API_KEY` | Yes | Resend API key |
+| `PAYSTACK_SECRET_KEY` | Yes | `sk_test_*` dev / `sk_live_*` prod |
+| `POINTS_ORDER_PLACED` | No | Points on order placement (default: 100) |
+| `POINTS_ORDER_DELIVERED` | No | Points on delivery (default: 50) |
+| `POINTS_RATE_STATION` | No | Points on rating (default: 50) |
+| `DELIVERY_BASE_FEE` | No | Base delivery fee in kobo (default: 500) |
+| `DELIVERY_PER_KM` | No | Additional fee per km in kobo (default: 100) |
+| `RIDER_DISPATCH_RADIUS_KM` | No | Dispatch search radius (default: 10) |
+| `RIDER_DISPATCH_TIMEOUT_SECONDS` | No | Per-round dispatch timeout (default: 180) |
+| `RIDER_DISPATCH_MAX_ROUNDS` | No | Max broadcast rounds before cancel (default: 3) |
+| `PLATFORM_FUEL_COMMISSION` | No | Vendor commission % deducted from fuel sale (default: 10) |
+| `PLATFORM_DELIVERY_COMMISSION` | No | Rider commission % deducted from delivery fee (default: 5) |
+| `PAYSTACK_SPLITS_ENABLED` | No | Enable Paystack Split Payments (default: false) |
 
 ---
 
-## What Needs Improvement
+## Known Limitations & TODO
 
-### Security (Critical — Fix Before Production)
-
-- **Rotate the JWT secret** — replace with a cryptographically random 256-bit string
-- **Restrict CORS origin** — `app.ts` currently sets `origin: "*"`; restrict to your frontend domain(s)
-- **Add rate limiting** — install `express-rate-limit` on `/auth` endpoints to prevent brute-force and OTP abuse
-- **Add HTTP security headers** — integrate `helmet.js` as the first middleware
-- **Input validation** — add server-side schema validation (Zod or Joi) on all `req.body` inputs
-- **Sanitize inputs** — add `express-mongo-sanitize` to prevent NoSQL injection
-- **Audit all exposed endpoints** — verify every route that needs `auth` middleware has it applied
-
-### Code Quality
-
-- **No test coverage** — add Jest + Supertest for route integration tests and unit tests for utilities
-- **Inconsistent error responses** — standardize to `{ success: false, message: string, errors?: [] }`
-- **Replace `console.log` with structured logging** — use Winston or Pino with log levels and JSON output
-- **TypeScript strictness** — define proper types for all request/response payloads; remove `any` casts
-- **Duplicate logic** — OTP generation/email sending repeated across route files; extract to shared utilities
-
-### Architecture
-
-- **No role-based access control (RBAC)** — add `role: "customer" | "driver" | "admin"` to User model and enforce in middleware
-- **No API versioning** — prefix routes with `/v1/` to allow non-breaking future changes
-- **No request logging middleware** — add `morgan` for HTTP access logs
-- **Missing database indexes** — add:
-  - `Station.location` (2dsphere index for geospatial queries)
-  - `Order.user` + `Order.status` (compound index for order history)
-  - `Point.user` + `Point.status` (for points settlement job)
-
-### Performance
-
-- **No caching** — fuel types and station lists are queried from MongoDB on every request; cache with Redis or an in-memory LRU cache
-- **No pagination on all endpoints** — ensure all list endpoints support cursor or offset-based pagination
+- **Paystack integration** — WebView checkout is stubbed; activate with a live `PAYSTACK_SECRET_KEY`
+- **Admin mobile screens** — Admin API routes exist; no mobile UI yet
+- **Station geospatial** — current queries use bounding-box approximation; switch to MongoDB `$near` with a `2dsphere` index for accuracy
+- **No API versioning** — prefix routes with `/v1/` before shipping a breaking v2 API
+- **Structured logging** — Pino is installed but not wired in; `console.*` used throughout
+- **No test coverage** — add Jest + Supertest integration tests
+- **Settings not persisted** — notification toggles in the mobile app are UI-only; no backend endpoint
 
 ---
 
-## Future Roadmap
-
-### Phase 1 — Driver & Operations
-
-| Feature | Description |
-|---------|-------------|
-| **Order Assignment** | Logic to assign confirmed orders to available drivers (manual or rule-based) |
-| **Driver Endpoints** | API routes for drivers to view assigned orders, update status to `in_transit` / `delivered` |
-| **Driver Authentication** | Driver registration or admin invite flow with `role: "driver"` |
-| **Real-time Updates** | Socket.io or Server-Sent Events to push order status changes live to the mobile app |
-| **SMS OTP** | Integrate Termii or Twilio to send OTP via SMS as an alternative to email |
-
-### Phase 2 — Enhanced Platform
-
-| Feature | Description |
-|---------|-------------|
-| **Admin Endpoints** | CRUD for stations, fuel types, user management, and order oversight |
-| **Station Inventory** | Track available fuel quantities per station; flag stations as out-of-stock |
-| **Order Pricing Engine** | Calculate total price server-side based on fuel type, quantity, and delivery distance |
-| **Ratings Aggregation** | Recalculate station average rating when a new rating is submitted |
-| **Email Templates** | Replace plain-text OTP emails with styled HTML templates (Handlebars or MJML) |
-| **Paystack Recurring** | Support saved cards and one-click reorder payments |
-
-### Phase 3 — Production & Scale
-
-| Feature | Description |
-|---------|-------------|
-| **Docker Containerization** | Dockerfile + docker-compose for portable, consistent deployments |
-| **CI/CD Pipeline** | GitHub Actions: lint → test → build → deploy on push to main |
-| **Database Migrations** | Scripts to safely apply schema changes to a live MongoDB database |
-| **Analytics Endpoints** | Aggregate endpoints for revenue, order volume, top stations, user retention |
-| **Monitoring & Alerts** | Integrate Datadog, New Relic, or self-hosted Prometheus/Grafana |
-| **Multi-tenancy** | Support multiple operators/franchises under one platform |
-
----
-
-*Gaznger Backend v1.2 — Node.js · Express · MongoDB · TypeScript · Paystack*
+*Gaznger Backend v2.0 — Node.js · Express · MongoDB · TypeScript*
