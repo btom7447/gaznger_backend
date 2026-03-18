@@ -2,7 +2,7 @@ import { Router } from "express";
 import multer from "multer";
 import GasStation from "../models/Station";
 import cloudinary from "../utils/cloudinary";
-import { requireAuth } from "../middleware/auth";
+import { requireAuth, requireAdmin } from "../middleware/auth";
 import { parsePagination } from "../utils/pagination";
 
 const router = Router();
@@ -91,7 +91,7 @@ router.get("/:id", async (req, res) => {
 });
 
 // ===================== CREATE NEW STATION =====================
-router.post("/", requireAuth, upload.single("image"), async (req, res) => {
+router.post("/", requireAuth, requireAdmin, upload.single("image"), async (req, res) => {
   try {
     if (!req.file)
       return res.status(400).json({ message: "Station image is required" });
@@ -158,7 +158,7 @@ router.post("/", requireAuth, upload.single("image"), async (req, res) => {
 });
 
 // ===================== UPDATE STATION =====================
-router.put("/:id", requireAuth, upload.single("image"), async (req, res) => {
+router.put("/:id", requireAuth, requireAdmin, upload.single("image"), async (req, res) => {
   try {
     const station = await GasStation.findById(req.params.id);
     if (!station) return res.status(404).json({ message: "Station not found" });
@@ -230,7 +230,7 @@ router.put("/:id", requireAuth, upload.single("image"), async (req, res) => {
 });
 
 // ===================== DELETE STATION =====================
-router.delete("/:id", requireAuth, async (req, res) => {
+router.delete("/:id", requireAuth, requireAdmin, async (req, res) => {
   try {
     const station = await GasStation.findById(req.params.id);
     if (!station) return res.status(404).json({ message: "Station not found" });

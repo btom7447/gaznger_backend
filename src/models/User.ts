@@ -7,6 +7,8 @@ export interface IUser extends Document {
   displayName: string;
   profileImage: string;
   gender: "male" | "female";
+  role: "customer" | "vendor" | "rider" | "admin";
+  isOnboarded: boolean;
   defaultAddress?: mongoose.Types.ObjectId | null;
   addressBook: mongoose.Types.ObjectId[];
   points: number;
@@ -29,6 +31,8 @@ const UserSchema: Schema<IUser> = new Schema(
     passwordHash: { type: String, required: true },
     displayName: { type: String, default: "Guest" },
     gender: { type: String, enum: ["male", "female"], default: "male" },
+    role: { type: String, enum: ["customer", "vendor", "rider", "admin"], default: "customer" },
+    isOnboarded: { type: Boolean, default: false },
     profileImage: {
       type: String,
       default: function (this: IUser) {

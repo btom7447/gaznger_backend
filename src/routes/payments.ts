@@ -3,10 +3,9 @@ import crypto from "crypto";
 import { v4 as uuidv4 } from "uuid";
 import Order from "../models/Order";
 import User from "../models/User";
-import Notification from "../models/Notification";
 import { requireAuth } from "../middleware/auth";
 import { initializePayment, verifyPayment } from "../utils/paystack";
-import { sendPushNotification } from "../utils/push";
+import { notifyUser } from "../utils/notify";
 
 const router = Router();
 
@@ -70,6 +69,13 @@ router.post("/verify", requireAuth, async (req, res) => {
     order.status = "confirmed";
     await order.save();
 
+    await notifyUser(
+      req.userId,
+      "payment",
+      "Payment Successful",
+      `Your payment of ₦${order.totalPrice.toLocaleString()} was received. Your order is being processed.`
+    );
+
     res.json({ message: "Payment verified", order });
   } catch (err) {
     res.status(500).json({ message: "Failed to verify payment" });
@@ -102,23 +108,12 @@ router.post("/webhook", async (req, res) => {
         order.status = "confirmed";
         await order.save();
 
-        const user = await User.findById(order.user);
-        if (user) {
-          await Notification.create({
-            user: user._id,
-            type: "order",
-            title: "Payment Confirmed",
-            body: `Your payment for order #${order._id.toString().slice(-6).toUpperCase()} was successful. Your order is being processed.`,
-          });
-
-          if (user.deviceTokens.length > 0) {
-            await sendPushNotification(
-              user.deviceTokens,
-              "Payment Confirmed",
-              "Your order is being processed."
-            );
-          }
-        }
+        await notifyUser(
+          order.user.toString(),
+          "payment",
+          "Payment Confirmed",
+          `Your payment for order #${order._id.toString().slice(-6).toUpperCase()} was successful. Your order is being processed.`
+        );
       }
     }
 

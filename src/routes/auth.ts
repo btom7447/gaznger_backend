@@ -32,12 +32,12 @@ const saveRefreshToken = async (userId: string, token: string) => {
   await RefreshToken.create({ user: userId, token, expiresAt });
 };
 
-const generateOtp = () => crypto.randomInt(10000, 99999).toString();
+const generateOtp = () => crypto.randomInt(100000, 999999).toString();
 
 // ===================== REGISTER =====================
 router.post("/register", validate(registerSchema), async (req, res) => {
   try {
-    const { email, phone, password, displayName, profileImage, gender } = req.body;
+    const { email, phone, password, displayName, profileImage, gender, role } = req.body;
 
     const existing = await User.findOne({ email });
     if (existing) return res.status(400).json({ message: "Email already in use" });
@@ -51,6 +51,8 @@ router.post("/register", validate(registerSchema), async (req, res) => {
       displayName: displayName || "Guest",
       gender: gender || "male",
       profileImage,
+      role: role || "customer",
+      isOnboarded: role === "customer", // customers skip onboarding, others do not
       isVerified: false,
     });
 
@@ -214,6 +216,8 @@ router.post("/login", validate(loginSchema), async (req, res) => {
         profileImage: user.profileImage,
         isVerified: user.isVerified,
         points: user.points,
+        role: user.role,
+        isOnboarded: user.isOnboarded,
         deviceTokens: user.deviceTokens,
       },
       accessToken,
@@ -232,7 +236,7 @@ router.post("/refresh-token", async (req, res) => {
     if (!refreshToken)
       return res.status(400).json({ message: "Refresh token required" });
 
-    const storedToken = await RefreshToken.findOne({ token: refreshToken });
+    const storedToken = await RefreshToken.findOneAndDelete({ token: refreshToken });
     if (!storedToken)
       return res.status(401).json({ message: "Invalid refresh token" });
 
@@ -241,7 +245,10 @@ router.post("/refresh-token", async (req, res) => {
       return res.status(401).json({ message: "Invalid refresh token" });
 
     const accessToken = signAccessToken({ id: payload.id });
-    res.json({ accessToken });
+    const newRefreshToken = signRefreshToken({ id: payload.id });
+    await saveRefreshToken(payload.id, newRefreshToken);
+
+    res.json({ accessToken, refreshToken: newRefreshToken });
   } catch (err) {
 
     res.status(500).json({ message: "Internal server error" });

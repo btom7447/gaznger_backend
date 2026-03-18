@@ -9,3 +9,14 @@ export const createOrderSchema = z.object({
   deliveryType: z.enum(["cylinder_swap", "home_refill"]).optional(),
   cylinderImages: z.array(z.string()).optional(),
 });
+
+export const updateOrderStatusSchema = z.object({
+  status: z.enum(["pending", "confirmed", "assigned", "in-transit", "delivered", "cancelled"], {
+    error: "Invalid status value",
+  }),
+});
+
+export const rateOrderSchema = z.object({
+  score: z.number().int().min(1, "Score must be at least 1").max(5, "Score must be at most 5"),
+  comment: z.string().max(500).optional(),
+});

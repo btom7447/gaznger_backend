@@ -30,6 +30,16 @@ router.get("/", requireAuth, async (req, res) => {
   }
 });
 
+// Mark all notifications as read (must come before /:id routes)
+router.patch("/read-all", requireAuth, async (req, res) => {
+  try {
+    await Notification.updateMany({ user: req.userId, read: false }, { read: true });
+    res.json({ message: "All notifications marked as read" });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to update notifications" });
+  }
+});
+
 // Mark a single notification as read
 router.patch("/:id/read", requireAuth, async (req, res) => {
   try {
@@ -46,15 +56,30 @@ router.patch("/:id/read", requireAuth, async (req, res) => {
   }
 });
 
-// Mark all notifications as read
-router.patch("/read-all", requireAuth, async (req, res) => {
+
+// GET unread notification count
+router.get("/unread-count", requireAuth, async (req, res) => {
   try {
-    await Notification.updateMany({ user: req.userId, read: false }, { read: true });
-    res.json({ message: "All notifications marked as read" });
+    const count = await Notification.countDocuments({ user: req.userId, read: false });
+    res.json({ count });
   } catch (err) {
-    res.status(500).json({ message: "Failed to update notifications" });
+    res.status(500).json({ message: "Failed to fetch unread count" });
   }
 });
 
+// DELETE a single notification
+router.delete("/:id", requireAuth, async (req, res) => {
+  try {
+    const notification = await Notification.findOneAndDelete({
+      _id: req.params.id,
+      user: req.userId,
+    });
+    if (!notification)
+      return res.status(404).json({ message: "Notification not found" });
+    res.json({ message: "Notification deleted" });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to delete notification" });
+  }
+});
 
 export default router;

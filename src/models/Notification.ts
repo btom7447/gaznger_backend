@@ -1,8 +1,25 @@
 import mongoose, { Schema, Document } from "mongoose";
 
+export type NotificationType =
+  | "order"
+  | "payment"
+  | "delivery"
+  | "delivered"
+  | "cancelled"
+  | "points"
+  | "promo"
+  | "system"
+  | "alert"
+  | "message"
+  // Vendor-specific
+  | "new_order"
+  // Rider-specific
+  | "dispatch"
+  | "earnings";
+
 export interface INotification extends Document {
   user: mongoose.Types.ObjectId;
-  type: "order" | "message" | "promo";
+  type: NotificationType;
   title: string;
   body: string;
   read: boolean;
@@ -13,7 +30,11 @@ export interface INotification extends Document {
 const NotificationSchema: Schema = new Schema(
   {
     user: { type: Schema.Types.ObjectId, ref: "User", required: true },
-    type: { type: String, enum: ["order", "message", "promo"], required: true },
+    type: {
+      type: String,
+      enum: ["order", "payment", "delivery", "delivered", "cancelled", "points", "promo", "system", "alert", "message", "new_order", "dispatch", "earnings"],
+      required: true,
+    },
     title: { type: String, required: true },
     body: { type: String, required: true },
     read: { type: Boolean, default: false },
