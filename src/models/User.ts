@@ -19,6 +19,16 @@ export interface IUser extends Document {
   otpCode?: string;
   otpExpiresAt?: Date;
   isVerified?: boolean;
+
+  vendorBankAccount?: { bankName: string; accountNumber: string; accountName: string };
+  vendorVerification?: {
+    status: "none" | "pending" | "verified" | "rejected";
+    documents: { label: string; url: string }[];
+    submittedAt?: Date;
+    reviewedAt?: Date;
+    note?: string;
+  };
+  partnerBadge?: { plan: string; active: boolean; subscribedAt?: Date };
 }
 
 const defaultMaleImage = "https://avatar.iran.liara.run/public/19";
@@ -47,10 +57,26 @@ const UserSchema: Schema<IUser> = new Schema(
     otpCode: { type: String },
     otpExpiresAt: { type: Date },
     isVerified: { type: Boolean, default: false },
+
+    vendorBankAccount: {
+      bankName: { type: String, default: "" },
+      accountNumber: { type: String, default: "" },
+      accountName: { type: String, default: "" },
+    },
+    vendorVerification: {
+      status: { type: String, enum: ["none", "pending", "verified", "rejected"], default: "none" },
+      documents: [{ label: { type: String }, url: { type: String } }],
+      submittedAt: { type: Date },
+      reviewedAt: { type: Date },
+      note: { type: String },
+    },
+    partnerBadge: {
+      plan: { type: String, default: "" },
+      active: { type: Boolean, default: false },
+      subscribedAt: { type: Date },
+    },
   },
   { timestamps: true }
 );
-
-UserSchema.index({ email: 1 });
 
 export default mongoose.model<IUser>("User", UserSchema);

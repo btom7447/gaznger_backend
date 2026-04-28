@@ -72,7 +72,12 @@ function sanitizeObject(obj: unknown): unknown {
 
 app.use((req: Request, _res: Response, next: NextFunction) => {
   if (req.body) req.body = sanitizeObject(req.body);
-  if (req.query) req.query = sanitizeObject(req.query) as typeof req.query;
+  if (req.query) {
+    const sanitized = sanitizeObject(req.query) as Record<string, string>;
+    Object.keys(sanitized).forEach((key) => {
+      (req.query as Record<string, unknown>)[key] = sanitized[key];
+    });
+  }
   next();
 });
 
@@ -99,7 +104,15 @@ app.get("/health", (_req, res) => {
 });
 
 // Routes
-app.use("/auth", authLimiter, authRoutes);
+// Sensitive auth actions (login, register, OTP, password reset) → strict limiter
+// Profile read/write (GET /auth/me, PUT /auth/me, device token) → relaxed API limiter
+app.use("/auth/login", authLimiter);
+app.use("/auth/register", authLimiter);
+app.use("/auth/verify-otp", authLimiter);
+app.use("/auth/resend-otp", authLimiter);
+app.use("/auth/forgot-password", authLimiter);
+app.use("/auth/reset-password", authLimiter);
+app.use("/auth", apiLimiter, authRoutes);
 app.use("/api/fuel-types", apiLimiter, fuelTypeRoutes);
 app.use("/api/stations", apiLimiter, stationRoutes);
 app.use("/api/upload", apiLimiter, uploadRoutes);

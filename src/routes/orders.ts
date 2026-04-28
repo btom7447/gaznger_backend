@@ -11,14 +11,17 @@ import { validate } from "../middleware/validate";
 import { createOrderSchema, updateOrderStatusSchema, rateOrderSchema } from "../validators/order.validators";
 import { parsePagination } from "../utils/pagination";
 import { notifyUser } from "../utils/notify";
+import { emitToUser } from "../socket";
 import { haversineDistance, calcDeliveryFee } from "../utils/haversine";
+import { createVendorPendingEarning, settleOrderEarnings } from "../utils/earningsUtils";
+import Delivery from "../models/Delivery";
 
 const router = Router();
 
+
 const POINTS_CONFIG = {
-  orderPlaced: Number(process.env.POINTS_ORDER_PLACED) || 100,
-  orderDelivered: Number(process.env.POINTS_ORDER_DELIVERED) || 50,
-  rateStation: Number(process.env.POINTS_RATE_STATION) || 50,
+  orderDelivered: Number(process.env.POINTS_ORDER_DELIVERED),
+  rateStation: Number(process.env.POINTS_RATE_STATION),
 };
 
 async function awardPoints(
@@ -37,6 +40,8 @@ async function awardPoints(
       user.points += points;
       if (user.points < 0) user.points = 0;
       await user.save();
+      // Real-time points update so PointsBanner reflects immediately
+      emitToUser(userId, "points:update", { points: user.points });
     }
   }
 
@@ -132,33 +137,47 @@ router.post("/", requireAuth, validate(createOrderSchema), async (req, res) => {
       orderData.cylinderImages = cylinderImages || [];
     }
 
-    const order = await Order.create(orderData);
+    let order = await Order.create(orderData);
 
-    await awardPoints(req.userId, POINTS_CONFIG.orderPlaced, "Points for placing an order");
+    // ── Socket events fire immediately; notifications follow in background ──
+    if (station.autoAcceptOrders) {
+      order.status = "confirmed";
+      await order.save();
 
-    // Notify customer: order placed + points
-    await notifyUser(
-      req.userId,
-      "order",
-      "Order Placed",
-      `Your ${fuel.name} order (${quantity} ${fuel.unit}) has been placed successfully.`
-    );
-    await notifyUser(
-      req.userId,
-      "points",
-      "Points Earned!",
-      `You earned ${POINTS_CONFIG.orderPlaced} Gaznger Points for placing an order.`
-    );
+      // 1. Instant socket events (no await)
+      emitToUser(req.userId, "order:update", { orderId: order._id, status: "confirmed" });
+      if (station.vendorId) {
+        const vendorId = station.vendorId.toString();
+        emitToUser(vendorId, "order:new", { orderId: order._id, status: "confirmed", fuelName: fuel.name, quantity, unit: fuel.unit });
+        // Create vendor earnings + emit earnings event (fast DB write)
+        createVendorPendingEarning(vendorId, order._id.toString(), fuelCost).catch(() => {});
+      }
 
-    // Notify vendor: new order at their station
-    if (station.vendorId) {
-      await notifyUser(
-        station.vendorId.toString(),
-        "new_order",
-        "New Order Received",
-        `A new ${fuel.name} order (${quantity} ${fuel.unit}) has been placed at your station.`
-      );
+      // 2. Background: DB notifications + push (do not block response)
+      Promise.all([
+        notifyUser(req.userId, "order", "Order Confirmed",
+          `Your ${fuel.name} order (${quantity} ${fuel.unit}) was automatically confirmed. A rider will be assigned shortly.`),
+        station.vendorId
+          ? notifyUser(station.vendorId.toString(), "order", "Order Auto-Confirmed",
+              `A ${fuel.name} order (${quantity} ${fuel.unit}) was auto-confirmed at your station.`)
+          : Promise.resolve(),
+        station.vendorId
+          ? notifyUser(station.vendorId.toString(), "payment", "Earnings Added",
+              `₦${fuelCost.toLocaleString()} added to your pending earnings.`)
+          : Promise.resolve(),
+      ]).catch(() => {});
+    } else {
+      // Pending order — instant vendor ping, then background notifications
+      if (station.vendorId) {
+        const vendorId = station.vendorId.toString();
+        emitToUser(vendorId, "order:new", { orderId: order._id, status: "pending", fuelName: fuel.name, quantity, unit: fuel.unit });
+        notifyUser(vendorId, "new_order", "New Order Received",
+          `A new ${fuel.name} order (${quantity} ${fuel.unit}) has been placed at your station.`).catch(() => {});
+      }
+      notifyUser(req.userId, "order", "Order Placed",
+        `Your ${fuel.name} order (${quantity} ${fuel.unit}) has been placed successfully.`).catch(() => {});
     }
+
 
     res.status(201).json(order);
   } catch (err) {
@@ -172,7 +191,10 @@ router.get("/", requireAuth, async (req, res) => {
     const { status, startDate, endDate } = req.query;
 
     const filter: any = { user: req.userId };
-    if (status) filter.status = status;
+    if (status) {
+      const statuses = (status as string).split(",").map((s) => s.trim()).filter(Boolean);
+      filter.status = statuses.length > 1 ? { $in: statuses } : statuses[0];
+    }
     if (startDate || endDate) {
       filter.createdAt = {};
       if (startDate) filter.createdAt.$gte = new Date(startDate as string);
@@ -238,21 +260,28 @@ router.patch("/:orderId/status", requireAuth, validate(updateOrderStatusSchema),
     order.status = status;
     await order.save();
 
-    // Notify on relevant status transitions
     const userId = order.user.toString();
-    if (status === "confirmed" && prevStatus !== "confirmed") {
-      await notifyUser(userId, "order", "Order Confirmed", "Your order has been confirmed by the station.");
-    }
-    if ((status === "in_transit" || status === "in-transit") && prevStatus !== status) {
-      await notifyUser(userId, "delivery", "On the Way!", "Your fuel is on its way. Track your rider in real time.");
-    }
-    if (status === "delivered" && prevStatus !== "delivered") {
-      const expiresAt = new Date();
-      expiresAt.setDate(expiresAt.getDate() + 30);
-      await awardPoints(userId, POINTS_CONFIG.orderDelivered, "Points for order delivered", undefined, expiresAt);
-      await notifyUser(userId, "delivered", "Fuel Delivered!", "Your fuel order has been delivered. Enjoy!");
-      await notifyUser(userId, "points", "Points Earned!", `You earned ${POINTS_CONFIG.orderDelivered} Gaznger Points for this delivery.`);
-    }
+
+    // Instant socket event first
+    emitToUser(userId, "order:update", { orderId: order._id, status });
+
+    // Background notifications (do not block response)
+    Promise.resolve().then(async () => {
+      if (status === "confirmed" && prevStatus !== "confirmed") {
+        await notifyUser(userId, "order", "Order Confirmed", "Your order has been confirmed by the station.");
+      }
+      if ((status === "in_transit" || status === "in-transit") && prevStatus !== status) {
+        await notifyUser(userId, "delivery", "On the Way!", "Your fuel is on its way. Track your rider in real time.");
+      }
+      if (status === "delivered" && prevStatus !== "delivered") {
+        const expiresAt = new Date();
+        expiresAt.setDate(expiresAt.getDate() + 30);
+        await awardPoints(userId, POINTS_CONFIG.orderDelivered, "Points for order delivered", undefined, expiresAt);
+        await settleOrderEarnings(order._id.toString());
+        await notifyUser(userId, "delivered", "Fuel Delivered!", "Your fuel order has been delivered. Enjoy!");
+        await notifyUser(userId, "points", "Points Earned!", `You earned ${POINTS_CONFIG.orderDelivered} Gaznger Points for this delivery.`);
+      }
+    }).catch(() => {});
 
     res.json(order);
   } catch (err) {
@@ -276,20 +305,7 @@ router.patch("/:orderId/cancel", requireAuth, async (req, res) => {
     order.status = "cancelled";
     await order.save();
 
-    // Reverse the points awarded for placing this order
-    const reversal = -POINTS_CONFIG.orderPlaced;
-    const user = await User.findById(req.userId);
-    if (user) {
-      user.points = Math.max(0, user.points + reversal);
-      await user.save();
-    }
-    await Point.create({
-      user: req.userId,
-      change: reversal,
-      type: "adjust",
-      description: "Points reversed for cancelled order",
-      settled: true,
-    });
+    emitToUser(req.userId, "order:update", { orderId: order._id, status: "cancelled" });
 
     await notifyUser(
       req.userId,
@@ -301,6 +317,64 @@ router.patch("/:orderId/cancel", requireAuth, async (req, res) => {
     res.json({ message: "Order cancelled", order });
   } catch (err) {
     res.status(500).json({ message: "Failed to cancel order" });
+  }
+});
+
+// ===================== CUSTOMER CONFIRMS DELIVERY RECEIPT =====================
+router.patch("/:orderId/confirm-delivery", requireAuth, async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.orderId);
+    if (!order) return res.status(404).json({ message: "Order not found" });
+
+    if (order.user.toString() !== req.userId)
+      return res.status(403).json({ message: "Forbidden" });
+
+    if (order.status !== "awaiting_confirmation")
+      return res.status(400).json({ message: "Order is not awaiting confirmation" });
+
+    order.status = "delivered";
+    await order.save();
+
+    const userId = order.user.toString();
+
+    // Settle earnings for vendor + rider
+    await settleOrderEarnings(order._id.toString());
+
+    // Mark delivery record as delivered + set customerConfirmedAt
+    await Delivery.findOneAndUpdate(
+      { order: order._id, status: "awaiting_confirmation" },
+      { status: "delivered", customerConfirmedAt: new Date() }
+    );
+
+    // Increment rider's totalDeliveries
+    if (order.riderId) {
+      const RiderProfile = (await import("../models/RiderProfile")).default;
+      await RiderProfile.findOneAndUpdate(
+        { user: order.riderId },
+        { $inc: { totalDeliveries: 1 } }
+      );
+    }
+
+    // Award customer points — only on successful delivery (not on placement)
+    await awardPoints(userId, POINTS_CONFIG.orderDelivered, "Points for completed delivery");
+
+    // Notify all parties
+    emitToUser(userId, "order:update", { orderId: order._id, status: "delivered" });
+    if (order.riderId) {
+      emitToUser(order.riderId.toString(), "order:update", { orderId: order._id, status: "delivered" });
+    }
+
+    Promise.all([
+      notifyUser(userId, "delivered", "Fuel Delivered!", "Your fuel order has been confirmed as delivered. Enjoy!"),
+      notifyUser(userId, "points", "Points Earned!", `You earned ${POINTS_CONFIG.orderDelivered} Gaznger Points for completing your delivery!`),
+      order.riderId
+        ? notifyUser(order.riderId.toString(), "payment", "Earnings Settled!", "Your delivery earnings have been settled.")
+        : Promise.resolve(),
+    ]).catch(() => {});
+
+    res.json({ message: "Delivery confirmed", order });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to confirm delivery" });
   }
 });
 

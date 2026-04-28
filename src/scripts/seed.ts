@@ -5,7 +5,8 @@
  * All passwords: Password@123
  */
 
-import "dotenv/config";
+import dotenv from "dotenv";
+dotenv.config({ path: ".env.local" });
 import mongoose from "mongoose";
 import bcrypt from "bcrypt";
 
@@ -32,22 +33,27 @@ async function seed() {
   const fuels = await Promise.all([
     FuelType.findOneAndUpdate(
       { name: "Petrol" },
-      { name: "Petrol", unit: "L", pricePerUnit: 897 },
+      { $set: { name: "Petrol", unit: "L" }, $unset: { pricePerUnit: "" } },
       { upsert: true, new: true }
     ),
     FuelType.findOneAndUpdate(
       { name: "Diesel" },
-      { name: "Diesel", unit: "L", pricePerUnit: 1300 },
+      { $set: { name: "Diesel", unit: "L" }, $unset: { pricePerUnit: "" } },
       { upsert: true, new: true }
     ),
     FuelType.findOneAndUpdate(
       { name: "Gas" },
-      { name: "Gas", unit: "kg", pricePerUnit: 1600 },
+      { $set: { name: "Gas", unit: "kg" }, $unset: { pricePerUnit: "" } },
+      { upsert: true, new: true }
+    ),
+    FuelType.findOneAndUpdate(
+      { name: "Oil" },
+      { $set: { name: "Oil", unit: "L" }, $unset: { pricePerUnit: "" } },
       { upsert: true, new: true }
     ),
   ]);
-  const [petrol, diesel, gas] = fuels;
-  console.log(`   Petrol ₦897/L  |  Diesel ₦1300/L  |  Gas ₦1600/kg`);
+  const [petrol, diesel, gas, oil] = fuels;
+  console.log(`   Petrol (L)  |  Diesel (L)  |  Gas (kg)  |  Oil (L)`);
 
   // ─── Users ───────────────────────────────────────────────────────────────
   console.log("\n👤 Seeding users…");
@@ -77,6 +83,8 @@ async function seed() {
     role: "vendor" as const,
     isOnboarded: true,
     isVerified: true,
+    vendorVerification: { status: "verified", submittedAt: new Date() },
+    partnerBadge: { plan: "standard", active: true, subscribedAt: new Date() },
   };
 
   const riderData = {
@@ -130,14 +138,14 @@ async function seed() {
     {
       user: customer._id,
       label: "Home",
-      street: "12 Banana Island Road",
-      city: "Ikoyi",
-      state: "Lagos",
+      street: "14 Udo Udoma Avenue",
+      city: "Ikot Ekpene",
+      state: "Akwa Ibom",
       country: "Nigeria",
-      postalCode: "101233",
+      postalCode: "532101",
       icon: "home-outline",
-      latitude: 6.4698,
-      longitude: 3.4356,
+      latitude: 5.1920,
+      longitude: 7.7230,
     },
     { upsert: true, new: true }
   );
@@ -145,7 +153,7 @@ async function seed() {
     defaultAddress: address._id,
     $addToSet: { addressBook: address._id },
   });
-  console.log(`   ✓ 12 Banana Island Road, Ikoyi, Lagos`);
+  console.log(`   ✓ 14 Udo Udoma Avenue, Ikot Ekpene, Akwa Ibom`);
 
   // ─── Gas Station (linked to vendor) ──────────────────────────────────────
   console.log("\n🏪 Seeding gas station…");
@@ -153,25 +161,27 @@ async function seed() {
     { vendorId: vendor._id },
     {
       name: "Gaznger Test Station",
-      address: "45 Adeola Odeku Street",
-      state: "Lagos",
-      lga: "Victoria Island",
-      location: { lat: 6.4281, lng: 3.4219 },
+      address: "15 Ikot Ekpene Road",
+      state: "Akwa Ibom",
+      lga: "Ikot Ekpene",
+      location: { lat: 5.1750, lng: 7.7100 },
       fuels: [
         { fuel: petrol._id, pricePerUnit: 897, available: true },
         { fuel: diesel._id, pricePerUnit: 1300, available: true },
         { fuel: gas._id, pricePerUnit: 1600, available: true },
+        { fuel: oil._id, pricePerUnit: 1200, available: true },
       ],
       rating: 4.5,
       image: "https://images.unsplash.com/photo-1545984412-4b8e3b0e4e9e?w=400",
       verified: true,
       vendorId: vendor._id,
       isActive: true,
+      autoAcceptOrders: true,
       operatingHours: { open: "06:00", close: "22:00" },
     },
     { upsert: true, new: true }
   );
-  console.log(`   ✓ ${station.name} — 45 Adeola Odeku St, VI`);
+  console.log(`   ✓ ${station.name} — 15 Ikot Ekpene Rd, Akwa Ibom`);
 
   // ─── Rider Profile ────────────────────────────────────────────────────────
   console.log("\n🏍️  Seeding rider profile…");
@@ -181,9 +191,11 @@ async function seed() {
       user: rider._id,
       vehicleType: "motorcycle",
       vehiclePlate: "LSD-123GZ",
-      isAvailable: false,
+      isAvailable: true,
       isVerified: true,
-      currentLocation: { lat: 6.4550, lng: 3.3841 },
+      // All three test points in Ikot Ekpene, Akwa Ibom — within ~3 km of each other
+      // Station: 5.1750, 7.7100 | Customer home: 5.1920, 7.7230 | Rider: 5.1833, 7.7167
+      currentLocation: { lat: 5.1833, lng: 7.7167 },
       rating: 4.8,
       totalDeliveries: 47,
       bankAccount: {

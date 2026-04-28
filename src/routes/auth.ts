@@ -71,7 +71,19 @@ router.post("/register", validate(registerSchema), async (req, res) => {
 
     res.status(201).json({
       message: "User registered successfully. Please verify your email.",
-      user: { email: user.email, displayName: user.displayName },
+      user: {
+        _id: user._id,
+        email: user.email,
+        displayName: user.displayName,
+        phone: user.phone,
+        gender: user.gender,
+        profileImage: user.profileImage,
+        isVerified: user.isVerified,
+        points: user.points,
+        role: user.role,
+        isOnboarded: user.isOnboarded,
+        deviceTokens: user.deviceTokens,
+      },
       accessToken,
       refreshToken,
     });
