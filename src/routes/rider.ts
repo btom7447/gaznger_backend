@@ -204,14 +204,39 @@ router.patch("/deliveries/:id/accept", requireAuth, requireRider, async (req, re
       ).catch(() => {});
     }
 
-    // Notify customer via socket + push
+    // Notify customer via socket + push. Include the rider's
+    // customer-safe fields in the payload so the Track screen can
+    // populate its rider card without a follow-up GET.
     const order = await Order.findById(delivery.order).select("user").lean();
     if (order) {
       const customerId = order.user.toString();
+
+      const [riderUser, riderProfile] = await Promise.all([
+        User.findById(req.userId).select("displayName phone").lean(),
+        RiderProfile.findOne({ user: req.userId })
+          .select("vehiclePlate rating")
+          .lean(),
+      ]);
+      const display = riderUser?.displayName ?? "Your rider";
+      const [first, ...rest] = display.split(/\s+/);
+
       emitToUser(customerId, "order:update", {
         orderId: delivery.order,
         status: "assigned",
         riderId: req.userId,
+        rider: {
+          firstName: first ?? "Rider",
+          lastName: rest.join(" "),
+          plate: riderProfile?.vehiclePlate,
+          rating: riderProfile?.rating,
+          phone: riderUser?.phone,
+          initials: display
+            .split(/\s+/)
+            .map((p) => p.charAt(0))
+            .join("")
+            .slice(0, 2)
+            .toUpperCase(),
+        },
       });
       notifyUser(
         customerId,

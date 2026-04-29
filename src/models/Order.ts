@@ -19,10 +19,62 @@ export interface IOrder extends Document {
   dispatchAttempt: number;
   dispatchExpiresAt?: Date;
 
+  /** Free-form rider note. Captured on Delivery + LPG-Swap Schedule. */
+  note?: string;
+
+  /**
+   * LPG-Swap only — when the rider should COME BACK for the empty cylinder.
+   * Null = same-trip (rider takes the empty in the same delivery visit).
+   */
+  returnSwapAt?: Date | null;
+
+  /** Customer-paid delivery timestamp (set on customer-confirm-delivered). */
+  deliveredAt?: Date;
+
+  /**
+   * Final amount actually charged. Equals `totalPrice` for liquid; for LPG
+   * it's the smaller of estimated vs weighed-actual (the legacy at-station
+   * weigh-in adjustment per spec). Delivered + Complete read this.
+   */
+  totalCharged?: number;
+
+  /**
+   * LPG-Swap weigh-in capture, populated by the rider app once weighed at
+   * the station. Used by the Handoff screen weight verification card.
+   */
+  weighIn?: {
+    emptyKg: number;
+    fullKg: number;
+    netKg: number;
+    weighedAt: Date;
+  };
+
+  /** Awarded at delivery confirm. Surfaced on Delivered. */
+  pointsEarned?: number;
+
+  /** Rating + tip, set on /api/orders/:id/rate. */
+  rating?: {
+    stars: number;
+    tags: string[];
+    tip: number;
+    note?: string;
+    ratedAt: Date;
+  };
+
   // Gas-specific fields
   cylinderType?: string;
   deliveryType?: "cylinder_swap" | "home_refill";
   cylinderImages?: string[];
+  /**
+   * LPG-Swap cylinder details. Customer-supplied on the Cylinder
+   * screen; vendor/rider verifies on arrival.
+   */
+  cylinderDetails?: {
+    brand?: string;
+    valve?: string;
+    age?: string;
+    test?: string;
+  };
 }
 
 const OrderSchema: Schema = new Schema(
@@ -56,10 +108,35 @@ const OrderSchema: Schema = new Schema(
     dispatchAttempt: { type: Number, default: 0 },
     dispatchExpiresAt: { type: Date },
 
+    note: { type: String, maxlength: 500 },
+    returnSwapAt: { type: Date, default: null },
+    deliveredAt: { type: Date },
+    totalCharged: { type: Number },
+    weighIn: {
+      emptyKg: { type: Number },
+      fullKg: { type: Number },
+      netKg: { type: Number },
+      weighedAt: { type: Date },
+    },
+    pointsEarned: { type: Number },
+    rating: {
+      stars: { type: Number, min: 1, max: 5 },
+      tags: [{ type: String }],
+      tip: { type: Number, default: 0 },
+      note: { type: String, maxlength: 500 },
+      ratedAt: { type: Date },
+    },
+
     // Gas-specific
     cylinderType: { type: String },
     deliveryType: { type: String, enum: ["cylinder_swap", "home_refill"] },
     cylinderImages: [{ type: String }],
+    cylinderDetails: {
+      brand: { type: String },
+      valve: { type: String },
+      age: { type: String },
+      test: { type: String },
+    },
   },
   { timestamps: true }
 );

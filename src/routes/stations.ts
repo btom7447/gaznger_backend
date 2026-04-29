@@ -5,6 +5,7 @@ import User from "../models/User";
 import cloudinary from "../utils/cloudinary";
 import { requireAuth, requireAdmin } from "../middleware/auth";
 import { parsePagination } from "../utils/pagination";
+import { haversineDistance } from "../utils/haversine";
 
 const router = Router();
 
@@ -67,7 +68,7 @@ router.get("/", async (req, res) => {
       GasStation.countDocuments(filter),
     ]);
 
-    // Enrich each station with vendor's partner status
+    // Enrich each station with vendor's partner status, distance, and ETA.
     const vendorIds = [...new Set(stations.map((s: any) => s.vendorId?.toString()).filter(Boolean))];
     const vendors = vendorIds.length
       ? await User.find({ _id: { $in: vendorIds } }).select("partnerBadge").lean()
@@ -75,10 +76,39 @@ router.get("/", async (req, res) => {
     const vendorPartnerMap = new Map(
       vendors.map((v: any) => [v._id.toString(), v.partnerBadge?.active === true])
     );
-    const enriched = stations.map((s: any) => ({
-      ...s,
-      isPartner: s.vendorId ? (vendorPartnerMap.get(s.vendorId.toString()) ?? false) : false,
-    }));
+
+    // Distance + ETA only when the caller passed coords. The mobile
+    // Stations screen relies on these so the user can sort by nearest
+    // and see "X min" without computing it client-side.
+    const haveCoords = lat && lng;
+    const queryLat = haveCoords ? parseFloat(lat as string) : null;
+    const queryLng = haveCoords ? parseFloat(lng as string) : null;
+
+    const enriched = stations.map((s: any) => {
+      let distance: number | undefined;
+      let etaMinutes: number | undefined;
+      if (
+        queryLat != null &&
+        queryLng != null &&
+        s.location?.lat != null &&
+        s.location?.lng != null
+      ) {
+        distance = haversineDistance(
+          { lat: queryLat, lng: queryLng },
+          { lat: s.location.lat, lng: s.location.lng }
+        );
+        // Rough drive-time heuristic: 3 minutes per km (Lagos traffic
+        // average), floored at 5 minutes. Exposed as the canonical
+        // server-side value so the client doesn't reinvent it.
+        etaMinutes = Math.max(5, Math.round(distance * 3));
+      }
+      return {
+        ...s,
+        isPartner: s.vendorId ? (vendorPartnerMap.get(s.vendorId.toString()) ?? false) : false,
+        distance,
+        etaMinutes,
+      };
+    });
 
     res.json({
       data: enriched,

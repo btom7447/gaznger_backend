@@ -65,6 +65,21 @@ export interface IUser extends Document {
     setBy?: mongoose.Types.ObjectId;
     setAt?: Date;
   };
+
+  /**
+   * LPG-Swap saved cylinder profile. Captured on the first successful
+   * swap when the customer accepts the "save cylinder" prompt; surfaced
+   * back on the Cylinder + Photo screens to skip re-entry on subsequent
+   * orders.
+   */
+  savedCylinder?: {
+    brand?: string;
+    valve?: string;
+    age?: string;
+    test?: string;
+    photos?: string[];
+    savedAt?: Date;
+  };
 }
 
 const defaultMaleImage = "https://avatar.iran.liara.run/public/19";
@@ -134,6 +149,15 @@ const UserSchema: Schema<IUser> = new Schema(
       reason: { type: String },
       setBy: { type: Schema.Types.ObjectId, ref: "User" },
       setAt: { type: Date },
+    },
+
+    savedCylinder: {
+      brand: { type: String },
+      valve: { type: String },
+      age: { type: String },
+      test: { type: String },
+      photos: [{ type: String }],
+      savedAt: { type: Date },
     },
   },
   { timestamps: true }

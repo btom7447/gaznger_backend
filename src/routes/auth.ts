@@ -288,9 +288,30 @@ router.get("/me", requireAuth, async (req, res) => {
       "-passwordHash -otpCode -otpExpiresAt"
     );
     if (!user) return res.status(404).json({ message: "User not found" });
-    res.json(user);
-  } catch (err) {
 
+    // Surface a count of completed LPG orders so the LPG flow can
+    // unlock the saved-cylinder card + the "Skip — use last photos"
+    // affordance for returning users (gated at 1+ per spec).
+    let lpgOrderCount = 0;
+    try {
+      const Order = (await import("../models/Order")).default;
+      const FuelType = (await import("../models/FuelType")).default;
+      const lpg = await FuelType.findOne({ name: { $regex: /^(gas|lpg)$/i } })
+        .select("_id")
+        .lean();
+      if (lpg) {
+        lpgOrderCount = await Order.countDocuments({
+          user: user._id,
+          fuel: lpg._id,
+          status: "delivered",
+        });
+      }
+    } catch {
+      // Non-fatal — profile still returns without the count.
+    }
+
+    res.json({ ...user.toObject(), lpgOrderCount });
+  } catch (err) {
     res.status(500).json({ message: "Internal server error" });
   }
 });
