@@ -20,7 +20,11 @@ export async function dispatchRiders(): Promise<void> {
   const maxRounds = Number(process.env.RIDER_DISPATCH_MAX_ROUNDS) || 3;
   const radiusKm = Number(process.env.RIDER_DISPATCH_RADIUS_KM) || 10;
   const timeoutSec = Number(process.env.RIDER_DISPATCH_TIMEOUT_SECONDS) || 180;
-  const platformDeliveryComm = Number(process.env.PLATFORM_DELIVERY_COMMISSION) || 5;
+  // Rider commission now sourced from PlatformConfig — env stays as a
+  // pure fallback for first boot before the singleton exists.
+  const { getCommissionRate } = await import("../utils/platformConfig");
+  const platformDeliveryRate = await getCommissionRate("rider"); // 0.05 default
+  const platformDeliveryComm = platformDeliveryRate * 100;
 
   const now = new Date();
 

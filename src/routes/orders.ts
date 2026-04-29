@@ -116,6 +116,14 @@ router.post("/", requireAuth, validate(createOrderSchema), async (req, res) => {
       deliveryFee = Number(process.env.DELIVERY_BASE_FEE) || 500;
     }
 
+    // LPG-swap is a 2-trip job (delivery + return pickup), so the rider
+    // gets paid for two legs even though it's one Earning row at settle
+    // time. Double the fee at order-create time so escrow holds the
+    // right total upfront.
+    if (fuel.name === "Gas" && deliveryType === "cylinder_swap") {
+      deliveryFee = deliveryFee * 2;
+    }
+
     const totalPrice = fuelCost + deliveryFee;
 
     const orderData: any = {
