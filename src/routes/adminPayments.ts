@@ -700,6 +700,75 @@ router.get("/withdrawals", async (req, res) => {
   }
 });
 
+/* ───────────────────── SYSTEM WALLETS ────────────────────────── */
+
+/**
+ * GET /api/admin/wallets/system
+ * Snapshot of platform-escrow + platform-revenue wallets for the
+ * dashboard. Use the regular /api/wallet/transactions cursor flow to
+ * page through individual ledger entries.
+ */
+router.get("/wallets/system", async (_req, res) => {
+  try {
+    const Wallet = (await import("../models/Wallet")).default;
+    const wallets = await Wallet.find({ ownerKind: "system" }).lean();
+    const map: Record<string, { available: number; pending: number }> = {};
+    for (const w of wallets) {
+      if (w.systemKind) {
+        map[w.systemKind] = { available: w.available, pending: w.pending };
+      }
+    }
+    res.json({
+      escrow: map["platform-escrow"] ?? { available: 0, pending: 0 },
+      revenue: map["platform-revenue"] ?? { available: 0, pending: 0 },
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to load system wallets" });
+  }
+});
+
+/* ───────────────────── USER DETAIL ────────────────────────────── */
+
+/**
+ * GET /api/admin/users/:id/detail
+ * Full user record + wallet balances + recent withdrawals + dispute count.
+ * The dashboard's user-detail page hits this; the legacy /admin/users
+ * endpoint stays as the lightweight list for the table view.
+ */
+router.get("/users/:id/detail", async (req, res) => {
+  try {
+    const Wallet = (await import("../models/Wallet")).default;
+    const user = await User.findById(req.params.id)
+      .select("-passwordHash -otpCode -otpExpiresAt -deviceTokens")
+      .lean();
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    const [wallet, withdrawalCount, openDisputeCount] = await Promise.all([
+      Wallet.findOne({ user: user._id, ownerKind: "user" }).lean(),
+      Withdrawal.countDocuments({ user: user._id }),
+      Dispute.countDocuments({ raisedBy: user._id, status: "open" }),
+    ]);
+
+    let riderProfile: any = null;
+    if (user.role === "rider") {
+      riderProfile = await RiderProfile.findOne({ user: user._id }).lean();
+    }
+
+    res.json({
+      user,
+      wallet: wallet
+        ? { available: wallet.available, pending: wallet.pending }
+        : { available: 0, pending: 0 },
+      withdrawalCount,
+      openDisputeCount,
+      riderProfile,
+    });
+  } catch (err) {
+    console.error("[admin/users/detail]", err);
+    res.status(500).json({ message: "Failed to load user detail" });
+  }
+});
+
 /* ─────────────────────── AUDIT LOG ───────────────────────────── */
 
 /**
