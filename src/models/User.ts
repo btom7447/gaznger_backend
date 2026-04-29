@@ -80,6 +80,28 @@ export interface IUser extends Document {
     photos?: string[];
     savedAt?: Date;
   };
+
+  /**
+   * Customer-side preferences. All optional — server treats `undefined`
+   * as the default policy:
+   *   - autoRedeemPoints: false. When true, /api/orders POST + payment
+   *     flow auto-applies the max-redeemable points unless the client
+   *     overrides per-order.
+   *   - priceAlertsEnabled: false. When true, push notifications about
+   *     nearby market price drops (informational, never customer-specific
+   *     order pricing — pricing rule honoured server-side).
+   *   - pushEnabled: true. Master push toggle; when false, the server
+   *     skips push delivery (in-app inbox still receives).
+   *   - notificationsFilter: persisted "last selected" filter for the
+   *     Notifications inbox. Client mirrors locally; server-side is the
+   *     source of truth across devices.
+   */
+  preferences?: {
+    autoRedeemPoints?: boolean;
+    priceAlertsEnabled?: boolean;
+    pushEnabled?: boolean;
+    notificationsFilter?: string;
+  };
 }
 
 const defaultMaleImage = "https://avatar.iran.liara.run/public/19";
@@ -158,6 +180,13 @@ const UserSchema: Schema<IUser> = new Schema(
       test: { type: String },
       photos: [{ type: String }],
       savedAt: { type: Date },
+    },
+
+    preferences: {
+      autoRedeemPoints: { type: Boolean, default: false },
+      priceAlertsEnabled: { type: Boolean, default: false },
+      pushEnabled: { type: Boolean, default: true },
+      notificationsFilter: { type: String },
     },
   },
   { timestamps: true }

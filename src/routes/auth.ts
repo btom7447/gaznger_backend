@@ -319,13 +319,31 @@ router.get("/me", requireAuth, async (req, res) => {
 // ===================== UPDATE PROFILE =====================
 router.put("/me", requireAuth, validate(updateProfileSchema), async (req, res) => {
   try {
-    const { displayName, phone, gender, profileImage } = req.body;
+    const { displayName, phone, gender, profileImage, preferences } = req.body;
 
+    // Build a `$set` payload with dot-paths so nested `preferences` fields
+    // patch in place — Mongo's default behaviour with a top-level
+    // `preferences` set would replace the whole subdocument, blowing
+    // away any other preference the client didn't include in this call.
     const updates: Record<string, any> = {};
     if (displayName !== undefined) updates.displayName = displayName;
     if (phone !== undefined) updates.phone = phone;
     if (gender !== undefined) updates.gender = gender;
     if (profileImage !== undefined) updates.profileImage = profileImage;
+    if (preferences && typeof preferences === "object") {
+      const allowedKeys = [
+        "autoRedeemPoints",
+        "priceAlertsEnabled",
+        "pushEnabled",
+        "notificationsFilter",
+      ] as const;
+      for (const key of allowedKeys) {
+        const value = (preferences as Record<string, unknown>)[key];
+        if (value !== undefined) {
+          updates[`preferences.${key}`] = value;
+        }
+      }
+    }
 
     const user = await User.findByIdAndUpdate(
       req.userId,
@@ -336,7 +354,6 @@ router.put("/me", requireAuth, validate(updateProfileSchema), async (req, res) =
     if (!user) return res.status(404).json({ message: "User not found" });
     res.json(user);
   } catch (err) {
-
     res.status(500).json({ message: "Internal server error" });
   }
 });

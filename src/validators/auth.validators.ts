@@ -39,4 +39,18 @@ export const updateProfileSchema = z.object({
   phone: z.string().refine(val => !val || val.length >= 10, "Phone number must be at least 10 digits").optional(),
   gender: z.enum(["male", "female"]).optional(),
   profileImage: z.string().url("Invalid image URL").optional(),
+
+  /**
+   * Customer preferences. Each field optional; the route handler patches
+   * only the keys present so partial updates from the Settings screen
+   * don't clobber unrelated flags.
+   */
+  preferences: z
+    .object({
+      autoRedeemPoints: z.boolean().optional(),
+      priceAlertsEnabled: z.boolean().optional(),
+      pushEnabled: z.boolean().optional(),
+      notificationsFilter: z.string().max(64).optional(),
+    })
+    .optional(),
 });
