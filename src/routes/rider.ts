@@ -14,7 +14,10 @@ import { notifyUser } from "../utils/notify";
 import { emitToUser } from "../socket";
 import { createRiderPendingEarning, settleOrderEarnings } from "../utils/earningsUtils";
 import Withdrawal from "../models/Withdrawal";
-import { listBanks, resolveBankAccount, createTransferRecipient, initiateTransfer } from "../utils/paystack";
+import { listBanks, resolveBankAccount } from "../utils/paystack";
+import { handleWithdrawRequest } from "../utils/withdraw";
+import { moneyLimiter } from "../middleware/moneyLimiter";
+import { idempotencyKey } from "../middleware/idempotency";
 
 const router = Router();
 
@@ -503,85 +506,18 @@ router.get("/bank/resolve", requireAuth, async (req, res) => {
 });
 
 // ===================== REQUEST PAYOUT (RIDER) =====================
-router.post("/withdraw", requireAuth, requireRider, async (req, res) => {
-  try {
-    const { amount } = req.body;
-    if (!amount || amount <= 0) {
-      return res.status(400).json({ message: "Invalid withdrawal amount" });
-    }
-
-    const profile = await RiderProfile.findOne({ user: req.userId }).lean();
-    if (!profile?.bankAccount?.accountNumber) {
-      return res.status(400).json({ message: "Add a bank account before requesting a payout" });
-    }
-
-    // Check settled balance
-    const settled = await Earning.aggregate([
-      { $match: { user: new mongoose.Types.ObjectId(req.userId), role: "rider", status: "settled" } },
-      { $group: { _id: null, total: { $sum: "$amount" } } },
-    ]);
-    const settledBalance = settled[0]?.total ?? 0;
-
-    const pendingWithdrawals = await Withdrawal.aggregate([
-      { $match: { user: new mongoose.Types.ObjectId(req.userId), status: { $in: ["pending", "processing"] } } },
-      { $group: { _id: null, total: { $sum: "$amount" } } },
-    ]);
-    const pendingOut = pendingWithdrawals[0]?.total ?? 0;
-
-    const available = settledBalance - pendingOut;
-    if (amount > available) {
-      return res.status(400).json({
-        message: `Insufficient balance. Available: ₦${available.toLocaleString()}`,
-      });
-    }
-
-    // Attempt Paystack transfer if bank code is available
-    let paystackTransferCode: string | undefined;
-    let paystackRecipientCode: string | undefined;
-    let withdrawalStatus: "pending" | "processing" = "pending";
-
-    const bankAccount = profile.bankAccount as any;
-    if (bankAccount?.bankCode) {
-      try {
-        const recipient = await createTransferRecipient({
-          name: bankAccount.accountName,
-          account_number: bankAccount.accountNumber,
-          bank_code: bankAccount.bankCode,
-        });
-        paystackRecipientCode = recipient.recipient_code;
-
-        const transfer = await initiateTransfer({
-          amount: amount * 100, // convert to kobo
-          recipient: recipient.recipient_code,
-          reason: "Gaznger rider payout",
-          reference: `rider-${req.userId}-${Date.now()}`,
-        });
-        paystackTransferCode = transfer.transfer_code;
-        withdrawalStatus = "processing";
-      } catch {
-        // Paystack transfer failed — fall back to manual review
-      }
-    }
-
-    const withdrawal = await Withdrawal.create({
-      user: req.userId,
-      role: "rider",
-      amount,
-      status: withdrawalStatus,
-      bankAccount: profile.bankAccount,
-      paystackTransferCode,
-      paystackRecipientCode,
-    });
-
-    const message = withdrawalStatus === "processing"
-      ? "Payout initiated via Paystack. Funds will arrive within minutes."
-      : "Payout request submitted. We'll process it within 1–3 business days.";
-
-    res.status(201).json({ message, withdrawal, status: withdrawalStatus });
-  } catch (err) {
-    res.status(500).json({ message: "Failed to request payout" });
+// Implementation lives in utils/withdraw.ts (shared with vendor route).
+// Source of truth for balance is now `Wallet.available`, not Earning aggregates.
+router.post(
+  "/withdraw",
+  requireAuth,
+  requireRider,
+  moneyLimiter,
+  idempotencyKey({ enforce: true }),
+  async (req, res) => {
+    await handleWithdrawRequest(req, res, "rider");
   }
-});
+);
 
 // ===================== UPDATE RIDER PROFILE =====================
 // Allows updating vehicle details, KYC doc URLs, bankAccount, or profileImage.

@@ -12,7 +12,10 @@ import { emitToUser } from "../socket";
 import { createVendorPendingEarning } from "../utils/earningsUtils";
 import Withdrawal from "../models/Withdrawal";
 import cloudinary from "../utils/cloudinary";
-import { listBanks, resolveBankAccount, createTransferRecipient, initiateTransfer } from "../utils/paystack";
+import { listBanks, resolveBankAccount } from "../utils/paystack";
+import { handleWithdrawRequest } from "../utils/withdraw";
+import { moneyLimiter } from "../middleware/moneyLimiter";
+import { idempotencyKey } from "../middleware/idempotency";
 
 const router = Router();
 
@@ -565,84 +568,18 @@ router.get("/bank/resolve", requireAuth, async (req, res) => {
 });
 
 // ===================== REQUEST PAYOUT (VENDOR) =====================
-router.post("/withdraw", requireAuth, requireVendor, async (req, res) => {
-  try {
-    const { amount } = req.body;
-    if (!amount || amount <= 0) {
-      return res.status(400).json({ message: "Invalid withdrawal amount" });
-    }
-
-    const user = await User.findById(req.userId).select("vendorBankAccount").lean() as any;
-    if (!user?.vendorBankAccount?.accountNumber) {
-      return res.status(400).json({ message: "Add a bank account before requesting a payout" });
-    }
-
-    const settled = await Earning.aggregate([
-      { $match: { user: new mongoose.Types.ObjectId(req.userId), role: "vendor", status: "settled" } },
-      { $group: { _id: null, total: { $sum: "$amount" } } },
-    ]);
-    const settledBalance = settled[0]?.total ?? 0;
-
-    const pendingOut = await Withdrawal.aggregate([
-      { $match: { user: new mongoose.Types.ObjectId(req.userId), status: { $in: ["pending", "processing"] } } },
-      { $group: { _id: null, total: { $sum: "$amount" } } },
-    ]);
-    const pendingAmount = pendingOut[0]?.total ?? 0;
-    const available = settledBalance - pendingAmount;
-
-    if (amount > available) {
-      return res.status(400).json({
-        message: `Insufficient balance. Available: ₦${available.toLocaleString()}`,
-      });
-    }
-
-    // Attempt Paystack transfer if bank code is available
-    let paystackTransferCode: string | undefined;
-    let paystackRecipientCode: string | undefined;
-    let withdrawalStatus: "pending" | "processing" = "pending";
-
-    const bankAccount = user.vendorBankAccount as any;
-    if (bankAccount?.bankCode) {
-      try {
-        const recipient = await createTransferRecipient({
-          name: bankAccount.accountName,
-          account_number: bankAccount.accountNumber,
-          bank_code: bankAccount.bankCode,
-        });
-        paystackRecipientCode = recipient.recipient_code;
-
-        const transfer = await initiateTransfer({
-          amount: amount * 100, // convert to kobo
-          recipient: recipient.recipient_code,
-          reason: "Gaznger vendor payout",
-          reference: `vendor-${req.userId}-${Date.now()}`,
-        });
-        paystackTransferCode = transfer.transfer_code;
-        withdrawalStatus = "processing";
-      } catch {
-        // Paystack transfer failed — fall back to manual review
-      }
-    }
-
-    const withdrawal = await Withdrawal.create({
-      user: req.userId,
-      role: "vendor",
-      amount,
-      status: withdrawalStatus,
-      bankAccount: bankAccount,
-      paystackTransferCode,
-      paystackRecipientCode,
-    });
-
-    const message = withdrawalStatus === "processing"
-      ? "Payout initiated via Paystack. Funds will arrive within minutes."
-      : "Payout request submitted. We'll process it within 1–3 business days.";
-
-    res.status(201).json({ message, withdrawal, status: withdrawalStatus });
-  } catch (err) {
-    res.status(500).json({ message: "Failed to request payout" });
+// Implementation lives in utils/withdraw.ts (shared with rider route).
+// Source of truth for balance is now `Wallet.available`, not Earning aggregates.
+router.post(
+  "/withdraw",
+  requireAuth,
+  requireVendor,
+  moneyLimiter,
+  idempotencyKey({ enforce: true }),
+  async (req, res) => {
+    await handleWithdrawRequest(req, res, "vendor");
   }
-});
+);
 
 // ===================== SUBSCRIBE TO PARTNER BADGE =====================
 router.post("/partner-badge/subscribe", requireAuth, requireVendor, async (req, res) => {
