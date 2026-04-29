@@ -464,6 +464,50 @@ function decodePolyline(encoded: string): [number, number][] {
 }
 
 // ===================== UPDATE ORDER STATUS =====================
+/**
+ * Allowed status transitions, scoped by caller role + ownership.
+ *
+ * S-S-01: Before this matrix, ANY authenticated user could PATCH any
+ * order to any status — including a customer marking their own order
+ * `delivered` to skip the rider entirely. Each cell below is the
+ * narrowest valid transition for that role.
+ *
+ * Customer-confirm-delivery uses its own dedicated route
+ * (`/confirm-delivery`) and is intentionally NOT included here so
+ * customers can't accidentally use this generic endpoint to flip
+ * `delivered`.
+ */
+type Role = "customer" | "vendor" | "rider" | "admin";
+const STATUS_TRANSITIONS: Record<
+  Role,
+  { from: string; to: string }[]
+> = {
+  customer: [
+    // Customer can cancel their own pre-confirmation order.
+    { from: "pending", to: "cancelled" },
+  ],
+  vendor: [
+    { from: "pending", to: "confirmed" },
+    { from: "pending", to: "cancelled" },
+  ],
+  rider: [
+    // Rider marks the order ready for customer confirmation. The
+    // rider-side detail (`riderId === caller`) is also enforced below.
+    { from: "in-transit", to: "awaiting_confirmation" },
+    { from: "in_transit", to: "awaiting_confirmation" },
+  ],
+  // Admin: any transition. Audited separately via AuditLog at the
+  // admin route surface; this generic endpoint stays open for ops.
+  admin: [],
+};
+
+function isAllowedTransition(role: Role, from: string, to: string): boolean {
+  if (role === "admin") return true;
+  return STATUS_TRANSITIONS[role].some(
+    (t) => t.from === from && t.to === to
+  );
+}
+
 router.patch("/:orderId/status", requireAuth, validate(updateOrderStatusSchema), async (req, res) => {
   try {
     const { status } = req.body;
@@ -471,7 +515,40 @@ router.patch("/:orderId/status", requireAuth, validate(updateOrderStatusSchema),
     const order = await Order.findById(req.params.orderId);
     if (!order) return res.status(404).json({ message: "Order not found" });
 
+    // Resolve caller role + ownership before mutating anything.
+    const caller = await User.findById(req.userId).select("role").lean();
+    if (!caller) return res.status(401).json({ message: "Unauthorized" });
+
+    const role = caller.role as Role;
     const prevStatus = order.status;
+
+    // Ownership gates per role:
+    //   customer → must own the order
+    //   vendor   → must own the order's station
+    //   rider    → must be the assigned rider on the order
+    //   admin    → no ownership check
+    if (role === "customer" && order.user.toString() !== req.userId) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+    if (role === "rider" && order.riderId?.toString() !== req.userId) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+    if (role === "vendor") {
+      const GasStation = (await import("../models/Station")).default;
+      const station = await GasStation.findById(order.station)
+        .select("vendorId")
+        .lean();
+      if (!station || (station as any).vendorId?.toString() !== req.userId) {
+        return res.status(403).json({ message: "Forbidden" });
+      }
+    }
+
+    if (!isAllowedTransition(role, prevStatus, status)) {
+      return res.status(403).json({
+        message: `Transition ${prevStatus} → ${status} not allowed for role ${role}`,
+      });
+    }
+
     order.status = status;
     await order.save();
 
@@ -656,15 +733,191 @@ router.post("/:orderId/rate", requireAuth, validate(rateOrderSchema), async (req
 
     await awardPoints(req.userId, POINTS_CONFIG.rateStation, "Points for rating a station");
 
-    // TODO(rider tip): when wallet+escrow extends to handle direct
-    // rider tipping, debit the customer wallet for `tip` and credit
-    // the rider. For now, the tip is captured but not transferred.
+    /* ───────────────── Rider tip transfer ─────────────────
+     * The tip is net-new money on top of the order total. Debit the
+     * customer's wallet directly into the rider's wallet — no escrow
+     * hop, no commission cut, 100% lands with the rider per the Rate
+     * screen copy ("100% GOES TO {rider}"). If the customer's wallet
+     * doesn't cover the tip, the rate still goes through but the tip
+     * is dropped with a non-blocking warning surfaced in the response.
+     *
+     * Uses postTransfer for atomic ledger pairing (debit on customer,
+     * credit on rider). Idempotency keyed on the order id so a retry
+     * of the rate-submit doesn't double-credit.
+     */
+    let tipTransferred = false;
+    let tipWarning: string | undefined;
+    const tipAmount = typeof tip === "number" ? Math.max(0, Math.round(tip)) : 0;
+    if (tipAmount > 0 && order.riderId) {
+      try {
+        const { getOrCreateUserWallet, postTransfer } = await import(
+          "../utils/wallet"
+        );
+        const customerWallet = await getOrCreateUserWallet(req.userId!);
+        if (customerWallet.available >= tipAmount) {
+          const riderWallet = await getOrCreateUserWallet(order.riderId);
+          await postTransfer({
+            from: customerWallet,
+            to: riderWallet,
+            amount: tipAmount,
+            state: "available",
+            kinds: ["order_wallet_debit", "rider_earning_credit"],
+            description: `Tip on order ${order._id.toString().slice(-6).toUpperCase()}`,
+            opts: {
+              idempotencyKey: `order:${order._id}:rate-tip`,
+              order: order._id as any,
+              meta: { kind: "tip" },
+            },
+          });
+          tipTransferred = true;
 
-    res.status(201).json({ rating, order });
+          // Real-time wallet update on both ends.
+          const fresh = await getOrCreateUserWallet(req.userId!);
+          emitToUser(req.userId!, "wallet:update", {
+            available: fresh.available,
+            pending: fresh.pending,
+          });
+          const freshRider = await getOrCreateUserWallet(order.riderId);
+          emitToUser(order.riderId.toString(), "wallet:update", {
+            available: freshRider.available,
+            pending: freshRider.pending,
+          });
+          await notifyUser(
+            order.riderId.toString(),
+            "payment",
+            "Tip received",
+            `Customer tipped you ₦${tipAmount.toLocaleString()} for order #${order._id
+              .toString()
+              .slice(-6)
+              .toUpperCase()}.`
+          );
+        } else {
+          tipWarning = `Tip not transferred — your wallet balance (₦${customerWallet.available.toLocaleString()}) is below the tip amount.`;
+        }
+      } catch (err) {
+        console.error("[orders/:orderId/rate] tip transfer failed", err);
+        tipWarning = "Tip not transferred. The rating itself was saved.";
+      }
+    }
+
+    res.status(201).json({ rating, order, tipTransferred, tipWarning });
   } catch (err) {
     console.error("[orders/:orderId/rate]", err);
     res.status(500).json({ message: "Failed to rate station" });
   }
 });
+
+// ===================== RECEIPT PDF =====================
+/**
+ * GET /api/orders/:orderId/receipt.pdf
+ *
+ * Streams a generated PDF receipt for the customer's order. Requires
+ * the caller own the order (or be admin). Streamed inline — no S3
+ * persistence; the PDF is regenerated on each request from the
+ * authoritative order doc.
+ */
+router.get("/:orderId/receipt.pdf", requireAuth, async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.orderId)
+      .populate("fuel", "name unit")
+      .populate("station", "name")
+      .populate("deliveryAddress", "street city state")
+      .lean();
+    if (!order) return res.status(404).json({ message: "Order not found" });
+
+    // Customer-only — admin uses the dashboard (separate flow).
+    if ((order as any).user.toString() !== req.userId) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const customer = await User.findById(req.userId)
+      .select("displayName email")
+      .lean();
+
+    const fuel = (order as any).fuel as { name: string; unit: string } | null;
+    const station = (order as any).station as { name: string } | null;
+    const addr = (order as any).deliveryAddress as
+      | { street?: string; city?: string; state?: string }
+      | null;
+
+    const orderShortId = (order._id as any).toString().slice(-6).toUpperCase();
+    const fuelLine = `${(order as any).quantity} ${(order as any).unit ?? fuel?.unit ?? "L"} ${
+      fuel?.name ?? ""
+    }`.trim();
+
+    // paymentMethodLabel mirrors the mobile helper so the receipt
+    // says the same thing the in-app receipt did.
+    const paymentMethodLabel = labelForPaymentMethod(
+      (order as any).paymentMethodId,
+      (customer as any)?.lastPaystackAuth
+    );
+
+    const totalCharged =
+      (order as any).totalCharged ?? (order as any).totalPrice ?? 0;
+
+    const { streamReceiptPdf } = await import("../utils/receiptPdf");
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `inline; filename="gaznger-receipt-${orderShortId}.pdf"`
+    );
+
+    await streamReceiptPdf(
+      {
+        orderId: (order._id as any).toString(),
+        orderShortId,
+        fuelLine,
+        stationName: station?.name ?? "—",
+        deliveryAddressLine: [addr?.street, addr?.city, addr?.state]
+          .filter(Boolean)
+          .join(", "),
+        paymentMethodLabel,
+        totalCharged,
+        fuelCost: (order as any).fuelCost ?? 0,
+        deliveryFee: (order as any).deliveryFee ?? 0,
+        pointsEarned: (order as any).pointsEarned ?? 0,
+        ratedAt: (order as any).rating?.ratedAt ?? null,
+        deliveredAt: (order as any).deliveredAt ?? null,
+        customerName: customer?.displayName ?? "Customer",
+        customerEmail: customer?.email ?? "",
+        weighIn: (order as any).weighIn ?? null,
+      },
+      res
+    );
+  } catch (err) {
+    console.error("[orders/:orderId/receipt.pdf]", err);
+    if (!res.headersSent) res.status(500).json({ message: "Failed to generate receipt" });
+  }
+});
+
+/** Mirror of mobile's lib/paymentLabel.ts so the PDF reads the same. */
+function labelForPaymentMethod(
+  paymentMethodId: string | undefined,
+  lastPaystackAuth: { last4?: string; brand?: string } | undefined
+): string {
+  if (!paymentMethodId) return "Card";
+  if (paymentMethodId === "card-saved") {
+    const last4 = lastPaystackAuth?.last4;
+    const brand = lastPaystackAuth?.brand;
+    if (last4) {
+      const tag = brand
+        ? brand.toLowerCase().includes("visa")
+          ? "VISA"
+          : brand.toLowerCase().includes("master")
+          ? "MASTERCARD"
+          : brand.toLowerCase().includes("verve")
+          ? "VERVE"
+          : brand.toUpperCase()
+        : "CARD";
+      return `${tag} •••• ${last4}`;
+    }
+    return "Saved card";
+  }
+  if (paymentMethodId === "card-new") return "Card";
+  if (paymentMethodId === "wallet") return "Gaznger wallet";
+  if (paymentMethodId === "transfer") return "Bank transfer";
+  return "Card";
+}
 
 export default router;

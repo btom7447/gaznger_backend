@@ -398,6 +398,138 @@ router.patch("/deliveries/:id/drop", requireAuth, requireRider, async (req, res)
   }
 });
 
+// ===================== DISPENSE PROGRESS =====================
+// Rider streams pump progress while filling at the customer's gate.
+// Customer's Arrival screen subscribes to `dispense:progress` to drive
+// the dispense ring. No DB write — this is purely a passthrough.
+//
+// Body: { litres: number }   (cumulative volume dispensed)
+router.post(
+  "/orders/:orderId/dispense",
+  requireAuth,
+  requireRider,
+  async (req, res) => {
+    try {
+      const { litres } = req.body ?? {};
+      if (typeof litres !== "number" || !Number.isFinite(litres) || litres < 0) {
+        return res.status(400).json({ message: "litres must be a non-negative number" });
+      }
+
+      const order = await Order.findById(req.params.orderId)
+        .select("user riderId quantity")
+        .lean();
+      if (!order) return res.status(404).json({ message: "Order not found" });
+      if (order.riderId?.toString() !== req.userId) {
+        return res.status(403).json({ message: "Forbidden" });
+      }
+
+      // Cap at order quantity so over-pumping bugs don't push the ring
+      // past 100% on the customer's screen.
+      const capped = Math.min(litres, (order as any).quantity ?? litres);
+      emitToUser(order.user.toString(), "dispense:progress", {
+        orderId: order._id,
+        litres: capped,
+      });
+
+      res.json({ ok: true });
+    } catch (err) {
+      console.error("[rider/dispense]", err);
+      res.status(500).json({ message: "Failed to record dispense progress" });
+    }
+  }
+);
+
+// ===================== LPG WEIGH-IN =====================
+// LPG-Swap step: rider weighs the customer's empty cylinder + the
+// freshly-filled one at the station. Customer's Handoff screen renders
+// the weight verification card from this payload.
+//
+// On submit:
+//   1. Persist weighIn { emptyKg, fullKg, netKg, weighedAt } on Order.
+//   2. Recompute totalCharged = min(estimated, weighedActualPrice). Per
+//      spec: customer pays the LOWER of the two.
+//   3. Emit `order:update` with the updated weighIn + totalCharged.
+//
+// Body: { emptyKg: number, fullKg: number }
+router.post(
+  "/orders/:orderId/weigh-in",
+  requireAuth,
+  requireRider,
+  async (req, res) => {
+    try {
+      const { emptyKg, fullKg } = req.body ?? {};
+      if (
+        typeof emptyKg !== "number" ||
+        typeof fullKg !== "number" ||
+        !Number.isFinite(emptyKg) ||
+        !Number.isFinite(fullKg) ||
+        emptyKg < 0 ||
+        fullKg <= emptyKg
+      ) {
+        return res.status(400).json({
+          message: "emptyKg + fullKg required, fullKg must exceed emptyKg",
+        });
+      }
+
+      const order = await Order.findById(req.params.orderId);
+      if (!order) return res.status(404).json({ message: "Order not found" });
+      if (order.riderId?.toString() !== req.userId) {
+        return res.status(403).json({ message: "Forbidden" });
+      }
+      if ((order as any).deliveryType !== "cylinder_swap") {
+        return res
+          .status(400)
+          .json({ message: "Weigh-in only applies to cylinder swap orders" });
+      }
+
+      const netKg = Math.round((fullKg - emptyKg) * 100) / 100;
+      order.weighIn = {
+        emptyKg,
+        fullKg,
+        netKg,
+        weighedAt: new Date(),
+      };
+
+      // Recompute totalCharged = min(estimate, weighed actual).
+      // Per-kg price already locked on the station fuels[] entry.
+      const station = await (await import("../models/Station")).default
+        .findById(order.station)
+        .select("fuels")
+        .lean();
+      const fuel = await (await import("../models/FuelType")).default
+        .findById(order.fuel)
+        .select("name")
+        .lean();
+      const stationEntry = (station as any)?.fuels?.find(
+        (f: any) => f.fuel.toString() === order.fuel.toString()
+      );
+      const pricePerKg = stationEntry?.pricePerUnit ?? 0;
+      const weighedFuelCost = Math.round(netKg * pricePerKg);
+      // delivery fee was already locked at order create.
+      const weighedTotal = weighedFuelCost + order.deliveryFee;
+      // Keep the lower of the estimate vs the actual.
+      order.totalCharged = Math.min(order.totalPrice, weighedTotal);
+      void fuel; // touched to satisfy unused-var when uncommented later
+      await order.save();
+
+      emitToUser(order.user.toString(), "order:update", {
+        orderId: order._id,
+        weighIn: order.weighIn,
+        totalCharged: order.totalCharged,
+      });
+
+      res.json({
+        ok: true,
+        weighIn: order.weighIn,
+        totalCharged: order.totalCharged,
+      });
+    } catch (err) {
+      console.error("[rider/weigh-in]", err);
+      res.status(500).json({ message: "Failed to record weigh-in" });
+    }
+  }
+);
+
 // ===================== GET DELIVERY HISTORY =====================
 router.get("/deliveries", requireAuth, requireRider, async (req, res) => {
   try {
