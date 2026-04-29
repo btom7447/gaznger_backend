@@ -34,10 +34,10 @@ router.get("/", async (_req: Request, res: Response) => {
 // CREATE a new fuel type (admin — requires auth)
 router.post("/", requireAuth, upload.single("image"), async (req: Request, res: Response) => {
   try {
-    const { name, unit, pricePerUnit } = req.body;
+    const { name, unit } = req.body;
 
-    if (!name || !pricePerUnit)
-      return res.status(400).json({ message: "Name and pricePerUnit are required" });
+    if (!name)
+      return res.status(400).json({ message: "Name is required" });
 
     const existing = await FuelType.findOne({ name });
     if (existing)
@@ -69,7 +69,6 @@ router.post("/", requireAuth, upload.single("image"), async (req: Request, res: 
     const fuel = await FuelType.create({
       name,
       unit: unit || "L",
-      pricePerUnit,
       icon: iconUrl,
     });
 

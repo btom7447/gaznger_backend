@@ -1,10 +1,12 @@
 import dotenv from "dotenv";
-dotenv.config();
+dotenv.config({ path: ".env.local" });
 
 import http from "http";
 import mongoose from "mongoose";
 import app from "./app";
 import { connectDB } from "./config/db";
+import { initSocket } from "./socket";
+import { startOrderWatchdog } from "./jobs/orderWatchdog";
 
 const REQUIRED_ENV_VARS = [
   "MONGO_URI",
@@ -35,6 +37,8 @@ const startServer = async () => {
   await connectDB();
 
   const server = http.createServer(app);
+  initSocket(server);
+  startOrderWatchdog();
 
   server.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);

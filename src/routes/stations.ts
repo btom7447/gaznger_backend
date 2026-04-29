@@ -1,6 +1,7 @@
 import { Router } from "express";
 import multer from "multer";
 import GasStation from "../models/Station";
+import User from "../models/User";
 import cloudinary from "../utils/cloudinary";
 import { requireAuth, requireAdmin } from "../middleware/auth";
 import { parsePagination } from "../utils/pagination";
@@ -66,8 +67,21 @@ router.get("/", async (req, res) => {
       GasStation.countDocuments(filter),
     ]);
 
+    // Enrich each station with vendor's partner status
+    const vendorIds = [...new Set(stations.map((s: any) => s.vendorId?.toString()).filter(Boolean))];
+    const vendors = vendorIds.length
+      ? await User.find({ _id: { $in: vendorIds } }).select("partnerBadge").lean()
+      : [];
+    const vendorPartnerMap = new Map(
+      vendors.map((v: any) => [v._id.toString(), v.partnerBadge?.active === true])
+    );
+    const enriched = stations.map((s: any) => ({
+      ...s,
+      isPartner: s.vendorId ? (vendorPartnerMap.get(s.vendorId.toString()) ?? false) : false,
+    }));
+
     res.json({
-      data: stations,
+      data: enriched,
       total,
       page: pageNum,
       totalPages: Math.ceil(total / limitNum),
@@ -81,9 +95,14 @@ router.get("/", async (req, res) => {
 // ===================== GET STATION BY ID =====================
 router.get("/:id", async (req, res) => {
   try {
-    const station = await GasStation.findById(req.params.id).populate("fuels.fuel");
+    const station = await GasStation.findById(req.params.id).populate("fuels.fuel").lean();
     if (!station) return res.status(404).json({ message: "Station not found" });
-    res.json(station);
+    let isPartner = false;
+    if ((station as any).vendorId) {
+      const vendor = await User.findById((station as any).vendorId).select("partnerBadge").lean();
+      isPartner = (vendor as any)?.partnerBadge?.active === true;
+    }
+    res.json({ ...station, isPartner });
   } catch (err) {
 
     res.status(500).json({ message: "Failed to fetch station" });

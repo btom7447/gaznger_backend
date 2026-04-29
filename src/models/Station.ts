@@ -6,12 +6,19 @@ export interface IGasStation extends Document {
   state: string;
   lga: string;
   location: { lat: number; lng: number };
-  fuels: { fuel: Schema.Types.ObjectId; pricePerUnit: number; available: boolean }[];
+  fuels: {
+    fuel: Schema.Types.ObjectId;
+    pricePerUnit: number;
+    available: boolean;
+    scheduledPrice?: { price: number; effectiveAt: Date };
+  }[];
   rating: number;
   image: string;
+  images: string[];
   verified: boolean;
   vendorId?: mongoose.Types.ObjectId;
   isActive: boolean;
+  autoAcceptOrders: boolean;
   operatingHours?: { open: string; close: string };
 }
 
@@ -30,13 +37,19 @@ const GasStationSchema: Schema = new Schema(
         fuel: { type: Schema.Types.ObjectId, ref: "FuelType", required: true },
         pricePerUnit: { type: Number, required: true },
         available: { type: Boolean, default: true },
+        scheduledPrice: {
+          price: { type: Number },
+          effectiveAt: { type: Date },
+        },
       },
     ],
     rating: { type: Number, default: 0 },
-    image: { type: String, required: true },
+    image: { type: String, default: "" },
+    images: [{ type: String }],
     verified: { type: Boolean, default: false },
     vendorId: { type: Schema.Types.ObjectId, ref: "User" },
     isActive: { type: Boolean, default: true },
+    autoAcceptOrders: { type: Boolean, default: false },
     operatingHours: {
       open: { type: String },
       close: { type: String },

@@ -3,7 +3,6 @@ import mongoose, { Schema, Document } from "mongoose";
 export interface IFuelType extends Document {
   name: string; // Petrol, Diesel, Gas, Oil
   unit: string; // "L" or "kg"
-  pricePerUnit: number; // Current price per L or kg
   icon?: string; // Image URL
 }
 
@@ -11,8 +10,7 @@ const FuelTypeSchema: Schema = new Schema(
   {
     name: { type: String, required: true, unique: true },
     unit: { type: String, default: "L" },
-    pricePerUnit: { type: Number, required: true },
-    icon: { type: String }, // optional
+    icon: { type: String },
   },
   { timestamps: true }
 );

@@ -17,6 +17,9 @@ import paymentRoutes from "./routes/payments";
 import vendorRoutes from "./routes/vendor";
 import riderRoutes from "./routes/rider";
 import adminRoutes from "./routes/admin";
+import adminPaymentRoutes from "./routes/adminPayments";
+import walletRoutes from "./routes/wallet";
+import disputeRoutes from "./routes/disputes";
 
 import { startCronJobs } from "./jobs";
 import { errorHandler } from "./middleware/errorHandler";
@@ -72,7 +75,12 @@ function sanitizeObject(obj: unknown): unknown {
 
 app.use((req: Request, _res: Response, next: NextFunction) => {
   if (req.body) req.body = sanitizeObject(req.body);
-  if (req.query) req.query = sanitizeObject(req.query) as typeof req.query;
+  if (req.query) {
+    const sanitized = sanitizeObject(req.query) as Record<string, string>;
+    Object.keys(sanitized).forEach((key) => {
+      (req.query as Record<string, unknown>)[key] = sanitized[key];
+    });
+  }
   next();
 });
 
@@ -93,13 +101,24 @@ const apiLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+// Money-handling limiter lives in middleware/moneyLimiter.ts so it can be
+// imported by route files without creating a circular import via app.ts.
+
 // Health check (no auth, no rate limit)
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", uptime: process.uptime() });
 });
 
 // Routes
-app.use("/auth", authLimiter, authRoutes);
+// Sensitive auth actions (login, register, OTP, password reset) → strict limiter
+// Profile read/write (GET /auth/me, PUT /auth/me, device token) → relaxed API limiter
+app.use("/auth/login", authLimiter);
+app.use("/auth/register", authLimiter);
+app.use("/auth/verify-otp", authLimiter);
+app.use("/auth/resend-otp", authLimiter);
+app.use("/auth/forgot-password", authLimiter);
+app.use("/auth/reset-password", authLimiter);
+app.use("/auth", apiLimiter, authRoutes);
 app.use("/api/fuel-types", apiLimiter, fuelTypeRoutes);
 app.use("/api/stations", apiLimiter, stationRoutes);
 app.use("/api/upload", apiLimiter, uploadRoutes);
@@ -111,6 +130,9 @@ app.use("/api/payments", apiLimiter, paymentRoutes);
 app.use("/api/vendor", apiLimiter, vendorRoutes);
 app.use("/api/rider", apiLimiter, riderRoutes);
 app.use("/api/admin", apiLimiter, adminRoutes);
+app.use("/api/admin", apiLimiter, adminPaymentRoutes);
+app.use("/api/wallet", apiLimiter, walletRoutes);
+app.use("/api/disputes", apiLimiter, disputeRoutes);
 
 startCronJobs();
 

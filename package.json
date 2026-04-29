@@ -41,6 +41,7 @@
     "pino": "^10.3.1",
     "pino-http": "^11.0.0",
     "resend": "^6.9.3",
+    "socket.io": "^4.8.3",
     "swagger-jsdoc": "^6.2.8",
     "swagger-ui-express": "^5.0.1",
     "typescript": "^5.9.3",

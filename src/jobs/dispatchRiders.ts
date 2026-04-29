@@ -3,6 +3,7 @@ import Delivery from "../models/Delivery";
 import RiderProfile from "../models/RiderProfile";
 import { haversineDistance, calcDeliveryFee } from "../utils/haversine";
 import { notifyUser } from "../utils/notify";
+import { emitToUser } from "../socket";
 
 const RIDERS_PER_BROADCAST = 3;
 
@@ -19,7 +20,11 @@ export async function dispatchRiders(): Promise<void> {
   const maxRounds = Number(process.env.RIDER_DISPATCH_MAX_ROUNDS) || 3;
   const radiusKm = Number(process.env.RIDER_DISPATCH_RADIUS_KM) || 10;
   const timeoutSec = Number(process.env.RIDER_DISPATCH_TIMEOUT_SECONDS) || 180;
-  const platformDeliveryComm = Number(process.env.PLATFORM_DELIVERY_COMMISSION) || 5;
+  // Rider commission now sourced from PlatformConfig — env stays as a
+  // pure fallback for first boot before the singleton exists.
+  const { getCommissionRate } = await import("../utils/platformConfig");
+  const platformDeliveryRate = await getCommissionRate("rider"); // 0.05 default
+  const platformDeliveryComm = platformDeliveryRate * 100;
 
   const now = new Date();
 
@@ -38,12 +43,14 @@ export async function dispatchRiders(): Promise<void> {
         cancellationReason: "No rider available. Please try placing your order again.",
       });
       await Delivery.deleteMany({ order: order._id, status: "pending" });
-      await notifyUser(
-        order.user.toString(),
+      const customerId = order.user.toString();
+      emitToUser(customerId, "order:update", { orderId: order._id, status: "cancelled" });
+      notifyUser(
+        customerId,
         "cancelled",
         "Order Cancelled",
         "We couldn't find a rider nearby. Your order has been cancelled — please try again."
-      );
+      ).catch(() => {});
     } else {
       // Clear stale pending Delivery records so this order gets re-dispatched below
       await Delivery.deleteMany({ order: order._id, status: "pending" });
@@ -70,18 +77,31 @@ export async function dispatchRiders(): Promise<void> {
     // Find all available riders that have reported a location
     const availableRiders = await RiderProfile.find({ isAvailable: true }).lean();
 
-    const candidates = availableRiders
-      .filter((r) => r.currentLocation?.lat && r.currentLocation?.lng)
-      .map((r) => ({
-        ...r,
-        distanceKm: haversineDistance(
-          { lat: stationCoords.lat, lng: stationCoords.lng },
-          { lat: r.currentLocation!.lat, lng: r.currentLocation!.lng }
-        ),
-      }))
-      .filter((r) => r.distanceKm <= radiusKm)
-      .sort((a, b) => a.distanceKm - b.distanceKm)
-      .slice(0, RIDERS_PER_BROADCAST);
+    const ridersWithLocation = availableRiders.filter(
+      (r) => r.currentLocation?.lat && r.currentLocation?.lng
+    );
+
+    let candidates: (typeof availableRiders[number] & { distanceKm: number })[];
+
+    if (ridersWithLocation.length > 0) {
+      candidates = ridersWithLocation
+        .map((r) => ({
+          ...r,
+          distanceKm: haversineDistance(
+            { lat: stationCoords.lat, lng: stationCoords.lng },
+            { lat: r.currentLocation!.lat, lng: r.currentLocation!.lng }
+          ),
+        }))
+        .filter((r) => r.distanceKm <= radiusKm)
+        .sort((a, b) => a.distanceKm - b.distanceKm)
+        .slice(0, RIDERS_PER_BROADCAST);
+    } else {
+      // No riders have reported location yet — dispatch to all available riders
+      // (handles dev/testing scenarios and first-time rider logins)
+      candidates = availableRiders
+        .slice(0, RIDERS_PER_BROADCAST)
+        .map((r) => ({ ...r, distanceKm: 0 }));
+    }
 
     const expiry = new Date(now.getTime() + timeoutSec * 1000);
 
@@ -107,7 +127,7 @@ export async function dispatchRiders(): Promise<void> {
       }).lean();
       if (hasActive) continue;
 
-      await Delivery.create({
+      const delivery = await Delivery.create({
         order: order._id,
         rider: candidate.user,
         station: order.station,
@@ -116,12 +136,24 @@ export async function dispatchRiders(): Promise<void> {
         platformEarnings,
       });
 
-      await notifyUser(
-        candidate.user.toString(),
+      // Instant socket ping first, then background push notification
+      const riderId = candidate.user.toString();
+      emitToUser(riderId, "delivery:dispatch", {
+        deliveryId: delivery._id,
+        orderId: order._id,
+        stationName: station?.name,
+        stationAddress: station?.address,
+        fuelName: (order as any).fuel?.name,
+        quantity: order.quantity,
+        unit: (order as any).unit,
+        riderEarnings,
+      });
+      notifyUser(
+        riderId,
         "dispatch",
         "New Delivery Request",
         "A new delivery near you is available. Open the app to accept."
-      );
+      ).catch(() => {});
 
       dispatchedCount++;
     }

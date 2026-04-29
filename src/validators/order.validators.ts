@@ -11,7 +11,7 @@ export const createOrderSchema = z.object({
 });
 
 export const updateOrderStatusSchema = z.object({
-  status: z.enum(["pending", "confirmed", "assigned", "in-transit", "delivered", "cancelled"], {
+  status: z.enum(["pending", "confirmed", "assigned", "in-transit", "delivered", "cancelled"] as const, {
     error: "Invalid status value",
   }),
 });

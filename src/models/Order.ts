@@ -9,7 +9,7 @@ export interface IOrder extends Document {
   fuelCost: number;
   deliveryFee: number;
   totalPrice: number;
-  status: "pending" | "confirmed" | "assigned" | "in-transit" | "delivered" | "cancelled";
+  status: "pending" | "confirmed" | "assigned" | "in-transit" | "awaiting_confirmation" | "delivered" | "cancelled";
   deliveryAddress: mongoose.Types.ObjectId;
   paymentStatus: "unpaid" | "paid" | "refunded";
   paymentRef?: string;
@@ -37,7 +37,7 @@ const OrderSchema: Schema = new Schema(
     totalPrice: { type: Number, required: true },
     status: {
       type: String,
-      enum: ["pending", "confirmed", "assigned", "in-transit", "delivered", "cancelled"],
+      enum: ["pending", "confirmed", "assigned", "in-transit", "awaiting_confirmation", "delivered", "cancelled"],
       default: "pending",
     },
     deliveryAddress: {

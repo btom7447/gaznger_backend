@@ -19,6 +19,52 @@ export interface IUser extends Document {
   otpCode?: string;
   otpExpiresAt?: Date;
   isVerified?: boolean;
+
+  vendorBankAccount?: { bankName: string; accountNumber: string; accountName: string };
+  vendorVerification?: {
+    status: "none" | "pending" | "verified" | "rejected";
+    documents: { label: string; url: string }[];
+    submittedAt?: Date;
+    reviewedAt?: Date;
+    note?: string;
+  };
+  partnerBadge?: { plan: string; active: boolean; subscribedAt?: Date };
+
+  /**
+   * Paystack saved-card metadata. Populated automatically on first
+   * successful charge via webhook (data.authorization). Used for
+   * "Charge saved card" path so returning customers skip the webview.
+   * Only safe-to-display fields are kept here — no PAN, no CVV.
+   */
+  lastPaystackAuth?: {
+    authorizationCode: string;
+    last4: string;
+    brand?: string;
+    bank?: string;
+    expMonth?: string;
+    expYear?: string;
+    cardType?: string;
+    signature?: string;
+  };
+
+  /**
+   * Lifecycle gate set by admin. `active` is the only state that allows
+   * vendors/riders to receive orders/jobs and customers to charge.
+   * `pending` = newly registered, awaiting verification.
+   * `suspended` = admin-paused (rules violation, dispute).
+   */
+  accountStatus?: "pending" | "active" | "suspended";
+
+  /**
+   * Withdrawal hold. When `active=true`, /withdraw is gated. Used for
+   * policy violations, owed money, or while a dispute is open.
+   */
+  withdrawalHold?: {
+    active: boolean;
+    reason?: string;
+    setBy?: mongoose.Types.ObjectId;
+    setAt?: Date;
+  };
 }
 
 const defaultMaleImage = "https://avatar.iran.liara.run/public/19";
@@ -47,10 +93,50 @@ const UserSchema: Schema<IUser> = new Schema(
     otpCode: { type: String },
     otpExpiresAt: { type: Date },
     isVerified: { type: Boolean, default: false },
+
+    vendorBankAccount: {
+      bankName: { type: String, default: "" },
+      accountNumber: { type: String, default: "" },
+      accountName: { type: String, default: "" },
+    },
+    vendorVerification: {
+      status: { type: String, enum: ["none", "pending", "verified", "rejected"], default: "none" },
+      documents: [{ label: { type: String }, url: { type: String } }],
+      submittedAt: { type: Date },
+      reviewedAt: { type: Date },
+      note: { type: String },
+    },
+    partnerBadge: {
+      plan: { type: String, default: "" },
+      active: { type: Boolean, default: false },
+      subscribedAt: { type: Date },
+    },
+
+    lastPaystackAuth: {
+      authorizationCode: { type: String },
+      last4: { type: String },
+      brand: { type: String },
+      bank: { type: String },
+      expMonth: { type: String },
+      expYear: { type: String },
+      cardType: { type: String },
+      signature: { type: String },
+    },
+
+    accountStatus: {
+      type: String,
+      enum: ["pending", "active", "suspended"],
+      default: "active",
+    },
+
+    withdrawalHold: {
+      active: { type: Boolean, default: false },
+      reason: { type: String },
+      setBy: { type: Schema.Types.ObjectId, ref: "User" },
+      setAt: { type: Date },
+    },
   },
   { timestamps: true }
 );
-
-UserSchema.index({ email: 1 });
 
 export default mongoose.model<IUser>("User", UserSchema);
