@@ -11,6 +11,8 @@ export type NotificationType =
   | "system"
   | "alert"
   | "message"
+  // Account / lifecycle (admin actions: activate, suspend, verify, message)
+  | "account"
   // Vendor-specific
   | "new_order"
   // Rider-specific
@@ -32,7 +34,7 @@ const NotificationSchema: Schema = new Schema(
     user: { type: Schema.Types.ObjectId, ref: "User", required: true },
     type: {
       type: String,
-      enum: ["order", "payment", "delivery", "delivered", "cancelled", "points", "promo", "system", "alert", "message", "new_order", "dispatch", "earnings"],
+      enum: ["order", "payment", "delivery", "delivered", "cancelled", "points", "promo", "system", "alert", "message", "account", "new_order", "dispatch", "earnings"],
       required: true,
     },
     title: { type: String, required: true },
