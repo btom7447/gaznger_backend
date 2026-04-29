@@ -17,6 +17,9 @@ import paymentRoutes from "./routes/payments";
 import vendorRoutes from "./routes/vendor";
 import riderRoutes from "./routes/rider";
 import adminRoutes from "./routes/admin";
+import adminPaymentRoutes from "./routes/adminPayments";
+import walletRoutes from "./routes/wallet";
+import disputeRoutes from "./routes/disputes";
 
 import { startCronJobs } from "./jobs";
 import { errorHandler } from "./middleware/errorHandler";
@@ -98,6 +101,9 @@ const apiLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+// Money-handling limiter lives in middleware/moneyLimiter.ts so it can be
+// imported by route files without creating a circular import via app.ts.
+
 // Health check (no auth, no rate limit)
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", uptime: process.uptime() });
@@ -124,6 +130,9 @@ app.use("/api/payments", apiLimiter, paymentRoutes);
 app.use("/api/vendor", apiLimiter, vendorRoutes);
 app.use("/api/rider", apiLimiter, riderRoutes);
 app.use("/api/admin", apiLimiter, adminRoutes);
+app.use("/api/admin", apiLimiter, adminPaymentRoutes);
+app.use("/api/wallet", apiLimiter, walletRoutes);
+app.use("/api/disputes", apiLimiter, disputeRoutes);
 
 startCronJobs();
 
