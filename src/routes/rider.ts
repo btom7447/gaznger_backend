@@ -456,10 +456,26 @@ async function applyRiderTransition(
     }
 
     if (order) {
-      emitToUser(order.user.toString(), "order:update", {
+      const customerId = order.user.toString();
+      emitToUser(customerId, "order:update", {
         orderId: delivery.order,
         status: toOrderStatus,
       });
+
+      // Phase 8 — push parity for customer-facing transitions.
+      // High-importance state changes that the customer needs to
+      // act on (or that visibly change their screen) get a push;
+      // intermediate moves (at_plant / refilling / returning) are
+      // too noisy and skip.
+      const pushPayload = pushForCustomer(toOrderStatus, String(delivery.order));
+      if (pushPayload) {
+        notifyUser(
+          customerId,
+          pushPayload.kind,
+          pushPayload.title,
+          pushPayload.body
+        ).catch(() => {});
+      }
     }
     emitToUser(riderId, "delivery:update", {
       deliveryId: delivery._id,
@@ -469,6 +485,46 @@ async function applyRiderTransition(
     return res.json({ message: successMessage, deliveryId: delivery._id });
   } catch (err) {
     return res.status(500).json({ message: "Transition failed" });
+  }
+}
+
+/**
+ * Customer-facing push gating.
+ *
+ * Returns a push payload for transitions that warrant notifying the
+ * customer on a locked phone, or null for intermediate states that
+ * don't. The `data` field would carry deep-link info — the existing
+ * `notifyUser` signature doesn't yet accept it; that lands when the
+ * notification utility gets extended to pass the orderId through to
+ * APNs/FCM payload data so the app can deep-link on tap.
+ */
+type PushKind = import("../models/Notification").NotificationType;
+function pushForCustomer(
+  toOrderStatus: string,
+  _orderId: string
+): { kind: PushKind; title: string; body: string } | null {
+  switch (toOrderStatus) {
+    case "arrived":
+      return {
+        kind: "delivery",
+        title: "Rider arrived",
+        body: "Your rider is at your gate. Open the app to confirm.",
+      };
+    case "dispensing":
+      return {
+        kind: "delivery",
+        title: "Dispensing now",
+        body: "Your rider has started filling your order.",
+      };
+    case "awaiting_confirmation":
+      return {
+        kind: "delivery",
+        title: "Confirm your delivery",
+        body: "Your rider has marked the order delivered. Tap to confirm.",
+      };
+    // at_plant / refilling / returning — too noisy for push
+    default:
+      return null;
   }
 }
 
