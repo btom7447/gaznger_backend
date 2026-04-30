@@ -4,6 +4,28 @@ import jwt from "jsonwebtoken";
 import Delivery from "./models/Delivery";
 import { ACTIVE_DELIVERY_STATUSES, Rooms } from "./_shared";
 
+/**
+ * Structured socket log. Single line per event so it's easy to grep
+ * production logs by event name, room, or user. Format:
+ *
+ *   [Socket] <action> event=<name> room=<room?> uid=<userId?> ms=<latency?>
+ *
+ * Phase 6 of the execution plan — without these logs, debugging a
+ * "rider pin not showing" report meant adding console.logs and
+ * waiting for the next repro. Now they're always there.
+ */
+function slog(
+  action: "in" | "out" | "join" | "leave" | "conn" | "disc",
+  fields: { event?: string; room?: string; uid?: string; ms?: number }
+) {
+  const parts: string[] = [`[Socket] ${action}`];
+  if (fields.event) parts.push(`event=${fields.event}`);
+  if (fields.room) parts.push(`room=${fields.room}`);
+  if (fields.uid) parts.push(`uid=${fields.uid}`);
+  if (fields.ms != null) parts.push(`ms=${fields.ms}`);
+  console.log(parts.join(" "));
+}
+
 let io: Server | null = null;
 
 /**
@@ -42,7 +64,7 @@ export function initSocket(httpServer: HttpServer): Server {
   io.on("connection", (socket) => {
     const userId = socket.data.userId as string;
     socket.join(Rooms.user(userId));
-    console.log(`[Socket] connected uid=${userId} sid=${socket.id}`);
+    slog("conn", { uid: userId, room: Rooms.user(userId) });
 
     // Re-attach this socket to any delivery rooms its user is a
     // member of. Handles the foreground/background reconnect case
@@ -70,6 +92,7 @@ export function initSocket(httpServer: HttpServer): Server {
      * rebuilds within a few rider transitions.
      */
     socket.on("rider:location", async ({ lat, lng }: { lat: number; lng: number }) => {
+      const startedAt = Date.now();
       try {
         // Fast path — find the delivery room this rider is in.
         let matchedDeliveryId: string | null = null;
@@ -84,6 +107,12 @@ export function initSocket(httpServer: HttpServer): Server {
           io!
             .to(Rooms.delivery(matchedDeliveryId))
             .emit("rider:location", { lat, lng, riderId: userId });
+          slog("out", {
+            event: "rider:location",
+            room: Rooms.delivery(matchedDeliveryId),
+            uid: userId,
+            ms: Date.now() - startedAt,
+          });
           return;
         }
 
@@ -102,13 +131,19 @@ export function initSocket(httpServer: HttpServer): Server {
         io!
           .to(Rooms.delivery(String(delivery._id)))
           .emit("rider:location", { lat, lng, riderId: userId });
+        slog("out", {
+          event: "rider:location (cold-path)",
+          room: Rooms.delivery(String(delivery._id)),
+          uid: userId,
+          ms: Date.now() - startedAt,
+        });
       } catch {
         // non-fatal — best-effort location relay
       }
     });
 
     socket.on("disconnect", () => {
-      console.log(`[Socket] disconnected uid=${userId}`);
+      slog("disc", { uid: userId });
       // Don't tear down delivery membership on disconnect — the
       // user might just be backgrounding the app. We keep them in
       // the membership map so that when their reconnecting socket
@@ -124,6 +159,7 @@ export function initSocket(httpServer: HttpServer): Server {
 export function emitToUser(userId: string, event: string, data: unknown): void {
   if (!io) return;
   io.to(Rooms.user(userId)).emit(event, data);
+  slog("out", { event, room: Rooms.user(userId) });
 }
 
 /** Emit an event to every socket in a delivery room. */
@@ -134,6 +170,7 @@ export function emitToDelivery(
 ): void {
   if (!io) return;
   io.to(Rooms.delivery(deliveryId)).emit(event, data);
+  slog("out", { event, room: Rooms.delivery(deliveryId) });
 }
 
 /**
@@ -165,6 +202,7 @@ export function joinDeliveryRoom(deliveryId: string, userIds: string[]): void {
         sock?.join(Rooms.delivery(deliveryId));
       }
     }
+    slog("join", { uid: userId, room: Rooms.delivery(deliveryId) });
   }
 }
 
@@ -177,4 +215,5 @@ export function leaveDeliveryRoom(deliveryId: string): void {
   if (!io) return;
   io.in(Rooms.delivery(deliveryId)).socketsLeave(Rooms.delivery(deliveryId));
   deliveryMembers.delete(deliveryId);
+  slog("leave", { room: Rooms.delivery(deliveryId) });
 }
