@@ -18,6 +18,10 @@ import { listBanks, resolveBankAccount } from "../utils/paystack";
 import { handleWithdrawRequest } from "../utils/withdraw";
 import { moneyLimiter } from "../middleware/moneyLimiter";
 import { idempotencyKey } from "../middleware/idempotency";
+import {
+  ACTIVE_DELIVERY_STATUSES,
+  DROPPABLE_DELIVERY_STATUSES,
+} from "../_shared";
 
 const router = Router();
 
@@ -143,29 +147,13 @@ router.patch("/location", requireAuth, requireRider, async (req, res) => {
 // Returns the rider's current in-progress delivery (accepted or picked_up).
 router.get("/active", requireAuth, requireRider, async (req, res) => {
   try {
-    // Status whitelist spans BOTH the legacy delivery states
-    // (`pending` / `accepted` / `picked_up` / `awaiting_confirmation`)
-    // AND the v3 granular states (`at_plant` / `refilling` /
-    // `returning` / `arrived` / `dispensing`). Without the granular
-    // states, an upgraded rider's active-delivery query goes empty
-    // the moment they tap "Mark at station" — leaving the rider app
-    // blank while the customer keeps watching them on the map. Same
-    // root cause as the rider:location relay bug (see socket.ts).
+    // Status whitelist comes from `_shared/status.ts` — same set used
+    // by the rider:location socket relay. Drift between this list
+    // and the relay was the F1 / I2 bug; importing from the shared
+    // module makes drift impossible.
     const delivery = await Delivery.findOne({
       rider: req.userId,
-      status: {
-        $in: [
-          "pending",
-          "accepted",
-          "picked_up",
-          "at_plant",
-          "refilling",
-          "returning",
-          "arrived",
-          "dispensing",
-          "awaiting_confirmation",
-        ],
-      },
+      status: { $in: ACTIVE_DELIVERY_STATUSES as unknown as string[] },
     })
       .populate({
         path: "order",
@@ -630,27 +618,16 @@ router.patch("/deliveries/:id/drop", requireAuth, requireRider, async (req, res)
       return res.status(400).json({ message: "A reason is required to drop a delivery" });
     }
 
-    // Drop is allowed from any in-flight state — both legacy
-    // (accepted / picked_up) and v3 granular (at_plant / refilling /
-    // returning / arrived / dispensing). A rider who has tapped
-    // "Mark at station" can still legitimately need to abandon (bike
-    // breakdown, plant out of stock), so we keep the drop path open
-    // through the granular pipeline.
+    // Drop is allowed from any in-flight state — see
+    // DROPPABLE_DELIVERY_STATUSES in `_shared/status.ts`. A rider can
+    // legitimately need to abandon at any point (bike breakdown,
+    // plant out of stock), so we keep the drop path open through the
+    // granular pipeline.
     const delivery = await Delivery.findOneAndUpdate(
       {
         _id: req.params.id,
         rider: req.userId,
-        status: {
-          $in: [
-            "accepted",
-            "picked_up",
-            "at_plant",
-            "refilling",
-            "returning",
-            "arrived",
-            "dispensing",
-          ],
-        },
+        status: { $in: DROPPABLE_DELIVERY_STATUSES as unknown as string[] },
       },
       { status: "dropped", dropReason: reason.trim() },
       { new: true }

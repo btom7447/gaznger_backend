@@ -508,58 +508,11 @@ function decodePolyline(encoded: string): [number, number][] {
  * customers can't accidentally use this generic endpoint to flip
  * `delivered`.
  */
-type Role = "customer" | "vendor" | "rider" | "admin";
-const STATUS_TRANSITIONS: Record<
-  Role,
-  { from: string; to: string }[]
-> = {
-  customer: [
-    // Customer can cancel their own pre-confirmation order.
-    { from: "pending", to: "cancelled" },
-  ],
-  vendor: [
-    { from: "pending", to: "confirmed" },
-    { from: "pending", to: "cancelled" },
-  ],
-  rider: [
-    // Rider marks the order ready for customer confirmation. The
-    // rider-side detail (`riderId === caller`) is also enforced below.
-    { from: "in-transit", to: "awaiting_confirmation" },
-    { from: "in_transit", to: "awaiting_confirmation" },
-    // ─── v3 granular rider transitions ───
-    // Driven by the upgraded rider app. Each represents a distinct
-    // physical milestone:
-    //   assigned   → at_plant     (rider has reached the pickup station)
-    //   at_plant   → refilling    (pump operator is filling the order)
-    //   refilling  → returning    (loaded, heading to customer)
-    //   returning  → arrived      (rolled up to the customer's gate)
-    //   arrived    → dispensing   (started pumping at the customer's tank)
-    //   dispensing → awaiting_confirmation (done; customer must confirm)
-    //
-    // Some transitions can be skipped (e.g. an LPG-Swap rider goes
-    // straight from at_plant → returning when the cylinder is
-    // weighed-and-swapped in one motion). We allow the skips so we
-    // don't force the rider through every step on swap orders.
-    { from: "assigned", to: "at_plant" },
-    { from: "at_plant", to: "refilling" },
-    { from: "at_plant", to: "returning" }, // skip refilling for swaps
-    { from: "refilling", to: "returning" },
-    { from: "returning", to: "arrived" },
-    { from: "arrived", to: "dispensing" },
-    { from: "arrived", to: "awaiting_confirmation" }, // swaps skip dispensing
-    { from: "dispensing", to: "awaiting_confirmation" },
-  ],
-  // Admin: any transition. Audited separately via AuditLog at the
-  // admin route surface; this generic endpoint stays open for ops.
-  admin: [],
-};
-
-function isAllowedTransition(role: Role, from: string, to: string): boolean {
-  if (role === "admin") return true;
-  return STATUS_TRANSITIONS[role].some(
-    (t) => t.from === from && t.to === to
-  );
-}
+// Status transition matrix lives in the shared module so the rider
+// app + server validate against the same rules. See
+// `src/_shared/transitions.ts` for the canonical list.
+import { isAllowedTransition, type TransitionRole } from "../_shared/transitions";
+type Role = TransitionRole;
 
 router.patch("/:orderId/status", requireAuth, validate(updateOrderStatusSchema), async (req, res) => {
   try {

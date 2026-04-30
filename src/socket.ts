@@ -2,6 +2,7 @@ import { Server } from "socket.io";
 import { Server as HttpServer } from "http";
 import jwt from "jsonwebtoken";
 import Delivery from "./models/Delivery";
+import { ACTIVE_DELIVERY_STATUSES, Rooms } from "./_shared";
 
 let io: Server | null = null;
 
@@ -25,34 +26,24 @@ export function initSocket(httpServer: HttpServer): Server {
 
   io.on("connection", (socket) => {
     const userId = socket.data.userId as string;
-    socket.join(`user:${userId}`);
+    socket.join(Rooms.user(userId));
     console.log(`[Socket] connected uid=${userId} sid=${socket.id}`);
 
     /**
-     * Relay rider GPS to the customer with the active order. The
-     * status whitelist spans both the legacy delivery states
-     * (`accepted` / `picked_up`) AND the v3 granular states
-     * (`at_plant` / `refilling` / `returning` / `arrived` /
-     * `dispensing`). Without the granular states in this list, an
-     * upgraded rider's GPS pings would be dropped on the floor and
-     * the customer's rider pin would never appear during the
-     * granular pipeline — which is exactly the F1 bug.
+     * Relay rider GPS to the customer with the active order.
+     *
+     * Whitelist comes from `_shared/status.ts` (ACTIVE_DELIVERY_STATUSES)
+     * — the same set the rider's `/active` endpoint uses, so the
+     * relay can never drift from "what the rider considers an active
+     * job." Phase 2 of the execution plan replaces this DB lookup
+     * with a per-delivery socket room — at that point this handler
+     * becomes `socket.to(deliveryRoom).emit(...)` with no DB hit.
      */
     socket.on("rider:location", async ({ lat, lng }: { lat: number; lng: number }) => {
       try {
         const delivery = await Delivery.findOne({
           rider: userId,
-          status: {
-            $in: [
-              "accepted",
-              "picked_up",
-              "at_plant",
-              "refilling",
-              "returning",
-              "arrived",
-              "dispensing",
-            ],
-          },
+          status: { $in: ACTIVE_DELIVERY_STATUSES as unknown as string[] },
         })
           .populate<{ order: { user: { toString(): string } } }>("order", "user")
           .lean();
@@ -76,5 +67,5 @@ export function initSocket(httpServer: HttpServer): Server {
 /** Emit an event to a specific user (all their active sockets). */
 export function emitToUser(userId: string, event: string, data: unknown): void {
   if (!io) return;
-  io.to(`user:${userId}`).emit(event, data);
+  io.to(Rooms.user(userId)).emit(event, data);
 }
