@@ -239,7 +239,7 @@ router.patch("/deliveries/:id/accept", requireAuth, requireRider, async (req, re
       const [first, ...rest] = display.split(/\s+/);
 
       emitToUser(customerId, "order:update", {
-        orderId: delivery.order,
+        orderId: String(delivery.order),
         status: "assigned",
         riderId: req.userId,
         rider: {
@@ -315,7 +315,7 @@ router.patch("/deliveries/:id/pickup", requireAuth, requireRider, async (req, re
 
     if (pickupOrder) {
       emitToUser(pickupOrder.user.toString(), "order:update", {
-        orderId: delivery.order,
+        orderId: String(delivery.order),
         status: "in-transit",
       });
     }
@@ -352,7 +352,7 @@ router.patch("/deliveries/:id/complete", requireAuth, requireRider, async (req, 
     if (order) {
       const customerId = order.user.toString();
       emitToUser(customerId, "order:update", {
-        orderId: order._id,
+        orderId: String(order._id),
         status: "awaiting_confirmation",
       });
       // Lock-screen push — copy matches the v3 design's "rider at gate"
@@ -479,7 +479,7 @@ async function applyRiderTransition(
     if (order) {
       const customerId = order.user.toString();
       emitToUser(customerId, "order:update", {
-        orderId: delivery.order,
+        orderId: String(delivery.order),
         status: toOrderStatus,
       });
 
@@ -652,7 +652,7 @@ router.patch("/deliveries/:id/finalise", requireAuth, requireRider, async (req, 
     if (order) {
       const customerId = order.user.toString();
       emitToUser(customerId, "order:update", {
-        orderId: order._id,
+        orderId: String(order._id),
         status: "awaiting_confirmation",
       });
       notifyUser(
@@ -711,7 +711,7 @@ router.post(
         .lean();
       if (order) {
         emitToUser(order.user.toString(), "dispense:progress", {
-          orderId: delivery.order,
+          orderId: String(delivery.order),
           litres,
         });
       }
@@ -764,7 +764,7 @@ router.patch("/deliveries/:id/drop", requireAuth, requireRider, async (req, res)
 
     if (order) {
       const customerId = order.user.toString();
-      emitToUser(customerId, "order:update", { orderId: order._id, status: "confirmed" });
+      emitToUser(customerId, "order:update", { orderId: String(order._id), status: "confirmed" });
       notifyUser(
         customerId,
         "delivery",
@@ -813,7 +813,7 @@ router.post(
       // past 100% on the customer's screen.
       const capped = Math.min(litres, (order as any).quantity ?? litres);
       emitToUser(order.user.toString(), "dispense:progress", {
-        orderId: order._id,
+        orderId: String(order._id),
         litres: capped,
       });
 
@@ -899,7 +899,7 @@ router.post(
       await order.save();
 
       emitToUser(order.user.toString(), "order:update", {
-        orderId: order._id,
+        orderId: String(order._id),
         weighIn: order.weighIn,
         totalCharged: order.totalCharged,
       });

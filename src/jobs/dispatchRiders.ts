@@ -44,7 +44,7 @@ export async function dispatchRiders(): Promise<void> {
       });
       await Delivery.deleteMany({ order: order._id, status: "pending" });
       const customerId = order.user.toString();
-      emitToUser(customerId, "order:update", { orderId: order._id, status: "cancelled" });
+      emitToUser(customerId, "order:update", { orderId: String(order._id), status: "cancelled" });
       notifyUser(
         customerId,
         "cancelled",

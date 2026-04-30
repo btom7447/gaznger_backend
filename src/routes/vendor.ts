@@ -227,8 +227,8 @@ router.patch("/orders/:id/confirm", requireAuth, requireVendor, async (req, res)
     const customerId = order.user.toString();
 
     // Instant socket events first
-    emitToUser(customerId, "order:update", { orderId: order._id, status: "confirmed" });
-    emitToUser(req.userId!, "order:update", { orderId: order._id, status: "confirmed" });
+    emitToUser(customerId, "order:update", { orderId: String(order._id), status: "confirmed" });
+    emitToUser(req.userId!, "order:update", { orderId: String(order._id), status: "confirmed" });
 
     // Create vendor pending earning (net of platform commission) + emit
     createVendorPendingEarning(req.userId!, order._id.toString(), order.fuelCost).catch(() => {});
@@ -264,8 +264,8 @@ router.patch("/orders/:id/reject", requireAuth, requireVendor, async (req, res) 
     const customerId = order.user.toString();
 
     // Instant socket events first
-    emitToUser(customerId, "order:update", { orderId: order._id, status: "cancelled" });
-    emitToUser(req.userId!, "order:update", { orderId: order._id, status: "cancelled" });
+    emitToUser(customerId, "order:update", { orderId: String(order._id), status: "cancelled" });
+    emitToUser(req.userId!, "order:update", { orderId: String(order._id), status: "cancelled" });
 
     // Background notification
     notifyUser(customerId, "cancelled", "Order Rejected",

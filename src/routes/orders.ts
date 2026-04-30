@@ -187,10 +187,10 @@ router.post("/", requireAuth, validate(createOrderSchema), async (req, res) => {
       await order.save();
 
       // 1. Instant socket events (no await)
-      emitToUser(req.userId, "order:update", { orderId: order._id, status: "confirmed" });
+      emitToUser(req.userId, "order:update", { orderId: String(order._id), status: "confirmed" });
       if (station.vendorId) {
         const vendorId = station.vendorId.toString();
-        emitToUser(vendorId, "order:new", { orderId: order._id, status: "confirmed", fuelName: fuel.name, quantity, unit: fuel.unit });
+        emitToUser(vendorId, "order:new", { orderId: String(order._id), status: "confirmed", fuelName: fuel.name, quantity, unit: fuel.unit });
         // Create vendor earnings + emit earnings event (fast DB write)
         createVendorPendingEarning(vendorId, order._id.toString(), fuelCost).catch(() => {});
       }
@@ -212,7 +212,7 @@ router.post("/", requireAuth, validate(createOrderSchema), async (req, res) => {
       // Pending order — instant vendor ping, then background notifications
       if (station.vendorId) {
         const vendorId = station.vendorId.toString();
-        emitToUser(vendorId, "order:new", { orderId: order._id, status: "pending", fuelName: fuel.name, quantity, unit: fuel.unit });
+        emitToUser(vendorId, "order:new", { orderId: String(order._id), status: "pending", fuelName: fuel.name, quantity, unit: fuel.unit });
         notifyUser(vendorId, "new_order", "New Order Received",
           `A new ${fuel.name} order (${quantity} ${fuel.unit}) has been placed at your station.`).catch(() => {});
       }
@@ -590,7 +590,7 @@ router.patch("/:orderId/status", requireAuth, validate(updateOrderStatusSchema),
     const userId = order.user.toString();
 
     // Instant socket event first
-    emitToUser(userId, "order:update", { orderId: order._id, status });
+    emitToUser(userId, "order:update", { orderId: String(order._id), status });
 
     // Background notifications (do not block response)
     Promise.resolve().then(async () => {
@@ -662,7 +662,7 @@ router.patch("/:orderId/cancel", requireAuth, async (req, res) => {
         .json({ message: "Only pending orders can be cancelled" });
     }
 
-    emitToUser(req.userId, "order:update", { orderId: order._id, status: "cancelled" });
+    emitToUser(req.userId, "order:update", { orderId: String(order._id), status: "cancelled" });
 
     await notifyUser(
       req.userId,
@@ -828,14 +828,14 @@ router.patch("/:orderId/confirm-delivery", requireAuth, async (req, res) => {
     // need so they can render real totals + timestamp + points without
     // a follow-up fetch.
     emitToUser(userId, "order:update", {
-      orderId: order._id,
+      orderId: String(order._id),
       status: "delivered",
       deliveredAt: order.deliveredAt,
       totalCharged: order.totalCharged,
       pointsEarned: order.pointsEarned,
     });
     if (order.riderId) {
-      emitToUser(order.riderId.toString(), "order:update", { orderId: order._id, status: "delivered" });
+      emitToUser(order.riderId.toString(), "order:update", { orderId: String(order._id), status: "delivered" });
     }
 
     Promise.all([

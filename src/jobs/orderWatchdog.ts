@@ -33,7 +33,7 @@ async function cancelStaleOrders() {
         "Order Cancelled",
         "No rider was available nearby. Your order has been cancelled — please try again."
       );
-      emitToUser(userId, "order:update", { orderId: order._id, status: "cancelled" });
+      emitToUser(userId, "order:update", { orderId: String(order._id), status: "cancelled" });
 
       console.log(`[Watchdog] Cancelled stale confirmed order ${order._id}`);
     }
