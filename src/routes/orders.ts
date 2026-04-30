@@ -734,10 +734,20 @@ router.patch("/:orderId/confirm-delivery", requireAuth, async (req, res) => {
     await settleOrderEarnings(order._id.toString());
 
     // Mark delivery record as delivered + set customerConfirmedAt
-    await Delivery.findOneAndUpdate(
+    const completedDelivery = await Delivery.findOneAndUpdate(
       { order: order._id, status: "awaiting_confirmation" },
-      { status: "delivered", customerConfirmedAt: new Date() }
+      { status: "delivered", customerConfirmedAt: new Date() },
+      { new: true }
     );
+
+    // Tear down the per-delivery socket room. Both rider and customer
+    // sockets leave; further events for this order go through user:
+    // rooms only (the customer might still be on the Delivered screen
+    // listening to order:update via the user room, which is fine).
+    if (completedDelivery) {
+      const { leaveDeliveryRoom } = await import("../socket");
+      leaveDeliveryRoom(String(completedDelivery._id));
+    }
 
     // Increment rider's totalDeliveries
     if (order.riderId) {

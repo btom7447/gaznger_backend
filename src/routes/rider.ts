@@ -11,7 +11,11 @@ import Earning from "../models/Earning";
 import Rating from "../models/Rating";
 import GasStation from "../models/Station";
 import { notifyUser } from "../utils/notify";
-import { emitToUser } from "../socket";
+import {
+  emitToUser,
+  joinDeliveryRoom,
+  leaveDeliveryRoom,
+} from "../socket";
 import { createRiderPendingEarning, settleOrderEarnings } from "../utils/earningsUtils";
 import Withdrawal from "../models/Withdrawal";
 import { listBanks, resolveBankAccount } from "../utils/paystack";
@@ -218,6 +222,12 @@ router.patch("/deliveries/:id/accept", requireAuth, requireRider, async (req, re
     const order = await Order.findById(delivery.order).select("user").lean();
     if (order) {
       const customerId = order.user.toString();
+
+      // Phase 2 — both parties join the per-delivery room. Subsequent
+      // rider:location pings emit directly to the room with no DB
+      // lookup. Cleared on terminal status (delivered / dropped /
+      // cancelled) by the matching transition handlers.
+      joinDeliveryRoom(String(delivery._id), [req.userId!, customerId]);
 
       const [riderUser, riderProfile] = await Promise.all([
         User.findById(req.userId).select("displayName phone profileImage").lean(),
@@ -659,6 +669,11 @@ router.patch("/deliveries/:id/drop", requireAuth, requireRider, async (req, res)
         "Your rider was unable to complete the delivery. We're finding a new rider for you."
       ).catch(() => {});
     }
+
+    // Tear down the delivery room — neither rider nor customer
+    // should keep receiving room emits for a dropped job. Customer
+    // re-joins automatically when a new rider accepts.
+    leaveDeliveryRoom(String(delivery._id));
 
     res.json({ message: "Delivery dropped", deliveryId: delivery._id });
   } catch (err) {
