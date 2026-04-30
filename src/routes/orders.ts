@@ -452,6 +452,35 @@ router.get("/:orderId/route", requireAuth, async (req, res) => {
       expiresAt: Date.now() + ROUTE_CACHE_TTL_MS,
     });
 
+    // Phase 3 — emit route:update to the customer so multi-device
+    // sessions (or a customer who recently reconnected) stay in
+    // sync without their own poll. The matching Delivery's room
+    // exists once a rider has accepted; before that there's
+    // nothing to broadcast. Best-effort: lookup is cheap, failure
+    // is silently fine (the requesting client got the polyline
+    // back synchronously).
+    try {
+      const { emitToDelivery } = await import("../socket");
+      const Delivery = (await import("../models/Delivery")).default;
+      const activeDelivery = await Delivery.findOne({
+        order: order._id,
+        status: { $nin: ["delivered", "dropped", "failed"] },
+      })
+        .select("_id")
+        .lean();
+      if (activeDelivery) {
+        emitToDelivery(String(activeDelivery._id), "route:update", {
+          orderId: String(order._id),
+          polyline,
+          distanceM: distanceMeters,
+          durationS: durationSeconds,
+          target,
+        });
+      }
+    } catch {
+      // non-fatal — the synchronous response covers the requester
+    }
+
     res.json({ polyline, distanceMeters, durationSeconds });
   } catch (err) {
     console.error("[orders/:orderId/route]", err);
