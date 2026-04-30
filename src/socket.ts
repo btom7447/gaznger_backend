@@ -28,12 +28,31 @@ export function initSocket(httpServer: HttpServer): Server {
     socket.join(`user:${userId}`);
     console.log(`[Socket] connected uid=${userId} sid=${socket.id}`);
 
-    // Relay rider location to the customer who has the active order
+    /**
+     * Relay rider GPS to the customer with the active order. The
+     * status whitelist spans both the legacy delivery states
+     * (`accepted` / `picked_up`) AND the v3 granular states
+     * (`at_plant` / `refilling` / `returning` / `arrived` /
+     * `dispensing`). Without the granular states in this list, an
+     * upgraded rider's GPS pings would be dropped on the floor and
+     * the customer's rider pin would never appear during the
+     * granular pipeline — which is exactly the F1 bug.
+     */
     socket.on("rider:location", async ({ lat, lng }: { lat: number; lng: number }) => {
       try {
         const delivery = await Delivery.findOne({
           rider: userId,
-          status: { $in: ["accepted", "picked_up"] },
+          status: {
+            $in: [
+              "accepted",
+              "picked_up",
+              "at_plant",
+              "refilling",
+              "returning",
+              "arrived",
+              "dispensing",
+            ],
+          },
         })
           .populate<{ order: { user: { toString(): string } } }>("order", "user")
           .lean();

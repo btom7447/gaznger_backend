@@ -100,8 +100,24 @@ export interface IUser extends Document {
     autoRedeemPoints?: boolean;
     priceAlertsEnabled?: boolean;
     pushEnabled?: boolean;
+    /**
+     * Sub-toggles for the "All notifications" master switch in Settings.
+     * `pushEnabled` remains the master gate — these only matter when
+     * push is on. `orderUpdates` defaults true (most useful channel),
+     * `promotions` defaults false (we err on the side of less spam).
+     */
+    orderUpdates?: boolean;
+    promotions?: boolean;
     notificationsFilter?: string;
   };
+
+  /**
+   * Optional 4-digit PIN, hashed via bcrypt. When set, the client
+   * surfaces a "Verify PIN" gate before sensitive actions (delete
+   * account, change phone, withdraw). NEVER returned by `/auth/me`
+   * — only its presence (boolean) is exposed.
+   */
+  pinHash?: string;
 }
 
 const defaultMaleImage = "https://avatar.iran.liara.run/public/19";
@@ -186,8 +202,12 @@ const UserSchema: Schema<IUser> = new Schema(
       autoRedeemPoints: { type: Boolean, default: false },
       priceAlertsEnabled: { type: Boolean, default: false },
       pushEnabled: { type: Boolean, default: true },
+      orderUpdates: { type: Boolean, default: true },
+      promotions: { type: Boolean, default: false },
       notificationsFilter: { type: String },
     },
+
+    pinHash: { type: String },
   },
   { timestamps: true }
 );

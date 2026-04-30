@@ -1,9 +1,23 @@
 import mongoose, { Schema, Document } from "mongoose";
 
+/**
+ * Delivery status mirrors the rider's view of the order. Spans
+ * legacy values (`accepted` / `picked_up`) and the v3 granular
+ * pipeline (`at_plant` / `refilling` / `returning` / `arrived` /
+ * `dispensing`). Both coexist so the legacy rider app keeps working
+ * during the granular rollout — old clients drive the legacy path
+ * via /pickup + /complete, new clients drive the granular path via
+ * the new endpoints.
+ */
 export type DeliveryStatus =
   | "pending"
   | "accepted"
   | "picked_up"
+  | "at_plant"
+  | "refilling"
+  | "returning"
+  | "arrived"
+  | "dispensing"
   | "awaiting_confirmation"
   | "delivered"
   | "dropped"
@@ -33,7 +47,20 @@ const DeliverySchema: Schema = new Schema(
     station: { type: Schema.Types.ObjectId, ref: "GasStation", required: true },
     status: {
       type: String,
-      enum: ["pending", "accepted", "picked_up", "awaiting_confirmation", "delivered", "dropped", "failed"],
+      enum: [
+        "pending",
+        "accepted",
+        "picked_up",
+        "at_plant",
+        "refilling",
+        "returning",
+        "arrived",
+        "dispensing",
+        "awaiting_confirmation",
+        "delivered",
+        "dropped",
+        "failed",
+      ],
       default: "pending",
     },
     pickupTime: { type: Date },

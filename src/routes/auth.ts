@@ -15,6 +15,10 @@ import {
   forgotPasswordSchema,
   resetPasswordSchema,
   updateProfileSchema,
+  setPinSchema,
+  verifyPinSchema,
+  clearPinSchema,
+  savedCylinderSchema,
 } from "../validators/auth.validators";
 
 const router = Router();
@@ -26,13 +30,42 @@ const router = Router();
  *   description: User authentication and token management
  */
 
-const saveRefreshToken = async (userId: string, token: string) => {
+/**
+ * Persist a refresh token with optional device metadata. The metadata
+ * powers the Active Sessions screen — without it, every row reads as
+ * "Unknown device". Callers should pass `req` so we can sniff the UA
+ * + IP at the same time.
+ */
+const saveRefreshToken = async (
+  userId: string,
+  token: string,
+  meta?: { userAgent?: string; device?: string; ip?: string }
+) => {
   const expiresAt = new Date();
   expiresAt.setDate(expiresAt.getDate() + 7);
-  await RefreshToken.create({ user: userId, token, expiresAt });
+  await RefreshToken.create({
+    user: userId,
+    token,
+    expiresAt,
+    userAgent: meta?.userAgent,
+    device: meta?.device,
+    ip: meta?.ip,
+    lastUsedAt: new Date(),
+  });
 };
 
 const generateOtp = () => crypto.randomInt(100000, 999999).toString();
+
+/**
+ * Pull device metadata off an incoming request for session bookkeeping.
+ * Header `X-Device-Label` is mobile-only; it carries a friendlier label
+ * than the User-Agent string (e.g. "iPhone 15 Pro").
+ */
+const sessionMeta = (req: import("express").Request) => ({
+  userAgent: req.get("user-agent") ?? undefined,
+  device: (req.get("x-device-label") as string | undefined) ?? undefined,
+  ip: req.ip,
+});
 
 // ===================== REGISTER =====================
 router.post("/register", validate(registerSchema), async (req, res) => {
@@ -67,7 +100,7 @@ router.post("/register", validate(registerSchema), async (req, res) => {
     const userIdStr = user._id.toString();
     const accessToken = signAccessToken({ id: userIdStr });
     const refreshToken = signRefreshToken({ id: userIdStr });
-    await saveRefreshToken(userIdStr, refreshToken);
+    await saveRefreshToken(userIdStr, refreshToken, sessionMeta(req));
 
     res.status(201).json({
       message: "User registered successfully. Please verify your email.",
@@ -216,7 +249,7 @@ router.post("/login", validate(loginSchema), async (req, res) => {
     const userIdStr = user._id.toString();
     const accessToken = signAccessToken({ id: userIdStr });
     const refreshToken = signRefreshToken({ id: userIdStr });
-    await saveRefreshToken(userIdStr, refreshToken);
+    await saveRefreshToken(userIdStr, refreshToken, sessionMeta(req));
 
     res.json({
       user: {
@@ -258,7 +291,7 @@ router.post("/refresh-token", async (req, res) => {
 
     const accessToken = signAccessToken({ id: payload.id });
     const newRefreshToken = signRefreshToken({ id: payload.id });
-    await saveRefreshToken(payload.id, newRefreshToken);
+    await saveRefreshToken(payload.id, newRefreshToken, sessionMeta(req));
 
     res.json({ accessToken, refreshToken: newRefreshToken });
   } catch (err) {
@@ -285,7 +318,7 @@ router.post("/logout", async (req, res) => {
 router.get("/me", requireAuth, async (req, res) => {
   try {
     const user = await User.findById(req.userId).select(
-      "-passwordHash -otpCode -otpExpiresAt"
+      "-passwordHash -otpCode -otpExpiresAt -pinHash"
     );
     if (!user) return res.status(404).json({ message: "User not found" });
 
@@ -310,7 +343,12 @@ router.get("/me", requireAuth, async (req, res) => {
       // Non-fatal — profile still returns without the count.
     }
 
-    res.json({ ...user.toObject(), lpgOrderCount });
+    // Re-read pinHash separately so we can derive `hasPin` without
+    // ever returning the hash itself.
+    const pinUser = await User.findById(req.userId).select("pinHash").lean();
+    const hasPin = Boolean(pinUser?.pinHash);
+
+    res.json({ ...user.toObject(), lpgOrderCount, hasPin });
   } catch (err) {
     res.status(500).json({ message: "Internal server error" });
   }
@@ -335,6 +373,8 @@ router.put("/me", requireAuth, validate(updateProfileSchema), async (req, res) =
         "autoRedeemPoints",
         "priceAlertsEnabled",
         "pushEnabled",
+        "orderUpdates",
+        "promotions",
         "notificationsFilter",
       ] as const;
       for (const key of allowedKeys) {
@@ -389,6 +429,231 @@ router.delete("/device-token", requireAuth, async (req, res) => {
   } catch (err) {
 
     res.status(500).json({ message: "Internal server error" });
+  }
+});
+
+// ===================== PIN: SET / CHANGE =====================
+/**
+ * Set or change the user's 4-digit PIN.
+ *
+ *   - First-time set (`hasPin` is false): require `password` so a
+ *     stolen unlocked phone can't add a PIN that locks the legitimate
+ *     owner out.
+ *   - Change (`hasPin` is true): require `currentPin` to verify before
+ *     accepting `newPin`.
+ */
+router.post("/pin/set", requireAuth, validate(setPinSchema), async (req, res) => {
+  try {
+    const { newPin, currentPin, password } = req.body as {
+      newPin: string;
+      currentPin?: string;
+      password?: string;
+    };
+
+    const user = await User.findById(req.userId).select("passwordHash pinHash");
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    if (user.pinHash) {
+      if (!currentPin)
+        return res.status(400).json({ message: "Current PIN required" });
+      const ok = await comparePassword(currentPin, user.pinHash);
+      if (!ok) return res.status(401).json({ message: "Current PIN incorrect" });
+    } else {
+      if (!password)
+        return res.status(400).json({ message: "Password required" });
+      const ok = await comparePassword(password, user.passwordHash);
+      if (!ok) return res.status(401).json({ message: "Password incorrect" });
+    }
+
+    user.pinHash = await hashPassword(newPin);
+    await user.save();
+
+    res.json({ message: "PIN updated", hasPin: true });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to update PIN" });
+  }
+});
+
+// ===================== PIN: VERIFY =====================
+/**
+ * Verify the user's PIN. Used by the client right before sensitive
+ * actions (delete account, change phone, big withdrawals). Returns
+ * `{ ok: true }` on match — never echoes the PIN back.
+ */
+router.post(
+  "/pin/verify",
+  requireAuth,
+  validate(verifyPinSchema),
+  async (req, res) => {
+    try {
+      const { pin } = req.body as { pin: string };
+      const user = await User.findById(req.userId).select("pinHash");
+      if (!user || !user.pinHash)
+        return res.status(400).json({ message: "No PIN set" });
+
+      const ok = await comparePassword(pin, user.pinHash);
+      if (!ok) return res.status(401).json({ message: "Incorrect PIN" });
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ message: "Failed to verify PIN" });
+    }
+  }
+);
+
+// ===================== PIN: CLEAR =====================
+router.delete("/pin", requireAuth, validate(clearPinSchema), async (req, res) => {
+  try {
+    const { currentPin, password } = req.body as {
+      currentPin?: string;
+      password?: string;
+    };
+    const user = await User.findById(req.userId).select("passwordHash pinHash");
+    if (!user) return res.status(404).json({ message: "User not found" });
+    if (!user.pinHash)
+      return res.json({ message: "No PIN set", hasPin: false });
+
+    // Either currentPin or password may unlock the clear — same threat
+    // model as set: we want at least one factor that proves identity.
+    if (currentPin) {
+      const ok = await comparePassword(currentPin, user.pinHash);
+      if (!ok)
+        return res.status(401).json({ message: "Current PIN incorrect" });
+    } else if (password) {
+      const ok = await comparePassword(password, user.passwordHash);
+      if (!ok) return res.status(401).json({ message: "Password incorrect" });
+    } else {
+      return res
+        .status(400)
+        .json({ message: "Current PIN or password required" });
+    }
+
+    user.pinHash = undefined;
+    await user.save();
+    res.json({ message: "PIN cleared", hasPin: false });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to clear PIN" });
+  }
+});
+
+// ===================== ACTIVE SESSIONS: LIST =====================
+/**
+ * Returns every refresh-token row for the current user (= every active
+ * session). The row matching the bearer's refresh token is flagged as
+ * `current: true`. The body `currentRefreshToken` is optional but
+ * recommended — without it the client can't tell which row is "this
+ * device".
+ */
+router.get("/sessions", requireAuth, async (req, res) => {
+  try {
+    const sessions = await RefreshToken.find({ user: req.userId })
+      .sort({ updatedAt: -1 })
+      .select("_id userAgent device ip lastUsedAt createdAt expiresAt token")
+      .lean();
+
+    const passedToken = (req.query.current as string | undefined) ?? null;
+    const out = sessions.map((s) => ({
+      _id: s._id,
+      userAgent: s.userAgent,
+      device: s.device,
+      ip: s.ip,
+      lastUsedAt: s.lastUsedAt,
+      createdAt: s.createdAt,
+      expiresAt: s.expiresAt,
+      current: passedToken ? s.token === passedToken : false,
+    }));
+
+    res.json({ sessions: out });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to list sessions" });
+  }
+});
+
+// ===================== ACTIVE SESSIONS: REVOKE ONE =====================
+router.delete("/sessions/:id", requireAuth, async (req, res) => {
+  try {
+    const result = await RefreshToken.findOneAndDelete({
+      _id: req.params.id,
+      user: req.userId,
+    });
+    if (!result) return res.status(404).json({ message: "Session not found" });
+    res.json({ message: "Session revoked" });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to revoke session" });
+  }
+});
+
+// ===================== SAVED CYLINDER: PUT =====================
+/**
+ * Replace the user's saved-cylinder profile with the supplied fields.
+ * Each field is optional — clients can save a partial profile and
+ * refine later. Photos are pre-uploaded URLs (Cloudinary), max 3.
+ */
+router.put(
+  "/saved-cylinder",
+  requireAuth,
+  validate(savedCylinderSchema),
+  async (req, res) => {
+    try {
+      const { brand, valve, age, test, photos } = req.body as {
+        brand?: string;
+        valve?: string;
+        age?: string;
+        test?: string;
+        photos?: string[];
+      };
+
+      const updates: Record<string, unknown> = {
+        "savedCylinder.savedAt": new Date(),
+      };
+      if (brand !== undefined) updates["savedCylinder.brand"] = brand;
+      if (valve !== undefined) updates["savedCylinder.valve"] = valve;
+      if (age !== undefined) updates["savedCylinder.age"] = age;
+      if (test !== undefined) updates["savedCylinder.test"] = test;
+      if (photos !== undefined) updates["savedCylinder.photos"] = photos;
+
+      const user = await User.findByIdAndUpdate(
+        req.userId,
+        { $set: updates },
+        { new: true }
+      ).select("savedCylinder");
+
+      if (!user) return res.status(404).json({ message: "User not found" });
+      res.json({ savedCylinder: user.savedCylinder });
+    } catch (err) {
+      res.status(500).json({ message: "Failed to save cylinder" });
+    }
+  }
+);
+
+// ===================== SAVED CYLINDER: DELETE =====================
+router.delete("/saved-cylinder", requireAuth, async (req, res) => {
+  try {
+    await User.findByIdAndUpdate(req.userId, {
+      $unset: { savedCylinder: "" },
+    });
+    res.json({ message: "Saved cylinder cleared", savedCylinder: null });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to clear saved cylinder" });
+  }
+});
+
+// ===================== ACTIVE SESSIONS: REVOKE ALL OTHERS =====================
+/**
+ * Sign out of every other device. The current session (matched on
+ * `currentRefreshToken` in the body) is preserved so the user doesn't
+ * get logged out of the device they're using.
+ */
+router.delete("/sessions", requireAuth, async (req, res) => {
+  try {
+    const { currentRefreshToken } = req.body as {
+      currentRefreshToken?: string;
+    };
+    const filter: Record<string, unknown> = { user: req.userId };
+    if (currentRefreshToken) filter.token = { $ne: currentRefreshToken };
+    const result = await RefreshToken.deleteMany(filter);
+    res.json({ message: "Other sessions revoked", count: result.deletedCount });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to revoke sessions" });
   }
 });
 

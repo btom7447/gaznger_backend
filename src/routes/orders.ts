@@ -338,6 +338,7 @@ router.get("/:orderId/route", requireAuth, async (req, res) => {
   try {
     const order = await Order.findById(req.params.orderId)
       .populate({ path: "deliveryAddress", select: "latitude longitude" })
+      .populate({ path: "station", select: "location" })
       .lean();
     if (!order) return res.status(404).json({ message: "Order not found" });
     if (order.user.toString() !== req.userId)
@@ -348,15 +349,45 @@ router.get("/:orderId/route", requireAuth, async (req, res) => {
     if (!Number.isFinite(riderLat) || !Number.isFinite(riderLng))
       return res.status(400).json({ message: "riderLat & riderLng required" });
 
-    const dest = order.deliveryAddress as unknown as
-      | { latitude?: number; longitude?: number }
-      | undefined;
-    if (!dest?.latitude || !dest?.longitude)
-      return res.status(400).json({ message: "Delivery address missing coordinates" });
+    /**
+     * Route target — `station` for the rider's outbound leg
+     * (assigned / at-pickup phases) or `destination` (default) for
+     * the customer-bound leg (in-transit / almost-there). Picking
+     * the wrong target would route the wrong geometry to the
+     * customer screen, so the client passes this explicitly.
+     */
+    const target =
+      req.query.target === "station" ? "station" : "destination";
 
-    // Cache hit — round to 3dp so micro-jitter on the rider coord
-    // doesn't bust the cache every push.
-    const cacheKey = `${order._id.toString()}:${riderLat.toFixed(3)},${riderLng.toFixed(3)}`;
+    let destLat: number | undefined;
+    let destLng: number | undefined;
+    if (target === "station") {
+      const station = order.station as unknown as
+        | { location?: { lat?: number; lng?: number } }
+        | undefined;
+      destLat = station?.location?.lat;
+      destLng = station?.location?.lng;
+    } else {
+      const dest = order.deliveryAddress as unknown as
+        | { latitude?: number; longitude?: number }
+        | undefined;
+      destLat = dest?.latitude;
+      destLng = dest?.longitude;
+    }
+    if (destLat == null || destLng == null) {
+      return res.status(400).json({
+        message:
+          target === "station"
+            ? "Station missing coordinates"
+            : "Delivery address missing coordinates",
+      });
+    }
+
+    // Cache key includes the target so a station+destination route
+    // pair for the same rider position doesn't collide.
+    const cacheKey = `${order._id.toString()}:${target}:${riderLat.toFixed(
+      3
+    )},${riderLng.toFixed(3)}`;
     const cached = routeCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
       return res.json({
@@ -373,7 +404,7 @@ router.get("/:orderId/route", requireAuth, async (req, res) => {
       return res.json({
         polyline: [
           [riderLat, riderLng],
-          [dest.latitude, dest.longitude],
+          [destLat, destLng],
         ],
         distanceMeters: undefined,
         durationSeconds: undefined,
@@ -382,7 +413,7 @@ router.get("/:orderId/route", requireAuth, async (req, res) => {
 
     const params = new URLSearchParams({
       origin: `${riderLat},${riderLng}`,
-      destination: `${dest.latitude},${dest.longitude}`,
+      destination: `${destLat},${destLng}`,
       mode: "driving",
       key: apiKey,
     });
@@ -402,7 +433,7 @@ router.get("/:orderId/route", requireAuth, async (req, res) => {
       return res.json({
         polyline: [
           [riderLat, riderLng],
-          [dest.latitude, dest.longitude],
+          [destLat, destLng],
         ],
       });
     }
@@ -495,6 +526,28 @@ const STATUS_TRANSITIONS: Record<
     // rider-side detail (`riderId === caller`) is also enforced below.
     { from: "in-transit", to: "awaiting_confirmation" },
     { from: "in_transit", to: "awaiting_confirmation" },
+    // ─── v3 granular rider transitions ───
+    // Driven by the upgraded rider app. Each represents a distinct
+    // physical milestone:
+    //   assigned   → at_plant     (rider has reached the pickup station)
+    //   at_plant   → refilling    (pump operator is filling the order)
+    //   refilling  → returning    (loaded, heading to customer)
+    //   returning  → arrived      (rolled up to the customer's gate)
+    //   arrived    → dispensing   (started pumping at the customer's tank)
+    //   dispensing → awaiting_confirmation (done; customer must confirm)
+    //
+    // Some transitions can be skipped (e.g. an LPG-Swap rider goes
+    // straight from at_plant → returning when the cylinder is
+    // weighed-and-swapped in one motion). We allow the skips so we
+    // don't force the rider through every step on swap orders.
+    { from: "assigned", to: "at_plant" },
+    { from: "at_plant", to: "refilling" },
+    { from: "at_plant", to: "returning" }, // skip refilling for swaps
+    { from: "refilling", to: "returning" },
+    { from: "returning", to: "arrived" },
+    { from: "arrived", to: "dispensing" },
+    { from: "arrived", to: "awaiting_confirmation" }, // swaps skip dispensing
+    { from: "dispensing", to: "awaiting_confirmation" },
   ],
   // Admin: any transition. Audited separately via AuditLog at the
   // admin route surface; this generic endpoint stays open for ops.
@@ -565,6 +618,19 @@ router.patch("/:orderId/status", requireAuth, validate(updateOrderStatusSchema),
       if ((status === "in_transit" || status === "in-transit") && prevStatus !== status) {
         await notifyUser(userId, "delivery", "On the Way!", "Your fuel is on its way. Track your rider in real time.");
       }
+      // Rider has rolled up to the customer's address — surface the
+      // most attention-grabbing notification of the flow. The customer's
+      // app simultaneously hard-routes to the Arrival/Handoff screen
+      // (driven by the same socket order:update event), so this push
+      // primarily lights up the lock screen for users who minimised.
+      if (status === "arrived" && prevStatus !== "arrived") {
+        await notifyUser(
+          userId,
+          "delivery",
+          "Your rider is here 🚪",
+          "They're at your gate. Step out when ready."
+        );
+      }
       if (status === "delivered" && prevStatus !== "delivered") {
         const expiresAt = new Date();
         expiresAt.setDate(expiresAt.getDate() + 30);
@@ -609,6 +675,79 @@ router.patch("/:orderId/cancel", requireAuth, async (req, res) => {
     res.json({ message: "Order cancelled", order });
   } catch (err) {
     res.status(500).json({ message: "Failed to cancel order" });
+  }
+});
+
+// ===================== CUSTOMER "I'M HERE" PING =====================
+/**
+ * POST /api/orders/:orderId/customer-here
+ *
+ * Surfaced by the v3 Track screen during the `almost-there` phase.
+ * Tells the rider that the customer is at the gate so they don't have
+ * to call. Idempotent — repeat hits within the same order are no-ops
+ * (we just re-emit the socket event so a reconnected rider catches it).
+ *
+ * Authorization: customer-only, must own the order.
+ *
+ * Side effects:
+ *   - Stamps `order.customerHereAt` if not yet set.
+ *   - Emits `order:customer-here` to the rider's socket room with the
+ *     order id + timestamp.
+ *   - Best-effort push notification to the rider.
+ *
+ * Returns: { stamped: boolean, customerHereAt: Date }
+ */
+router.post("/:orderId/customer-here", requireAuth, async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.orderId);
+    if (!order) return res.status(404).json({ message: "Order not found" });
+
+    if (order.user.toString() !== req.userId)
+      return res.status(403).json({ message: "Forbidden" });
+
+    // Only meaningful while a rider is en route. Block on terminal
+    // statuses so a stale tap doesn't ping a long-finished order.
+    const eligibleStatuses = [
+      "assigned",
+      "picked_up",
+      "at_plant",
+      "refilling",
+      "returning",
+      "arrived",
+    ];
+    if (!eligibleStatuses.includes(order.status)) {
+      return res.status(400).json({
+        message: "Rider isn't en route to your address right now.",
+      });
+    }
+
+    let stamped = false;
+    if (!order.customerHereAt) {
+      order.customerHereAt = new Date();
+      await order.save();
+      stamped = true;
+    }
+    const customerHereAt = order.customerHereAt;
+
+    // Emit to the rider so their app surfaces a "Customer at gate" pill.
+    if (order.riderId) {
+      emitToUser(order.riderId.toString(), "order:customer-here", {
+        orderId: order._id.toString(),
+        customerHereAt,
+      });
+      // Push to the rider device — non-fatal if it fails.
+      notifyUser(
+        order.riderId.toString(),
+        "delivery",
+        "Customer at the gate",
+        "Heads up — they're outside waiting."
+      ).catch(() => {});
+    }
+
+    res.json({ stamped, customerHereAt });
+  } catch (err) {
+    console.error("[orders/:orderId/customer-here]", err);
+    res.status(500).json({ message: "Failed to send arrival ping" });
   }
 });
 

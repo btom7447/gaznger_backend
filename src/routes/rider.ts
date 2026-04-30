@@ -143,9 +143,29 @@ router.patch("/location", requireAuth, requireRider, async (req, res) => {
 // Returns the rider's current in-progress delivery (accepted or picked_up).
 router.get("/active", requireAuth, requireRider, async (req, res) => {
   try {
+    // Status whitelist spans BOTH the legacy delivery states
+    // (`pending` / `accepted` / `picked_up` / `awaiting_confirmation`)
+    // AND the v3 granular states (`at_plant` / `refilling` /
+    // `returning` / `arrived` / `dispensing`). Without the granular
+    // states, an upgraded rider's active-delivery query goes empty
+    // the moment they tap "Mark at station" — leaving the rider app
+    // blank while the customer keeps watching them on the map. Same
+    // root cause as the rider:location relay bug (see socket.ts).
     const delivery = await Delivery.findOne({
       rider: req.userId,
-      status: { $in: ["pending", "accepted", "picked_up", "awaiting_confirmation"] },
+      status: {
+        $in: [
+          "pending",
+          "accepted",
+          "picked_up",
+          "at_plant",
+          "refilling",
+          "returning",
+          "arrived",
+          "dispensing",
+          "awaiting_confirmation",
+        ],
+      },
     })
       .populate({
         path: "order",
@@ -212,7 +232,7 @@ router.patch("/deliveries/:id/accept", requireAuth, requireRider, async (req, re
       const customerId = order.user.toString();
 
       const [riderUser, riderProfile] = await Promise.all([
-        User.findById(req.userId).select("displayName phone").lean(),
+        User.findById(req.userId).select("displayName phone profileImage").lean(),
         RiderProfile.findOne({ user: req.userId })
           .select("vehiclePlate rating")
           .lean(),
@@ -230,6 +250,7 @@ router.patch("/deliveries/:id/accept", requireAuth, requireRider, async (req, re
           plate: riderProfile?.vehiclePlate,
           rating: riderProfile?.rating,
           phone: riderUser?.phone,
+          profileImage: riderUser?.profileImage,
           initials: display
             .split(/\s+/)
             .map((p) => p.charAt(0))
@@ -332,12 +353,22 @@ router.patch("/deliveries/:id/complete", requireAuth, requireRider, async (req, 
 
     if (order) {
       const customerId = order.user.toString();
-      emitToUser(customerId, "order:update", { orderId: order._id, status: "awaiting_confirmation" });
+      emitToUser(customerId, "order:update", {
+        orderId: order._id,
+        status: "awaiting_confirmation",
+      });
+      // Lock-screen push — copy matches the v3 design's "rider at gate"
+      // notification. The legacy rider app collapses the granular
+      // arrived/dispensing transitions into awaiting_confirmation, so
+      // this is the single notification we have for the on-site phase.
+      // When the rider app upgrades and starts emitting `arrived`
+      // separately, the equivalent notify in routes/orders.ts handles
+      // that path and this one stays as the customer-confirm prompt.
       notifyUser(
         customerId,
         "delivery",
-        "Confirm Your Delivery",
-        "Your rider has arrived! Please confirm you've received your fuel order."
+        "Your rider is here 🚪",
+        "Step out when ready — confirm receipt in the app once your fuel is in."
       ).catch(() => {});
     }
 
@@ -350,6 +381,246 @@ router.patch("/deliveries/:id/complete", requireAuth, requireRider, async (req, 
   }
 });
 
+// ===================== GRANULAR V3 PHASE TRANSITIONS =====================
+/**
+ * Six narrow endpoints that drive the v3 granular order pipeline:
+ *   PATCH /deliveries/:id/at-plant      assigned     → at_plant
+ *   PATCH /deliveries/:id/refilling     at_plant     → refilling
+ *   PATCH /deliveries/:id/heading-back  refilling    → returning
+ *                                       at_plant     → returning  (LPG-Swap shortcut)
+ *   PATCH /deliveries/:id/arrived       returning    → arrived
+ *   PATCH /deliveries/:id/dispensing    arrived      → dispensing
+ *   PATCH /deliveries/:id/finalise      dispensing   → awaiting_confirmation
+ *                                       arrived      → awaiting_confirmation (swap shortcut)
+ *
+ * Each transition:
+ *   1. Validates the rider owns the delivery + the previous status.
+ *   2. Updates the Order status (the canonical timeline customers see).
+ *   3. Emits `order:update` to the customer's socket room.
+ *   4. Emits `delivery:update` to the rider's own room (so the
+ *      rider screen reflects the new state on the next render).
+ *
+ * The legacy `/pickup` + `/complete` endpoints stay in place as
+ * compatibility shims; older rider builds keep working alongside
+ * the new granular flow.
+ */
+async function applyRiderTransition(
+  riderId: string,
+  deliveryId: string | string[] | undefined,
+  fromDeliveryStatuses: string[],
+  toDeliveryStatus: string,
+  toOrderStatus: string,
+  successMessage: string,
+  res: import("express").Response
+) {
+  try {
+    const delivery = await Delivery.findOneAndUpdate(
+      { _id: deliveryId, rider: riderId, status: { $in: fromDeliveryStatuses } },
+      { status: toDeliveryStatus },
+      { new: true }
+    );
+    if (!delivery) {
+      return res.status(409).json({
+        message: `Delivery not in expected state (need one of: ${fromDeliveryStatuses.join(", ")}).`,
+      });
+    }
+
+    const order = await Order.findByIdAndUpdate(
+      delivery.order,
+      { status: toOrderStatus },
+      { new: true }
+    ).select("user").lean();
+
+    if (order) {
+      emitToUser(order.user.toString(), "order:update", {
+        orderId: delivery.order,
+        status: toOrderStatus,
+      });
+    }
+    emitToUser(riderId, "delivery:update", {
+      deliveryId: delivery._id,
+      status: toDeliveryStatus,
+    });
+
+    return res.json({ message: successMessage, deliveryId: delivery._id });
+  } catch (err) {
+    return res.status(500).json({ message: "Transition failed" });
+  }
+}
+
+// At plant — rider has reached the pickup station.
+router.patch("/deliveries/:id/at-plant", requireAuth, requireRider, async (req, res) => {
+  // Delivery model uses `accepted` for "rider en route to station"
+  // in the legacy flow. We accept either `accepted` or `picked_up`
+  // here so a rider that already pressed the legacy "pickup" button
+  // can still flip back into the granular flow without getting stuck.
+  await applyRiderTransition(
+    req.userId,
+    req.params.id,
+    ["accepted", "picked_up"],
+    "at_plant",
+    "at_plant",
+    "Marked at plant",
+    res
+  );
+});
+
+// Refilling — pump operator filling the order. Liquid only; LPG-Swap
+// orders skip directly from at_plant → returning via /heading-back.
+router.patch("/deliveries/:id/refilling", requireAuth, requireRider, async (req, res) => {
+  await applyRiderTransition(
+    req.userId,
+    req.params.id,
+    ["at_plant"],
+    "refilling",
+    "refilling",
+    "Refilling started",
+    res
+  );
+});
+
+// Heading back — loaded, on the way to the customer. Accepts either
+// `refilling` (liquid) or `at_plant` (LPG-Swap shortcut).
+router.patch("/deliveries/:id/heading-back", requireAuth, requireRider, async (req, res) => {
+  await applyRiderTransition(
+    req.userId,
+    req.params.id,
+    ["refilling", "at_plant"],
+    "returning",
+    "returning",
+    "Heading back",
+    res
+  );
+});
+
+// Arrived — pulled up at the customer's gate. Customer-side this
+// flips Track to `almost-there` and fires the lock-screen push.
+router.patch("/deliveries/:id/arrived", requireAuth, requireRider, async (req, res) => {
+  await applyRiderTransition(
+    req.userId,
+    req.params.id,
+    ["returning"],
+    "arrived",
+    "arrived",
+    "Arrived",
+    res
+  );
+});
+
+// Dispensing — started pumping at the customer's tank. Liquid only;
+// LPG-Swap goes straight from arrived → finalise. The rider-side
+// emit also drives the `dispense:progress` events while pumping
+// (those carry a `litres` payload — see /dispense-progress below).
+router.patch("/deliveries/:id/dispensing", requireAuth, requireRider, async (req, res) => {
+  await applyRiderTransition(
+    req.userId,
+    req.params.id,
+    ["arrived"],
+    "dispensing",
+    "dispensing",
+    "Dispensing started",
+    res
+  );
+});
+
+// Finalise — done, customer must confirm. Accepts either `dispensing`
+// (liquid) or `arrived` (LPG-Swap shortcut).
+router.patch("/deliveries/:id/finalise", requireAuth, requireRider, async (req, res) => {
+  try {
+    const delivery = await Delivery.findOneAndUpdate(
+      {
+        _id: req.params.id,
+        rider: req.userId,
+        status: { $in: ["dispensing", "arrived"] },
+      },
+      { status: "awaiting_confirmation", deliveryTime: new Date() },
+      { new: true }
+    );
+    if (!delivery) {
+      return res
+        .status(409)
+        .json({ message: "Delivery not in dispensing or arrived state" });
+    }
+
+    const order = await Order.findByIdAndUpdate(
+      delivery.order,
+      { status: "awaiting_confirmation" },
+      { new: true }
+    );
+
+    if (order) {
+      const customerId = order.user.toString();
+      emitToUser(customerId, "order:update", {
+        orderId: order._id,
+        status: "awaiting_confirmation",
+      });
+      notifyUser(
+        customerId,
+        "delivery",
+        "Confirm your delivery",
+        "Tap to confirm you've received your fuel."
+      ).catch(() => {});
+    }
+    emitToUser(req.userId, "delivery:update", {
+      deliveryId: delivery._id,
+      status: "awaiting_confirmation",
+    });
+
+    res.json({
+      message: "Awaiting customer confirmation",
+      deliveryId: delivery._id,
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to finalise delivery" });
+  }
+});
+
+/**
+ * Dispense progress ping. Called by the rider app while pumping —
+ * accepts a single `litres` value (cumulative, not delta) which
+ * drives the customer's Arrival screen DispenseRing. Idempotent;
+ * rider can call this every 200ms without burning the server.
+ */
+router.post(
+  "/deliveries/:id/dispense-progress",
+  requireAuth,
+  requireRider,
+  async (req, res) => {
+    try {
+      const { litres } = req.body as { litres?: number };
+      if (typeof litres !== "number" || !Number.isFinite(litres) || litres < 0) {
+        return res.status(400).json({ message: "litres must be >= 0" });
+      }
+      const delivery = await Delivery.findOne({
+        _id: req.params.id,
+        rider: req.userId,
+      })
+        .select("order status")
+        .lean();
+      if (!delivery) {
+        return res.status(404).json({ message: "Delivery not found" });
+      }
+      if (delivery.status !== "dispensing") {
+        return res.status(409).json({
+          message: "Delivery is not in dispensing state",
+        });
+      }
+      const order = await Order.findById(delivery.order)
+        .select("user")
+        .lean();
+      if (order) {
+        emitToUser(order.user.toString(), "dispense:progress", {
+          orderId: delivery.order,
+          litres,
+        });
+      }
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ message: "Failed to push dispense progress" });
+    }
+  }
+);
+
 // ===================== DROP DELIVERY =====================
 // Rider drops an accepted or in-transit delivery (must provide reason).
 router.patch("/deliveries/:id/drop", requireAuth, requireRider, async (req, res) => {
@@ -359,8 +630,28 @@ router.patch("/deliveries/:id/drop", requireAuth, requireRider, async (req, res)
       return res.status(400).json({ message: "A reason is required to drop a delivery" });
     }
 
+    // Drop is allowed from any in-flight state — both legacy
+    // (accepted / picked_up) and v3 granular (at_plant / refilling /
+    // returning / arrived / dispensing). A rider who has tapped
+    // "Mark at station" can still legitimately need to abandon (bike
+    // breakdown, plant out of stock), so we keep the drop path open
+    // through the granular pipeline.
     const delivery = await Delivery.findOneAndUpdate(
-      { _id: req.params.id, rider: req.userId, status: { $in: ["accepted", "picked_up"] } },
+      {
+        _id: req.params.id,
+        rider: req.userId,
+        status: {
+          $in: [
+            "accepted",
+            "picked_up",
+            "at_plant",
+            "refilling",
+            "returning",
+            "arrived",
+            "dispensing",
+          ],
+        },
+      },
       { status: "dropped", dropReason: reason.trim() },
       { new: true }
     );

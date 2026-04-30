@@ -9,7 +9,21 @@ export interface IOrder extends Document {
   fuelCost: number;
   deliveryFee: number;
   totalPrice: number;
-  status: "pending" | "confirmed" | "assigned" | "in-transit" | "awaiting_confirmation" | "delivered" | "cancelled";
+  status:
+    // Legacy flow
+    | "pending"
+    | "confirmed"
+    | "assigned"
+    | "in-transit"
+    | "awaiting_confirmation"
+    | "delivered"
+    | "cancelled"
+    // v3 granular flow (upgraded rider app)
+    | "at_plant"
+    | "refilling"
+    | "returning"
+    | "arrived"
+    | "dispensing";
   deliveryAddress: mongoose.Types.ObjectId;
   paymentStatus: "unpaid" | "paid" | "refunded";
   paymentRef?: string;
@@ -30,6 +44,13 @@ export interface IOrder extends Document {
 
   /** Customer-paid delivery timestamp (set on customer-confirm-delivered). */
   deliveredAt?: Date;
+
+  /**
+   * Set when the customer taps "I'm here" on the v3 Track screen during
+   * the almost-there phase. Lets the rider's app surface a "Customer at
+   * gate" pill so they don't have to call. Idempotent — only set once.
+   */
+  customerHereAt?: Date;
 
   /**
    * Final amount actually charged. Equals `totalPrice` for liquid; for LPG
@@ -87,9 +108,41 @@ const OrderSchema: Schema = new Schema(
     fuelCost: { type: Number, required: true },
     deliveryFee: { type: Number, required: true, default: 0 },
     totalPrice: { type: Number, required: true },
+    /**
+     * Order status enum. Spans both the legacy flow
+     * (`pending → confirmed → assigned → in-transit →
+     * awaiting_confirmation → delivered`) and the v3 granular flow
+     * that the upgraded rider app drives (`assigned → at_plant →
+     * refilling → returning → arrived → dispensing →
+     * awaiting_confirmation → delivered`). Both pipelines coexist
+     * so we can roll out the rider-app upgrade without forcing a
+     * cutover; old rider clients keep using the legacy values
+     * while new ones drive the granular ones, and the customer app
+     * already handles both transparently via getTrackPhase.
+     *
+     * pending_payment + the granular cancellation reasons aren't
+     * stored here — they live on Delivery / paymentStatus / a
+     * cancellation note — so the enum stays focused on the
+     * delivery lifecycle alone.
+     */
     status: {
       type: String,
-      enum: ["pending", "confirmed", "assigned", "in-transit", "awaiting_confirmation", "delivered", "cancelled"],
+      enum: [
+        // Legacy values (still emitted by the legacy rider app).
+        "pending",
+        "confirmed",
+        "assigned",
+        "in-transit",
+        "awaiting_confirmation",
+        "delivered",
+        "cancelled",
+        // v3 granular values (emitted by the upgraded rider app).
+        "at_plant",
+        "refilling",
+        "returning",
+        "arrived",
+        "dispensing",
+      ],
       default: "pending",
     },
     deliveryAddress: {
@@ -111,6 +164,7 @@ const OrderSchema: Schema = new Schema(
     note: { type: String, maxlength: 500 },
     returnSwapAt: { type: Date, default: null },
     deliveredAt: { type: Date },
+    customerHereAt: { type: Date },
     totalCharged: { type: Number },
     weighIn: {
       emptyKg: { type: Number },
