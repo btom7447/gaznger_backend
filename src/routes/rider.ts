@@ -412,6 +412,19 @@ async function applyRiderTransition(
   res: import("express").Response
 ) {
   try {
+    // Capture the prior delivery status BEFORE the write so we can
+    // roll back if the matching Order update fails. Phase 5
+    // duality-drift hardening: Delivery.status and Order.status
+    // must end up in lockstep, or stay in lockstep (both at the
+    // prior value). The reconcileStatusDuality script catches any
+    // drift that slips through, but the rollback here prevents most.
+    const prior = await Delivery.findOne({
+      _id: deliveryId,
+      rider: riderId,
+    })
+      .select("status")
+      .lean();
+
     const delivery = await Delivery.findOneAndUpdate(
       { _id: deliveryId, rider: riderId, status: { $in: fromDeliveryStatuses } },
       { status: toDeliveryStatus },
@@ -423,11 +436,24 @@ async function applyRiderTransition(
       });
     }
 
-    const order = await Order.findByIdAndUpdate(
-      delivery.order,
-      { status: toOrderStatus },
-      { new: true }
-    ).select("user").lean();
+    let order: { user: { toString(): string } } | null = null;
+    try {
+      order = await Order.findByIdAndUpdate(
+        delivery.order,
+        { status: toOrderStatus },
+        { new: true }
+      ).select("user").lean();
+    } catch (orderErr) {
+      // Rollback the Delivery write so the two stay in lockstep.
+      // Without this, customer sees old status while rider sees new.
+      if (prior?.status) {
+        await Delivery.updateOne(
+          { _id: delivery._id },
+          { status: prior.status }
+        ).catch(() => {});
+      }
+      throw orderErr;
+    }
 
     if (order) {
       emitToUser(order.user.toString(), "order:update", {

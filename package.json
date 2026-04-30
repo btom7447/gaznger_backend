@@ -8,7 +8,8 @@
     "build": "tsc",
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node dist/index.js",
-    "seed": "ts-node src/scripts/seed.ts"
+    "seed": "ts-node src/scripts/seed.ts",
+    "reconcile:status": "ts-node src/scripts/reconcileStatusDuality.ts"
   },
   "keywords": [],
   "author": "",
