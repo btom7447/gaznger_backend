@@ -633,17 +633,34 @@ router.patch("/:orderId/status", requireAuth, validate(updateOrderStatusSchema),
 // ===================== CANCEL ORDER =====================
 router.patch("/:orderId/cancel", requireAuth, async (req, res) => {
   try {
-    const order = await Order.findById(req.params.orderId);
-    if (!order) return res.status(404).json({ message: "Order not found" });
-
-    if (order.user.toString() !== req.userId)
-      return res.status(403).json({ message: "Forbidden" });
-
-    if (order.status !== "pending")
-      return res.status(400).json({ message: "Only pending orders can be cancelled" });
-
-    order.status = "cancelled";
-    await order.save();
+    // Phase 9 — atomic cancel. The status filter `pending` ensures
+    // two concurrent cancel requests can't both succeed; the loser
+    // gets null back and a 409. Replaces the read-then-write that
+    // was a tiny but real race window (customer double-taps the
+    // cancel button, both requests in flight before the first save).
+    const order = await Order.findOneAndUpdate(
+      {
+        _id: req.params.orderId,
+        user: req.userId,
+        status: "pending",
+      },
+      { status: "cancelled" },
+      { new: true }
+    );
+    if (!order) {
+      // Differentiate "not yours" from "wrong status" by re-fetching
+      // for accurate error messages. Cheap second query, only on the
+      // rare error path.
+      const exists = await Order.findById(req.params.orderId)
+        .select("user status")
+        .lean();
+      if (!exists) return res.status(404).json({ message: "Order not found" });
+      if (String(exists.user) !== req.userId)
+        return res.status(403).json({ message: "Forbidden" });
+      return res
+        .status(400)
+        .json({ message: "Only pending orders can be cancelled" });
+    }
 
     emitToUser(req.userId, "order:update", { orderId: order._id, status: "cancelled" });
 
@@ -736,26 +753,43 @@ router.post("/:orderId/customer-here", requireAuth, async (req, res) => {
 // ===================== CUSTOMER CONFIRMS DELIVERY RECEIPT =====================
 router.patch("/:orderId/confirm-delivery", requireAuth, async (req, res) => {
   try {
-    const order = await Order.findById(req.params.orderId);
-    if (!order) return res.status(404).json({ message: "Order not found" });
-
-    if (order.user.toString() !== req.userId)
+    // Phase 9 — atomic confirm. We fetch first to read the existing
+    // totalCharged + totalPrice (needed to compute the LPG fallback),
+    // but the actual flip uses findOneAndUpdate with the status guard
+    // so two concurrent confirms can't both succeed. The loser gets
+    // null back and a 409.
+    const existing = await Order.findById(req.params.orderId)
+      .select("user status totalCharged totalPrice")
+      .lean();
+    if (!existing) return res.status(404).json({ message: "Order not found" });
+    if (String(existing.user) !== req.userId)
       return res.status(403).json({ message: "Forbidden" });
-
-    if (order.status !== "awaiting_confirmation")
+    if (existing.status !== "awaiting_confirmation")
       return res.status(400).json({ message: "Order is not awaiting confirmation" });
 
-    order.status = "delivered";
-    order.deliveredAt = new Date();
-    // For liquid orders totalCharged was set at create time. For LPG
-    // orders we expect the rider weigh-in to have already populated
-    // totalCharged with min(estimated, weighedActual). If a swap/refill
-    // landed without a weigh-in, default to totalPrice as a safety net.
-    if (order.totalCharged == null) {
-      order.totalCharged = order.totalPrice;
+    const fallbackTotalCharged =
+      existing.totalCharged ?? existing.totalPrice;
+
+    const order = await Order.findOneAndUpdate(
+      {
+        _id: req.params.orderId,
+        user: req.userId,
+        status: "awaiting_confirmation",
+      },
+      {
+        status: "delivered",
+        deliveredAt: new Date(),
+        totalCharged: fallbackTotalCharged,
+        pointsEarned: POINTS_CONFIG.orderDelivered,
+      },
+      { new: true }
+    );
+    if (!order) {
+      // Lost the race to a concurrent confirm — already delivered.
+      return res
+        .status(409)
+        .json({ message: "Order already confirmed" });
     }
-    order.pointsEarned = POINTS_CONFIG.orderDelivered;
-    await order.save();
 
     const userId = order.user.toString();
 

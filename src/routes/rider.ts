@@ -402,6 +402,27 @@ router.patch("/deliveries/:id/complete", requireAuth, requireRider, async (req, 
  * compatibility shims; older rider builds keep working alongside
  * the new granular flow.
  */
+/**
+ * Apply a rider-driven status transition atomically.
+ *
+ * Phase 9 — concurrency model:
+ *
+ *   The `from` status filter on findOneAndUpdate IS the concurrency
+ *   guard. Two concurrent calls with the same `(deliveryId, slug)`
+ *   pair: the first one matches, flips status, returns the updated
+ *   doc; the second one's filter no longer matches the (already-
+ *   flipped) status, returns null, gets a 409. No need for a Redis-
+ *   backed idempotency cache — Mongo's atomic findOneAndUpdate is
+ *   strong enough for this shape of operation.
+ *
+ *   Where this is NOT enough: operations that span MULTIPLE collection
+ *   writes (e.g. confirm-delivery, which writes Order + Delivery +
+ *   Earnings + RiderProfile + Notifications). Those need a Mongo
+ *   transaction OR an idempotency-key cache so a retry doesn't
+ *   re-credit earnings. See orders.ts:/confirm-delivery for the
+ *   spot fix; broader transactional support is queued behind a
+ *   replica-set-required infra setup.
+ */
 async function applyRiderTransition(
   riderId: string,
   deliveryId: string | string[] | undefined,
