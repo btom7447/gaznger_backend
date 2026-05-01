@@ -40,16 +40,20 @@ export async function dispatchRiders(): Promise<void> {
       // No rider found after all rounds — cancel the order
       await Order.findByIdAndUpdate(order._id, {
         status: "cancelled",
-        cancellationReason: "No rider available. Please try placing your order again.",
+        cancellationReason:
+          "No rider available. Please try placing your order again.",
       });
       await Delivery.deleteMany({ order: order._id, status: "pending" });
       const customerId = order.user.toString();
-      emitToUser(customerId, "order:update", { orderId: String(order._id), status: "cancelled" });
+      emitToUser(customerId, "order:update", {
+        orderId: String(order._id),
+        status: "cancelled",
+      });
       notifyUser(
         customerId,
         "cancelled",
         "Order Cancelled",
-        "We couldn't find a rider nearby. Your order has been cancelled — please try again."
+        "We couldn't find a rider nearby. Your order has been cancelled — please try again.",
       ).catch(() => {});
     } else {
       // Clear stale pending Delivery records so this order gets re-dispatched below
@@ -75,10 +79,12 @@ export async function dispatchRiders(): Promise<void> {
     if (!stationCoords?.lat || !stationCoords?.lng) continue;
 
     // Find all available riders that have reported a location
-    const availableRiders = await RiderProfile.find({ isAvailable: true }).lean();
+    const availableRiders = await RiderProfile.find({
+      isAvailable: true,
+    }).lean();
 
     const ridersWithLocation = availableRiders.filter(
-      (r) => r.currentLocation?.lat && r.currentLocation?.lng
+      (r) => r.currentLocation?.lat && r.currentLocation?.lng,
     );
 
     let candidates;
@@ -89,7 +95,7 @@ export async function dispatchRiders(): Promise<void> {
           ...r,
           distanceKm: haversineDistance(
             { lat: stationCoords.lat, lng: stationCoords.lng },
-            { lat: r.currentLocation!.lat, lng: r.currentLocation!.lng }
+            { lat: r.currentLocation!.lat, lng: r.currentLocation!.lng },
           ),
         }))
         .filter((r) => r.distanceKm <= radiusKm)
@@ -115,7 +121,9 @@ export async function dispatchRiders(): Promise<void> {
     }
 
     // Pre-compute earnings split
-    const riderEarnings = Math.round(order.deliveryFee * (1 - platformDeliveryComm / 100));
+    const riderEarnings = Math.round(
+      order.deliveryFee * (1 - platformDeliveryComm / 100),
+    );
     const platformEarnings = order.deliveryFee - riderEarnings;
 
     let dispatchedCount = 0;
@@ -152,7 +160,7 @@ export async function dispatchRiders(): Promise<void> {
         riderId,
         "dispatch",
         "New Delivery Request",
-        "A new delivery near you is available. Open the app to accept."
+        "A new delivery near you is available. Open the app to accept.",
       ).catch(() => {});
 
       dispatchedCount++;
