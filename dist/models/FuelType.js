@@ -37,8 +37,7 @@ const mongoose_1 = __importStar(require("mongoose"));
 const FuelTypeSchema = new mongoose_1.Schema({
     name: { type: String, required: true, unique: true },
     unit: { type: String, default: "L" },
-    pricePerUnit: { type: Number, required: true },
-    icon: { type: String }, // optional
+    icon: { type: String },
 }, { timestamps: true });
 exports.default = mongoose_1.default.model("FuelType", FuelTypeSchema);
 //# sourceMappingURL=FuelType.js.map

@@ -40,10 +40,44 @@ const OrderSchema = new mongoose_1.Schema({
     station: { type: mongoose_1.Schema.Types.ObjectId, ref: "GasStation", required: true },
     quantity: { type: Number, required: true },
     unit: { type: String, required: true },
+    fuelCost: { type: Number, required: true },
+    deliveryFee: { type: Number, required: true, default: 0 },
     totalPrice: { type: Number, required: true },
+    /**
+     * Order status enum. Spans both the legacy flow
+     * (`pending → confirmed → assigned → in-transit →
+     * awaiting_confirmation → delivered`) and the v3 granular flow
+     * that the upgraded rider app drives (`assigned → at_plant →
+     * refilling → returning → arrived → dispensing →
+     * awaiting_confirmation → delivered`). Both pipelines coexist
+     * so we can roll out the rider-app upgrade without forcing a
+     * cutover; old rider clients keep using the legacy values
+     * while new ones drive the granular ones, and the customer app
+     * already handles both transparently via getTrackPhase.
+     *
+     * pending_payment + the granular cancellation reasons aren't
+     * stored here — they live on Delivery / paymentStatus / a
+     * cancellation note — so the enum stays focused on the
+     * delivery lifecycle alone.
+     */
     status: {
         type: String,
-        enum: ["pending", "confirmed", "in-transit", "delivered", "cancelled"],
+        enum: [
+            // Legacy values (still emitted by the legacy rider app).
+            "pending",
+            "confirmed",
+            "assigned",
+            "in-transit",
+            "awaiting_confirmation",
+            "delivered",
+            "cancelled",
+            // v3 granular values (emitted by the upgraded rider app).
+            "at_plant",
+            "refilling",
+            "returning",
+            "arrived",
+            "dispensing",
+        ],
         default: "pending",
     },
     deliveryAddress: {
@@ -57,10 +91,39 @@ const OrderSchema = new mongoose_1.Schema({
         default: "unpaid",
     },
     paymentRef: { type: String },
+    riderId: { type: mongoose_1.Schema.Types.ObjectId, ref: "User" },
+    riderAssignedAt: { type: Date },
+    dispatchAttempt: { type: Number, default: 0 },
+    dispatchExpiresAt: { type: Date },
+    note: { type: String, maxlength: 500 },
+    returnSwapAt: { type: Date, default: null },
+    deliveredAt: { type: Date },
+    customerHereAt: { type: Date },
+    totalCharged: { type: Number },
+    weighIn: {
+        emptyKg: { type: Number },
+        fullKg: { type: Number },
+        netKg: { type: Number },
+        weighedAt: { type: Date },
+    },
+    pointsEarned: { type: Number },
+    rating: {
+        stars: { type: Number, min: 1, max: 5 },
+        tags: [{ type: String }],
+        tip: { type: Number, default: 0 },
+        note: { type: String, maxlength: 500 },
+        ratedAt: { type: Date },
+    },
     // Gas-specific
     cylinderType: { type: String },
     deliveryType: { type: String, enum: ["cylinder_swap", "home_refill"] },
     cylinderImages: [{ type: String }],
+    cylinderDetails: {
+        brand: { type: String },
+        valve: { type: String },
+        age: { type: String },
+        test: { type: String },
+    },
 }, { timestamps: true });
 OrderSchema.index({ user: 1, status: 1 });
 OrderSchema.index({ createdAt: -1 });

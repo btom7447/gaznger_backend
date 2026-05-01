@@ -6,9 +6,11 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const express_1 = require("express");
 const multer_1 = __importDefault(require("multer"));
 const Station_1 = __importDefault(require("../models/Station"));
+const User_1 = __importDefault(require("../models/User"));
 const cloudinary_1 = __importDefault(require("../utils/cloudinary"));
 const auth_1 = require("../middleware/auth");
 const pagination_1 = require("../utils/pagination");
+const haversine_1 = require("../utils/haversine");
 const router = (0, express_1.Router)();
 const ALLOWED_MIME_TYPES = ["image/jpeg", "image/png", "image/webp"];
 const upload = (0, multer_1.default)({
@@ -54,8 +56,40 @@ router.get("/", async (req, res) => {
             Station_1.default.find(filter).populate("fuels.fuel").skip(skip).limit(limitNum).lean(),
             Station_1.default.countDocuments(filter),
         ]);
+        // Enrich each station with vendor's partner status, distance, and ETA.
+        const vendorIds = [...new Set(stations.map((s) => s.vendorId?.toString()).filter(Boolean))];
+        const vendors = vendorIds.length
+            ? await User_1.default.find({ _id: { $in: vendorIds } }).select("partnerBadge").lean()
+            : [];
+        const vendorPartnerMap = new Map(vendors.map((v) => [v._id.toString(), v.partnerBadge?.active === true]));
+        // Distance + ETA only when the caller passed coords. The mobile
+        // Stations screen relies on these so the user can sort by nearest
+        // and see "X min" without computing it client-side.
+        const haveCoords = lat && lng;
+        const queryLat = haveCoords ? parseFloat(lat) : null;
+        const queryLng = haveCoords ? parseFloat(lng) : null;
+        const enriched = stations.map((s) => {
+            let distance;
+            let etaMinutes;
+            if (queryLat != null &&
+                queryLng != null &&
+                s.location?.lat != null &&
+                s.location?.lng != null) {
+                distance = (0, haversine_1.haversineDistance)({ lat: queryLat, lng: queryLng }, { lat: s.location.lat, lng: s.location.lng });
+                // Rough drive-time heuristic: 3 minutes per km (Lagos traffic
+                // average), floored at 5 minutes. Exposed as the canonical
+                // server-side value so the client doesn't reinvent it.
+                etaMinutes = Math.max(5, Math.round(distance * 3));
+            }
+            return {
+                ...s,
+                isPartner: s.vendorId ? (vendorPartnerMap.get(s.vendorId.toString()) ?? false) : false,
+                distance,
+                etaMinutes,
+            };
+        });
         res.json({
-            data: stations,
+            data: enriched,
             total,
             page: pageNum,
             totalPages: Math.ceil(total / limitNum),
@@ -68,17 +102,22 @@ router.get("/", async (req, res) => {
 // ===================== GET STATION BY ID =====================
 router.get("/:id", async (req, res) => {
     try {
-        const station = await Station_1.default.findById(req.params.id).populate("fuels.fuel");
+        const station = await Station_1.default.findById(req.params.id).populate("fuels.fuel").lean();
         if (!station)
             return res.status(404).json({ message: "Station not found" });
-        res.json(station);
+        let isPartner = false;
+        if (station.vendorId) {
+            const vendor = await User_1.default.findById(station.vendorId).select("partnerBadge").lean();
+            isPartner = vendor?.partnerBadge?.active === true;
+        }
+        res.json({ ...station, isPartner });
     }
     catch (err) {
         res.status(500).json({ message: "Failed to fetch station" });
     }
 });
 // ===================== CREATE NEW STATION =====================
-router.post("/", auth_1.requireAuth, upload.single("image"), async (req, res) => {
+router.post("/", auth_1.requireAuth, auth_1.requireAdmin, upload.single("image"), async (req, res) => {
     try {
         if (!req.file)
             return res.status(400).json({ message: "Station image is required" });
@@ -143,7 +182,7 @@ router.post("/", auth_1.requireAuth, upload.single("image"), async (req, res) =>
     }
 });
 // ===================== UPDATE STATION =====================
-router.put("/:id", auth_1.requireAuth, upload.single("image"), async (req, res) => {
+router.put("/:id", auth_1.requireAuth, auth_1.requireAdmin, upload.single("image"), async (req, res) => {
     try {
         const station = await Station_1.default.findById(req.params.id);
         if (!station)
@@ -220,7 +259,7 @@ router.put("/:id", auth_1.requireAuth, upload.single("image"), async (req, res) 
     }
 });
 // ===================== DELETE STATION =====================
-router.delete("/:id", auth_1.requireAuth, async (req, res) => {
+router.delete("/:id", auth_1.requireAuth, auth_1.requireAdmin, async (req, res) => {
     try {
         const station = await Station_1.default.findById(req.params.id);
         if (!station)

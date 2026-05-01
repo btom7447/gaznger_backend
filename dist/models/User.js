@@ -42,6 +42,8 @@ const UserSchema = new mongoose_1.Schema({
     passwordHash: { type: String, required: true },
     displayName: { type: String, default: "Guest" },
     gender: { type: String, enum: ["male", "female"], default: "male" },
+    role: { type: String, enum: ["customer", "vendor", "rider", "admin"], default: "customer" },
+    isOnboarded: { type: Boolean, default: false },
     profileImage: {
         type: String,
         default: function () {
@@ -55,7 +57,61 @@ const UserSchema = new mongoose_1.Schema({
     otpCode: { type: String },
     otpExpiresAt: { type: Date },
     isVerified: { type: Boolean, default: false },
+    vendorBankAccount: {
+        bankName: { type: String, default: "" },
+        accountNumber: { type: String, default: "" },
+        accountName: { type: String, default: "" },
+    },
+    vendorVerification: {
+        status: { type: String, enum: ["none", "pending", "verified", "rejected"], default: "none" },
+        documents: [{ label: { type: String }, url: { type: String } }],
+        submittedAt: { type: Date },
+        reviewedAt: { type: Date },
+        note: { type: String },
+    },
+    partnerBadge: {
+        plan: { type: String, default: "" },
+        active: { type: Boolean, default: false },
+        subscribedAt: { type: Date },
+    },
+    lastPaystackAuth: {
+        authorizationCode: { type: String },
+        last4: { type: String },
+        brand: { type: String },
+        bank: { type: String },
+        expMonth: { type: String },
+        expYear: { type: String },
+        cardType: { type: String },
+        signature: { type: String },
+    },
+    accountStatus: {
+        type: String,
+        enum: ["pending", "active", "suspended"],
+        default: "active",
+    },
+    withdrawalHold: {
+        active: { type: Boolean, default: false },
+        reason: { type: String },
+        setBy: { type: mongoose_1.Schema.Types.ObjectId, ref: "User" },
+        setAt: { type: Date },
+    },
+    savedCylinder: {
+        brand: { type: String },
+        valve: { type: String },
+        age: { type: String },
+        test: { type: String },
+        photos: [{ type: String }],
+        savedAt: { type: Date },
+    },
+    preferences: {
+        autoRedeemPoints: { type: Boolean, default: false },
+        priceAlertsEnabled: { type: Boolean, default: false },
+        pushEnabled: { type: Boolean, default: true },
+        orderUpdates: { type: Boolean, default: true },
+        promotions: { type: Boolean, default: false },
+        notificationsFilter: { type: String },
+    },
+    pinHash: { type: String },
 }, { timestamps: true });
-UserSchema.index({ email: 1 });
 exports.default = mongoose_1.default.model("User", UserSchema);
 //# sourceMappingURL=User.js.map

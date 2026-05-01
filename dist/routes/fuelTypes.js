@@ -35,9 +35,9 @@ router.get("/", async (_req, res) => {
 // CREATE a new fuel type (admin — requires auth)
 router.post("/", auth_1.requireAuth, upload.single("image"), async (req, res) => {
     try {
-        const { name, unit, pricePerUnit } = req.body;
-        if (!name || !pricePerUnit)
-            return res.status(400).json({ message: "Name and pricePerUnit are required" });
+        const { name, unit } = req.body;
+        if (!name)
+            return res.status(400).json({ message: "Name is required" });
         const existing = await FuelType_1.default.findOne({ name });
         if (existing)
             return res.status(400).json({ message: "Fuel type already exists" });
@@ -63,7 +63,6 @@ router.post("/", auth_1.requireAuth, upload.single("image"), async (req, res) =>
         const fuel = await FuelType_1.default.create({
             name,
             unit: unit || "L",
-            pricePerUnit,
             icon: iconUrl,
         });
         res.status(201).json(fuel);

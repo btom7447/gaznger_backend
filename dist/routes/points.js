@@ -77,6 +77,14 @@ router.post("/redeem", auth_1.requireAuth, async (req, res) => {
             return res.status(403).json({ message: "Forbidden" });
         if (order.status !== "pending")
             return res.status(400).json({ message: "Points can only be redeemed on pending orders" });
+        // Prevent double-redeem: check if points were already applied to this order
+        const alreadyRedeemed = await Point_1.default.findOne({
+            user: req.userId,
+            type: "redeem",
+            description: { $regex: order._id.toString() },
+        });
+        if (alreadyRedeemed)
+            return res.status(409).json({ message: "Points have already been redeemed on this order" });
         // Each point is worth ₦1 in discount (customize as needed)
         const discountAmount = pointsToRedeem;
         order.totalPrice = Math.max(0, order.totalPrice - discountAmount);

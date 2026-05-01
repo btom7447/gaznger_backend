@@ -38,8 +38,12 @@ const RefreshTokenSchema = new mongoose_1.Schema({
     user: { type: mongoose_1.Schema.Types.ObjectId, ref: "User", required: true },
     token: { type: String, required: true },
     expiresAt: { type: Date, required: true },
+    userAgent: { type: String },
+    device: { type: String },
+    ip: { type: String },
+    lastUsedAt: { type: Date },
 }, { timestamps: true });
-// Auto-delete expired tokens from MongoDB
 RefreshTokenSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+RefreshTokenSchema.index({ user: 1 });
 exports.default = mongoose_1.default.model("RefreshToken", RefreshTokenSchema);
 //# sourceMappingURL=RefreshToken.js.map

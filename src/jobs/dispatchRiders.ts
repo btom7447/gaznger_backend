@@ -81,7 +81,7 @@ export async function dispatchRiders(): Promise<void> {
       (r) => r.currentLocation?.lat && r.currentLocation?.lng
     );
 
-    let candidates: (typeof availableRiders[number] & { distanceKm: number })[];
+    let candidates;
 
     if (ridersWithLocation.length > 0) {
       candidates = ridersWithLocation

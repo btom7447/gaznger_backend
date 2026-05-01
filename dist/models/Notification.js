@@ -36,7 +36,11 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const mongoose_1 = __importStar(require("mongoose"));
 const NotificationSchema = new mongoose_1.Schema({
     user: { type: mongoose_1.Schema.Types.ObjectId, ref: "User", required: true },
-    type: { type: String, enum: ["order", "message", "promo"], required: true },
+    type: {
+        type: String,
+        enum: ["order", "payment", "delivery", "delivered", "cancelled", "points", "promo", "system", "alert", "message", "account", "new_order", "dispatch", "earnings"],
+        required: true,
+    },
     title: { type: String, required: true },
     body: { type: String, required: true },
     read: { type: Boolean, default: false },

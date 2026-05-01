@@ -1,7 +1,11 @@
 "use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.requireAuth = void 0;
+exports.requireCustomer = exports.requireRider = exports.requireVendor = exports.requireAdmin = exports.requireAuth = void 0;
 const jwt_1 = require("../utils/jwt");
+const User_1 = __importDefault(require("../models/User"));
 const requireAuth = (req, res, next) => {
     const authHeader = req.headers.authorization;
     if (!authHeader)
@@ -14,4 +18,40 @@ const requireAuth = (req, res, next) => {
     next();
 };
 exports.requireAuth = requireAuth;
+const requireAdmin = async (req, res, next) => {
+    if (!req.userId)
+        return res.status(401).json({ message: "Unauthorized" });
+    const user = await User_1.default.findById(req.userId).select("role").lean();
+    if (!user || user.role !== "admin")
+        return res.status(403).json({ message: "Admin access required" });
+    next();
+};
+exports.requireAdmin = requireAdmin;
+const requireVendor = async (req, res, next) => {
+    if (!req.userId)
+        return res.status(401).json({ message: "Unauthorized" });
+    const user = await User_1.default.findById(req.userId).select("role").lean();
+    if (!user || user.role !== "vendor")
+        return res.status(403).json({ message: "Vendor access required" });
+    next();
+};
+exports.requireVendor = requireVendor;
+const requireRider = async (req, res, next) => {
+    if (!req.userId)
+        return res.status(401).json({ message: "Unauthorized" });
+    const user = await User_1.default.findById(req.userId).select("role").lean();
+    if (!user || user.role !== "rider")
+        return res.status(403).json({ message: "Rider access required" });
+    next();
+};
+exports.requireRider = requireRider;
+const requireCustomer = async (req, res, next) => {
+    if (!req.userId)
+        return res.status(401).json({ message: "Unauthorized" });
+    const user = await User_1.default.findById(req.userId).select("role").lean();
+    if (!user || user.role !== "customer")
+        return res.status(403).json({ message: "Customer access required" });
+    next();
+};
+exports.requireCustomer = requireCustomer;
 //# sourceMappingURL=auth.js.map

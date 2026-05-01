@@ -4,11 +4,13 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 const dotenv_1 = __importDefault(require("dotenv"));
-dotenv_1.default.config();
+dotenv_1.default.config({ path: ".env.local" });
 const http_1 = __importDefault(require("http"));
 const mongoose_1 = __importDefault(require("mongoose"));
 const app_1 = __importDefault(require("./app"));
 const db_1 = require("./config/db");
+const socket_1 = require("./socket");
+const orderWatchdog_1 = require("./jobs/orderWatchdog");
 const REQUIRED_ENV_VARS = [
     "MONGO_URI",
     "JWT_SECRET",
@@ -32,6 +34,8 @@ const startServer = async () => {
     validateEnv();
     await (0, db_1.connectDB)();
     const server = http_1.default.createServer(app_1.default);
+    (0, socket_1.initSocket)(server);
+    (0, orderWatchdog_1.startOrderWatchdog)();
     server.listen(PORT, () => {
         console.log(`Server running on port ${PORT}`);
     });

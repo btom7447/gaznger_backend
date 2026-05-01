@@ -31,6 +31,16 @@ router.get("/", auth_1.requireAuth, async (req, res) => {
         res.status(500).json({ message: "Failed to fetch notifications" });
     }
 });
+// Mark all notifications as read (must come before /:id routes)
+router.patch("/read-all", auth_1.requireAuth, async (req, res) => {
+    try {
+        await Notification_1.default.updateMany({ user: req.userId, read: false }, { read: true });
+        res.json({ message: "All notifications marked as read" });
+    }
+    catch (err) {
+        res.status(500).json({ message: "Failed to update notifications" });
+    }
+});
 // Mark a single notification as read
 router.patch("/:id/read", auth_1.requireAuth, async (req, res) => {
     try {
@@ -43,14 +53,29 @@ router.patch("/:id/read", auth_1.requireAuth, async (req, res) => {
         res.status(500).json({ message: "Failed to update notification" });
     }
 });
-// Mark all notifications as read
-router.patch("/read-all", auth_1.requireAuth, async (req, res) => {
+// GET unread notification count
+router.get("/unread-count", auth_1.requireAuth, async (req, res) => {
     try {
-        await Notification_1.default.updateMany({ user: req.userId, read: false }, { read: true });
-        res.json({ message: "All notifications marked as read" });
+        const count = await Notification_1.default.countDocuments({ user: req.userId, read: false });
+        res.json({ count });
     }
     catch (err) {
-        res.status(500).json({ message: "Failed to update notifications" });
+        res.status(500).json({ message: "Failed to fetch unread count" });
+    }
+});
+// DELETE a single notification
+router.delete("/:id", auth_1.requireAuth, async (req, res) => {
+    try {
+        const notification = await Notification_1.default.findOneAndDelete({
+            _id: req.params.id,
+            user: req.userId,
+        });
+        if (!notification)
+            return res.status(404).json({ message: "Notification not found" });
+        res.json({ message: "Notification deleted" });
+    }
+    catch (err) {
+        res.status(500).json({ message: "Failed to delete notification" });
     }
 });
 exports.default = router;

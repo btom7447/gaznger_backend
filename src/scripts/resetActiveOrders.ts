@@ -46,8 +46,27 @@ async function run() {
   });
   console.log("Connected:", mongoose.connection.host);
 
+  // Log all non-terminal orders first so we can see what's stuck
+  const allNonTerminal = await Order.find({
+    status: {
+      $nin: ["delivered", "rated", "closed", "cancelled",
+             "cancelled_by_customer", "cancelled_by_vendor",
+             "cancelled_by_rider", "failed_payment"],
+    },
+  }).select("_id status createdAt").lean();
+  console.log(`Non-terminal orders found: ${allNonTerminal.length}`);
+  allNonTerminal.forEach((o: any) =>
+    console.log(`  ${o._id} — status: ${o.status} — created: ${o.createdAt}`)
+  );
+
   const orders = await Order.updateMany(
-    { status: { $in: ACTIVE_ORDER_STATUSES } },
+    {
+      status: {
+        $nin: ["delivered", "rated", "closed", "cancelled",
+               "cancelled_by_customer", "cancelled_by_vendor",
+               "cancelled_by_rider", "failed_payment"],
+      },
+    },
     {
       $set: {
         status: "cancelled",

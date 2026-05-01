@@ -47,11 +47,24 @@ const GasStationSchema = new mongoose_1.Schema({
         {
             fuel: { type: mongoose_1.Schema.Types.ObjectId, ref: "FuelType", required: true },
             pricePerUnit: { type: Number, required: true },
+            available: { type: Boolean, default: true },
+            scheduledPrice: {
+                price: { type: Number },
+                effectiveAt: { type: Date },
+            },
         },
     ],
     rating: { type: Number, default: 0 },
-    image: { type: String, required: true },
+    image: { type: String, default: "" },
+    images: [{ type: String }],
     verified: { type: Boolean, default: false },
+    vendorId: { type: mongoose_1.Schema.Types.ObjectId, ref: "User" },
+    isActive: { type: Boolean, default: true },
+    autoAcceptOrders: { type: Boolean, default: false },
+    operatingHours: {
+        open: { type: String },
+        close: { type: String },
+    },
 }, { timestamps: true });
 GasStationSchema.index({ state: 1, lga: 1 });
 GasStationSchema.index({ name: "text", address: "text" });
