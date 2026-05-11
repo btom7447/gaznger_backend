@@ -5,6 +5,7 @@
     "rootDir": "src",
     "outDir": "dist",
     "moduleResolution": "node",
+    "ignoreDeprecations": "5.0",
     "resolveJsonModule": true,
     "strict": true,
     "esModuleInterop": true,
