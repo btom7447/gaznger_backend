@@ -13,17 +13,15 @@ import { connectDB } from "./config/db";
 import { initSocket } from "./socket";
 import { startOrderWatchdog } from "./jobs/orderWatchdog";
 
+// Hard requirements — server cannot boot without these. The rest of
+// the integrations (Cloudinary, Firebase, Resend) degrade gracefully
+// when their keys are missing: the relevant call is skipped and the
+// rest of the request succeeds. Lets us deploy on Railway with only
+// Mongo + JWT + Atlas configured and wire the others later.
 const REQUIRED_ENV_VARS = [
   "MONGO_URI",
   "JWT_SECRET",
   "JWT_REFRESH_SECRET",
-  "CLOUDINARY_CLOUD_NAME",
-  "CLOUDINARY_API_KEY",
-  "CLOUDINARY_API_SECRET",
-  "FIREBASE_PROJECT_ID",
-  "FIREBASE_PRIVATE_KEY",
-  "FIREBASE_CLIENT_EMAIL",
-  "RESEND_API_KEY",
 ];
 
 /**
