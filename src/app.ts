@@ -7,6 +7,7 @@ import { v4 as uuidv4 } from "uuid";
 
 import authRoutes from "./routes/auth";
 import fuelTypeRoutes from "./routes/fuelTypes";
+import fuelPricesRoutes from "./routes/fuelPrices";
 import stationRoutes from "./routes/stations";
 import uploadRoutes from "./routes/upload";
 import pointRoutes from "./routes/points";
@@ -23,14 +24,33 @@ import disputeRoutes from "./routes/disputes";
 
 import { startCronJobs } from "./jobs";
 import { errorHandler } from "./middleware/errorHandler";
+import { edgeStateGate } from "./middleware/edgeState";
 
 const app = express();
 
 // Security headers
 app.use(helmet());
 
-// CORS — restrict to allowed origins in production, allow all in development
-const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(",").map((o) => o.trim());
+// CORS — restrict to allowed origins in production, allow all in development.
+// SECURITY (audit F.1): filter empty entries after split so a stray
+// trailing comma in env doesn't leave `""` in the list (which previously
+// would-let any browser-without-Origin through). Also fail fast at boot
+// if the prod allowlist is empty — silently allowing nothing prevents
+// every legit request, but more importantly tells the operator their
+// env is wrong before any traffic shows up.
+const allowedOrigins = process.env.ALLOWED_ORIGINS
+  ?.split(",")
+  .map((o) => o.trim())
+  .filter(Boolean);
+
+if (
+  process.env.NODE_ENV === "production" &&
+  (!allowedOrigins || allowedOrigins.length === 0)
+) {
+  throw new Error(
+    "CORS: ALLOWED_ORIGINS must be a non-empty comma-separated list in production",
+  );
+}
 
 app.use(
   cors({
@@ -85,17 +105,39 @@ app.use((req: Request, _res: Response, next: NextFunction) => {
 });
 
 // Rate limiters
+//
+// Three buckets with intentionally different max values:
+//   - authLimiter:  signup / login / refresh (sensitive but low-volume)
+//   - otpLimiter:   OTP send + verify + check-phone (chatty during a
+//                   single signup, easy to trip in dev — generous bucket)
+//   - apiLimiter:   everything else
+//
+// In development we essentially turn limits off so iterating doesn't
+// burn through the bucket. Production uses the real numbers.
+const isDev = process.env.NODE_ENV !== "production";
+
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 10,
+  max: isDev ? 1000 : 30,
   message: { message: "Too many requests, please try again later." },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const otpLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  // OTP flows fire 2-3 calls per signup attempt (check-phone, send-otp,
+  // verify-otp). 60/15min = 20 full signup attempts which is plenty
+  // for prod abuse protection while not nuking dev iteration.
+  max: isDev ? 1000 : 60,
+  message: { message: "Too many OTP requests, try again later." },
   standardHeaders: true,
   legacyHeaders: false,
 });
 
 const apiLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
-  max: 100,
+  max: isDev ? 1000 : 100,
   message: { message: "Too many requests, please try again later." },
   standardHeaders: true,
   legacyHeaders: false,
@@ -104,22 +146,35 @@ const apiLimiter = rateLimit({
 // Money-handling limiter lives in middleware/moneyLimiter.ts so it can be
 // imported by route files without creating a circular import via app.ts.
 
-// Health check (no auth, no rate limit)
+// Health check (no auth, no rate limit, no edge-state gate)
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", uptime: process.uptime() });
 });
 
+// Edge-state gate (maintenance + force-update). Runs after /health so
+// admin tooling can still ping during maintenance windows. Routes after
+// this point are subject to 503 when maintenanceMode is on.
+app.use(edgeStateGate);
+
 // Routes
-// Sensitive auth actions (login, register, OTP, password reset) → strict limiter
-// Profile read/write (GET /auth/me, PUT /auth/me, device token) → relaxed API limiter
+// Sensitive auth actions → strict limiter. v4 phone-first endpoints
+// have separate per-flow limiters because abuse vectors differ
+// (signup vs login vs recovery). The legacy /register, /forgot-password,
+// /reset-password, /resend-otp routes return 410 from the auth router
+// itself — keeping the limiter mappings would 429 noise the legacy
+// stub's 410, so they're omitted.
+// OTP-flavoured endpoints get the generous bucket; signup + login keep
+// the strict authLimiter because brute-force PIN guessing is the more
+// dangerous attack surface than OTP-burning.
+app.use("/auth/check-phone", otpLimiter);
+app.use("/auth/send-otp", otpLimiter);
+app.use("/auth/verify-otp", otpLimiter);
+app.use("/auth/forgot-pin", otpLimiter);
+app.use("/auth/signup", authLimiter);
 app.use("/auth/login", authLimiter);
-app.use("/auth/register", authLimiter);
-app.use("/auth/verify-otp", authLimiter);
-app.use("/auth/resend-otp", authLimiter);
-app.use("/auth/forgot-password", authLimiter);
-app.use("/auth/reset-password", authLimiter);
 app.use("/auth", apiLimiter, authRoutes);
 app.use("/api/fuel-types", apiLimiter, fuelTypeRoutes);
+app.use("/api/fuel-prices", apiLimiter, fuelPricesRoutes);
 app.use("/api/stations", apiLimiter, stationRoutes);
 app.use("/api/upload", apiLimiter, uploadRoutes);
 app.use("/api/points", apiLimiter, pointRoutes);

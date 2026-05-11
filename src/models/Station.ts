@@ -20,6 +20,29 @@ export interface IGasStation extends Document {
   isActive: boolean;
   autoAcceptOrders: boolean;
   operatingHours?: { open: string; close: string };
+  /**
+   * Avg minutes from order accept → rider arrives at station. Drives
+   * the "Service time" amenity chip. Optional — surfaces only when set.
+   */
+  serviceTime?: string;
+  /**
+   * Payment options accepted at the station (excluding cash on delivery,
+   * which Gaznger does not support). Examples: "Card & POS", "Bank
+   * transfer", "USSD". Surfaced as amenity chips.
+   */
+  paymentOptions?: string[];
+  /**
+   * Timestamp of the last successful Gaznger dispense at this station.
+   * Surfaced as "Last Gaznger dispense X ago" in the station detail
+   * sheet. Server updates this on each delivery-confirm.
+   */
+  lastDispenseAt?: Date;
+  /**
+   * Rolling on-time delivery rate (0–100). Computed by aggregating the
+   * last N orders' eta-vs-actual. Optional — first-time stations have
+   * no data so the stat tile shows a blank state instead of a fake "—".
+   */
+  onTimeRate?: number;
 }
 
 const GasStationSchema: Schema = new Schema(
@@ -54,6 +77,10 @@ const GasStationSchema: Schema = new Schema(
       open: { type: String },
       close: { type: String },
     },
+    serviceTime: { type: String },
+    paymentOptions: [{ type: String }],
+    lastDispenseAt: { type: Date },
+    onTimeRate: { type: Number, min: 0, max: 100 },
   },
   { timestamps: true }
 );

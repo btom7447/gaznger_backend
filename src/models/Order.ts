@@ -8,6 +8,11 @@ export interface IOrder extends Document {
   unit: string;
   fuelCost: number;
   deliveryFee: number;
+  /** Platform service fee (audit C.4). Default 2% of fuelCost,
+   *  overridable per-deploy via SERVICE_FEE_BPS env (basis points).
+   *  Stored as a separate line so admin reporting can split platform
+   *  earnings from rider/vendor settlement. */
+  serviceFee: number;
   totalPrice: number;
   status:
     // Legacy flow
@@ -107,6 +112,7 @@ const OrderSchema: Schema = new Schema(
     unit: { type: String, required: true },
     fuelCost: { type: Number, required: true },
     deliveryFee: { type: Number, required: true, default: 0 },
+    serviceFee: { type: Number, required: true, default: 0 },
     totalPrice: { type: Number, required: true },
     /**
      * Order status enum. Spans both the legacy flow

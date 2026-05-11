@@ -1,9 +1,16 @@
 import mongoose, { Schema, Document } from "mongoose";
 
 export interface IUser extends Document {
-  email: string;
-  phone?: string;
-  passwordHash: string;
+  /**
+   * E.164-normalised phone (e.g. "+2348012345678"). Unique. Primary
+   * identity for the v4 auth slice. Always set on new accounts; legacy
+   * email-only accounts may be missing it (cleared by the migration
+   * note in seed.ts).
+   */
+  phone: string;
+  email?: string;
+  /** Legacy password hash. Optional after the v4 cutover; not set on phone-signup users. */
+  passwordHash?: string;
   displayName: string;
   profileImage: string;
   gender: "male" | "female";
@@ -16,6 +23,47 @@ export interface IUser extends Document {
   createdAt: Date;
   updatedAt: Date;
 
+  /**
+   * Whether the account holder has completed the SMS-OTP step on the
+   * current phone number. Set on /auth/signup and /auth/forgot-pin/reset.
+   */
+  phoneVerified?: boolean;
+
+  /**
+   * Devices the user has authenticated from. The `X-Device-Id` header
+   * from the mobile maps to entries here. Capped at 5 — see
+   * docs/handoff/_server-asks/auth-device-binding.md.
+   */
+  knownDevices?: Array<{
+    deviceId: string;
+    label?: string;
+    firstSeenAt: Date;
+    lastSeenAt: Date;
+  }>;
+
+  /**
+   * Rider/vendor verification gate. Customers don't carry this field.
+   * Pushed to mobile via /auth/me + the `verification:status` socket
+   * event when admin transitions it.
+   */
+  verificationStatus?: "pending" | "approved" | "rejected";
+  verificationReason?: string;
+  verificationReviewedAt?: Date;
+  verificationReviewedBy?: mongoose.Types.ObjectId;
+
+  /**
+   * Verification documents — per-kind URL refs uploaded via the existing
+   * /api/upload Cloudinary endpoint. Each entry is a stored Cloudinary
+   * URL plus the moment it was last received. Admin tooling reads from
+   * here when reviewing a verification.
+   */
+  verificationDocs?: Array<{
+    kind: string;
+    url: string;
+    uploadedAt: Date;
+  }>;
+
+  /** Legacy email-OTP fields. Will be removed after the v4 cutover; kept here so old data doesn't error on read. */
   otpCode?: string;
   otpExpiresAt?: Date;
   isVerified?: boolean;
@@ -53,7 +101,10 @@ export interface IUser extends Document {
    * `pending` = newly registered, awaiting verification.
    * `suspended` = admin-paused (rules violation, dispute).
    */
-  accountStatus?: "pending" | "active" | "suspended";
+  accountStatus?: "pending" | "active" | "suspended" | "deleted";
+  /** Set when user soft-deleted via /auth/me/delete. Hard-delete cron
+   *  picks up rows where deletedAt < now - 30d. */
+  deletedAt?: Date;
 
   /**
    * Withdrawal hold. When `active=true`, /withdraw is gated. Used for
@@ -118,6 +169,24 @@ export interface IUser extends Document {
    * — only its presence (boolean) is exposed.
    */
   pinHash?: string;
+  /**
+   * Brute-force protection for PIN-gated routes (`/auth/login`,
+   * `/auth/pin/verify`). Counts wrong-PIN attempts within a rolling
+   * window; once `count >= 5` AND `firstFailedAt` is within the last
+   * 15 min, `lockedUntil` is set to now+15min and PIN routes return
+   * 423 with no signal until the lock expires. Successful PIN check
+   * resets the subdoc.
+   *
+   * SECURITY (audit A.4): without this, a 4-digit PIN is brute-
+   * forceable through the IP-only `authLimiter` — ~120 guesses/hour
+   * per IP, trivially bypassed by IP rotation, against a 10,000-key
+   * keyspace.
+   */
+  pinFailures?: {
+    count: number;
+    firstFailedAt?: Date;
+    lockedUntil?: Date;
+  };
 }
 
 const defaultMaleImage = "https://avatar.iran.liara.run/public/19";
@@ -125,9 +194,9 @@ const defaultFemaleImage = "https://avatar.iran.liara.run/public/57";
 
 const UserSchema: Schema<IUser> = new Schema(
   {
-    email: { type: String, required: true, unique: true },
-    phone: { type: String, default: "" },
-    passwordHash: { type: String, required: true },
+    phone: { type: String, required: true, unique: true, index: true },
+    email: { type: String, sparse: true, index: true },
+    passwordHash: { type: String },
     displayName: { type: String, default: "Guest" },
     gender: { type: String, enum: ["male", "female"], default: "male" },
     role: { type: String, enum: ["customer", "vendor", "rider", "admin"], default: "customer" },
@@ -142,6 +211,32 @@ const UserSchema: Schema<IUser> = new Schema(
     defaultAddress: { type: Schema.Types.ObjectId, ref: "Address" },
     points: { type: Number, default: 0 },
     deviceTokens: { type: [String], default: [] },
+
+    phoneVerified: { type: Boolean, default: false },
+
+    knownDevices: [
+      {
+        deviceId: { type: String, required: true },
+        label: { type: String },
+        firstSeenAt: { type: Date, default: Date.now },
+        lastSeenAt: { type: Date, default: Date.now },
+      },
+    ],
+
+    verificationStatus: {
+      type: String,
+      enum: ["pending", "approved", "rejected"],
+    },
+    verificationReason: { type: String },
+    verificationReviewedAt: { type: Date },
+    verificationReviewedBy: { type: Schema.Types.ObjectId, ref: "User" },
+    verificationDocs: [
+      {
+        kind: { type: String, required: true },
+        url: { type: String, required: true },
+        uploadedAt: { type: Date, default: Date.now },
+      },
+    ],
 
     otpCode: { type: String },
     otpExpiresAt: { type: Date },
@@ -178,9 +273,10 @@ const UserSchema: Schema<IUser> = new Schema(
 
     accountStatus: {
       type: String,
-      enum: ["pending", "active", "suspended"],
+      enum: ["pending", "active", "suspended", "deleted"],
       default: "active",
     },
+    deletedAt: { type: Date },
 
     withdrawalHold: {
       active: { type: Boolean, default: false },
@@ -208,6 +304,11 @@ const UserSchema: Schema<IUser> = new Schema(
     },
 
     pinHash: { type: String },
+    pinFailures: {
+      count: { type: Number, default: 0 },
+      firstFailedAt: { type: Date },
+      lockedUntil: { type: Date },
+    },
   },
   { timestamps: true }
 );

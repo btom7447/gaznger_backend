@@ -43,9 +43,18 @@ router.get("/", async (req, res) => {
     if (lga) filter.lga = lga;
 
     if (search) {
+      // SECURITY (audit A.6): cap length + escape regex metachars
+      // before injection. Unescaped user input was a ReDoS vector
+      // (`(.*a){25}` worst-case) and let attackers craft regexes
+      // that matched more rows than a literal-prefix search. We
+      // anchor with `^…` for prefix-match semantics and case-fold
+      // via `$options: i` (Mongo handles it without us touching
+      // the pattern).
+      const raw = String(search).slice(0, 64);
+      const escaped = raw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       filter.$or = [
-        { name: { $regex: search, $options: "i" } },
-        { address: { $regex: search, $options: "i" } },
+        { name: { $regex: `^${escaped}`, $options: "i" } },
+        { address: { $regex: `^${escaped}`, $options: "i" } },
       ];
     }
 
@@ -74,7 +83,13 @@ router.get("/", async (req, res) => {
       ? await User.find({ _id: { $in: vendorIds } }).select("partnerBadge").lean()
       : [];
     const vendorPartnerMap = new Map(
-      vendors.map((v: any) => [v._id.toString(), v.partnerBadge?.active === true])
+      vendors.map((v: any) => [
+        v._id.toString(),
+        {
+          isPartner: v.partnerBadge?.active === true,
+          partnerSince: v.partnerBadge?.subscribedAt ?? null,
+        },
+      ])
     );
 
     // Distance + ETA only when the caller passed coords. The mobile
@@ -100,11 +115,20 @@ router.get("/", async (req, res) => {
         // Rough drive-time heuristic: 3 minutes per km (Lagos traffic
         // average), floored at 5 minutes. Exposed as the canonical
         // server-side value so the client doesn't reinvent it.
-        etaMinutes = Math.max(5, Math.round(distance * 3));
+        // ETA buffer: drive-time heuristic (3 min/km) + a flat 10-min
+        // expectation-management buffer covering rider acceptance
+        // latency, dispatcher idle time, and forecourt queueing. We
+        // surface the buffered value as the canonical ETA so list
+        // copy, the detail sheet, and the order receipt all agree.
+        etaMinutes = Math.max(5, Math.round(distance * 3)) + 10;
       }
+      const vendorMeta = s.vendorId
+        ? vendorPartnerMap.get(s.vendorId.toString())
+        : undefined;
       return {
         ...s,
-        isPartner: s.vendorId ? (vendorPartnerMap.get(s.vendorId.toString()) ?? false) : false,
+        isPartner: vendorMeta?.isPartner === true,
+        partnerSince: vendorMeta?.partnerSince ?? null,
         distance,
         etaMinutes,
       };
@@ -122,17 +146,211 @@ router.get("/", async (req, res) => {
   }
 });
 
+// ===================== AUTO-PICK (Let Gaznger Choose) =====================
+//
+// Partner-weighted server-side pick. Filter to verified partners first
+// (with a graceful fall-back to all stations when zero partners are in
+// range), then score by:
+//   price 40% — lower per-unit wins
+//   ETA   35% — lower minutes wins
+//   rating 25% — proxy for on-time until the server tracks on-time rate
+//
+// Each metric normalised to [0,1] across the candidate set; the score
+// is the weighted sum and the lowest score wins. The response includes
+// human-readable reasons (e.g. "Lowest price within 5 km", "Fastest ETA")
+// so the mobile result sheet can show a "Why this one" list without
+// duplicating the scoring logic on the client.
+router.post("/auto-pick", requireAuth, async (req, res) => {
+  try {
+    const { lat, lng, radiusKm, fuelTypeId } = req.body ?? {};
+    if (typeof lat !== "number" || typeof lng !== "number") {
+      return res.status(400).json({ message: "lat + lng required" });
+    }
+    const r = typeof radiusKm === "number" && radiusKm > 0 ? radiusKm : 10;
+
+    const latDiff = r / 111;
+    const lngDiff = r / (111 * Math.cos((lat * Math.PI) / 180));
+
+    const filter: any = {
+      isActive: true,
+      "location.lat": { $gte: lat - latDiff, $lte: lat + latDiff },
+      "location.lng": { $gte: lng - lngDiff, $lte: lng + lngDiff },
+    };
+    if (fuelTypeId) filter["fuels.fuel"] = fuelTypeId;
+
+    const stations = await GasStation.find(filter).populate("fuels.fuel").lean();
+    if (stations.length === 0) {
+      return res.status(404).json({ message: "No stations within radius" });
+    }
+
+    // Resolve vendor partner status in one batch.
+    const vendorIds = [
+      ...new Set(stations.map((s: any) => s.vendorId?.toString()).filter(Boolean)),
+    ];
+    const vendors = vendorIds.length
+      ? await User.find({ _id: { $in: vendorIds } }).select("partnerBadge").lean()
+      : [];
+    const partnerMeta = new Map(
+      vendors.map((v: any) => [
+        v._id.toString(),
+        {
+          isPartner: v.partnerBadge?.active === true,
+          partnerSince: v.partnerBadge?.subscribedAt ?? null,
+        },
+      ])
+    );
+
+    // Enrich each candidate with distance, ETA, perUnit (filtered to the
+    // requested fuel where given), partner flag, and a flat shape for
+    // scoring.
+    type Candidate = {
+      station: any;
+      perUnit: number;
+      distance: number;
+      etaMinutes: number;
+      rating: number;
+      isPartner: boolean;
+      partnerSince: Date | null;
+    };
+    const candidates: Candidate[] = [];
+    for (const s of stations as any[]) {
+      if (!s.location?.lat || !s.location?.lng) continue;
+      let perUnit: number | undefined;
+      if (fuelTypeId) {
+        const match = s.fuels?.find(
+          (f: any) =>
+            (f.fuel?._id?.toString?.() ?? f.fuel?.toString?.()) ===
+              String(fuelTypeId) && f.available !== false
+        );
+        if (!match) continue;
+        perUnit = match.pricePerUnit;
+      } else {
+        // No fuel filter — use the cheapest available fuel as the
+        // representative price so price scoring is fair across the set.
+        const available = (s.fuels ?? []).filter(
+          (f: any) => f.available !== false && typeof f.pricePerUnit === "number"
+        );
+        if (available.length === 0) continue;
+        perUnit = Math.min(...available.map((f: any) => f.pricePerUnit));
+      }
+      if (perUnit == null) continue;
+      const distance = haversineDistance(
+        { lat, lng },
+        { lat: s.location.lat, lng: s.location.lng }
+      );
+      // Same +10 expectation-management buffer as the GET / handler
+      // (see comment there). Keep the two computations in sync — the
+      // auto-pick result has to match the same station's row in the
+      // list view, otherwise the user sees two different ETAs.
+      const etaMinutes = Math.max(5, Math.round(distance * 3)) + 10;
+      const meta = s.vendorId ? partnerMeta.get(s.vendorId.toString()) : undefined;
+      candidates.push({
+        station: s,
+        perUnit,
+        distance,
+        etaMinutes,
+        rating: s.rating ?? 0,
+        isPartner: meta?.isPartner === true,
+        partnerSince: meta?.partnerSince ?? null,
+      });
+    }
+
+    if (candidates.length === 0) {
+      return res.status(404).json({ message: "No matching stations within radius" });
+    }
+
+    // Prefer verified partners. Fall back to all candidates only when
+    // no partner is in range so the user always gets an answer.
+    const verifiedPartners = candidates.filter(
+      (c) => c.isPartner && c.station.verified
+    );
+    const pool = verifiedPartners.length > 0 ? verifiedPartners : candidates;
+
+    const minPrice = Math.min(...pool.map((c) => c.perUnit));
+    const maxPrice = Math.max(...pool.map((c) => c.perUnit));
+    const minEta = Math.min(...pool.map((c) => c.etaMinutes));
+    const maxEta = Math.max(...pool.map((c) => c.etaMinutes));
+    const maxRating = Math.max(...pool.map((c) => c.rating), 5);
+
+    const norm = (v: number, lo: number, hi: number) =>
+      hi - lo < 1e-6 ? 0 : (v - lo) / (hi - lo);
+
+    let best: Candidate | null = null;
+    let bestScore = Infinity;
+    for (const c of pool) {
+      const priceScore = norm(c.perUnit, minPrice, maxPrice);
+      const etaScore = norm(c.etaMinutes, minEta, maxEta);
+      const ratingScore = 1 - c.rating / maxRating;
+      const score = 0.4 * priceScore + 0.35 * etaScore + 0.25 * ratingScore;
+      if (score < bestScore) {
+        bestScore = score;
+        best = c;
+      }
+    }
+    if (!best) {
+      return res.status(404).json({ message: "No suitable station found" });
+    }
+
+    const reasons: string[] = [];
+    if (best.perUnit === minPrice) {
+      reasons.push(
+        `Lowest price within ${r} km — ₦${best.perUnit.toLocaleString("en-NG")}/${
+          fuelTypeId ? "unit" : "unit"
+        }`
+      );
+    } else {
+      reasons.push(
+        `Competitive price — ₦${best.perUnit.toLocaleString("en-NG")} (₦${
+          best.perUnit - minPrice
+        } above cheapest)`
+      );
+    }
+    if (best.etaMinutes === minEta) {
+      reasons.push(`Fastest ETA — ~${best.etaMinutes} min away`);
+    } else {
+      reasons.push(`~${best.etaMinutes} min ETA · ${best.distance.toFixed(1)} km`);
+    }
+    if (best.isPartner && best.station.verified) {
+      reasons.push("Verified Gaznger Partner — price honoured at delivery");
+    } else if (best.isPartner) {
+      reasons.push("Gaznger Partner — price honoured at delivery");
+    } else if (best.station.verified) {
+      reasons.push("NMDPRA-verified station");
+    } else {
+      reasons.push("Listed station — price guaranteed at order time");
+    }
+
+    res.json({
+      station: {
+        ...best.station,
+        isPartner: best.isPartner,
+        partnerSince: best.partnerSince,
+        distance: best.distance,
+        etaMinutes: best.etaMinutes,
+      },
+      reasons,
+      score: Number(bestScore.toFixed(4)),
+      pool: pool.length,
+      usedPartnerFilter: verifiedPartners.length > 0,
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to auto-pick station" });
+  }
+});
+
 // ===================== GET STATION BY ID =====================
 router.get("/:id", async (req, res) => {
   try {
     const station = await GasStation.findById(req.params.id).populate("fuels.fuel").lean();
     if (!station) return res.status(404).json({ message: "Station not found" });
     let isPartner = false;
+    let partnerSince: Date | null = null;
     if ((station as any).vendorId) {
       const vendor = await User.findById((station as any).vendorId).select("partnerBadge").lean();
       isPartner = (vendor as any)?.partnerBadge?.active === true;
+      partnerSince = (vendor as any)?.partnerBadge?.subscribedAt ?? null;
     }
-    res.json({ ...station, isPartner });
+    res.json({ ...station, isPartner, partnerSince });
   } catch (err) {
 
     res.status(500).json({ message: "Failed to fetch station" });

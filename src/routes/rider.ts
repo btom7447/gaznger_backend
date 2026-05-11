@@ -13,8 +13,10 @@ import GasStation from "../models/Station";
 import { notifyUser } from "../utils/notify";
 import {
   emitToUser,
+  emitRouteUpdateForDelivery,
   joinDeliveryRoom,
   leaveDeliveryRoom,
+  setDeliveryRider,
 } from "../socket";
 import { createRiderPendingEarning, settleOrderEarnings } from "../utils/earningsUtils";
 import Withdrawal from "../models/Withdrawal";
@@ -228,6 +230,9 @@ router.patch("/deliveries/:id/accept", requireAuth, requireRider, async (req, re
       // lookup. Cleared on terminal status (delivered / dropped /
       // cancelled) by the matching transition handlers.
       joinDeliveryRoom(String(delivery._id), [req.userId!, customerId]);
+      // Record the assigned rider for the spoof-prevention check in
+      // the rider:location socket handler (audit A.2).
+      setDeliveryRider(String(delivery._id), req.userId!);
 
       const [riderUser, riderProfile] = await Promise.all([
         User.findById(req.userId).select("displayName phone profileImage").lean(),
@@ -263,6 +268,11 @@ router.patch("/deliveries/:id/accept", requireAuth, requireRider, async (req, re
         "Rider Assigned",
         "A rider has accepted your order and is heading to the station."
       ).catch(() => {});
+
+      // Kick a route compute now so the customer's first paint of the
+      // Track screen has the rider→station polyline ready, instead of
+      // waiting up to 6s for the rider's first GPS ping to arrive.
+      emitRouteUpdateForDelivery(String(delivery._id)).catch(() => {});
     }
 
     res.json({ message: "Delivery accepted", deliveryId: delivery._id });
@@ -322,6 +332,11 @@ router.patch("/deliveries/:id/pickup", requireAuth, requireRider, async (req, re
 
     // Notify rider's own screen of the status change
     emitToUser(req.userId, "delivery:update", { deliveryId: delivery._id, status: "picked_up" });
+
+    // Phase boundary — flip target station→destination immediately so
+    // both the rider's and the customer's Track screens redraw the
+    // inbound leg without waiting on the next GPS ping.
+    emitRouteUpdateForDelivery(String(delivery._id)).catch(() => {});
 
     res.json({ message: "Pickup confirmed", deliveryId: delivery._id });
   } catch (err) {
@@ -502,6 +517,13 @@ async function applyRiderTransition(
       deliveryId: delivery._id,
       status: toDeliveryStatus,
     });
+
+    // Phase boundary route refresh. The most important flip is
+    // station→destination on pickup — without this the customer's
+    // polyline would keep drawing the rider→station leg until the
+    // next GPS ping cleared the throttle (5s later, plus the cache
+    // TTL). Fire-and-forget so the response stays fast.
+    emitRouteUpdateForDelivery(String(delivery._id)).catch(() => {});
 
     return res.json({ message: successMessage, deliveryId: delivery._id });
   } catch (err) {

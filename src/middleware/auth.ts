@@ -11,7 +11,16 @@ export const requireAuth = (
   if (!authHeader)
     return res.status(401).json({ message: "No token provided" });
 
-  const token = authHeader.split(" ")[1]; // Bearer <token>
+  // SECURITY (audit E.2): require the literal "Bearer " prefix. Without
+  // this check, `authHeader.split(" ")[1]` happily parses
+  // "Basic <token>" or just "<token>" and verifyToken sees a value the
+  // caller never legitimately sent. Generic 401 in either case.
+  if (!authHeader.startsWith("Bearer "))
+    return res.status(401).json({ message: "Invalid token" });
+
+  const token = authHeader.slice(7).trim();
+  if (!token) return res.status(401).json({ message: "Invalid token" });
+
   const payload = verifyToken(token);
   if (!payload) return res.status(401).json({ message: "Invalid token" });
 

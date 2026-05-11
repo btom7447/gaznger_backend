@@ -7,15 +7,22 @@ import Address from "../models/Address";
 import Rating, { IRating } from "../models/Rating";
 import User from "../models/User";
 import Point from "../models/Point";
-import { requireAuth } from "../middleware/auth";
+import { requireAuth, requireCustomer } from "../middleware/auth";
 import { validate } from "../middleware/validate";
-import { createOrderSchema, updateOrderStatusSchema, rateOrderSchema } from "../validators/order.validators";
+import {
+  createOrderSchema,
+  updateOrderStatusSchema,
+  rateOrderSchema,
+  listOrdersQuerySchema,
+} from "../validators/order.validators";
 import { parsePagination } from "../utils/pagination";
 import { notifyUser } from "../utils/notify";
-import { emitToUser } from "../socket";
+import { emitToUser, emitToDelivery } from "../socket";
 import { haversineDistance, calcDeliveryFee } from "../utils/haversine";
 import { createVendorPendingEarning, settleOrderEarnings } from "../utils/earningsUtils";
 import Delivery from "../models/Delivery";
+import RiderProfile from "../models/RiderProfile";
+import { computeRoute, type RouteTarget } from "../utils/routePolyline";
 
 const router = Router();
 
@@ -57,7 +64,12 @@ async function awardPoints(
 }
 
 // ===================== PLACE NEW ORDER =====================
-router.post("/", requireAuth, validate(createOrderSchema), async (req, res) => {
+// SECURITY (audit F.5): customer-only writes get an explicit role
+// gate. Today these handlers don't behave differently for non-
+// customers (they'd just create a malformed order doc), but
+// defense-in-depth: a vendor or rider session token shouldn't be
+// able to call any of them at all.
+router.post("/", requireAuth, requireCustomer, validate(createOrderSchema), async (req, res) => {
   try {
     const {
       fuelId,
@@ -149,7 +161,16 @@ router.post("/", requireAuth, validate(createOrderSchema), async (req, res) => {
       deliveryFee = deliveryFee * 2;
     }
 
-    const totalPrice = fuelCost + deliveryFee;
+    // Platform service fee (audit C.4). Configurable in basis points
+    // via SERVICE_FEE_BPS (200 = 2%, the default). Computed off the
+    // fuel cost — not the total — so the platform's cut doesn't
+    // double-dip on the delivery fee that already pays the rider.
+    // Stored as a separate Order line so admin reporting can split
+    // platform earnings from rider/vendor settlement.
+    const serviceFeeBps = Number(process.env.SERVICE_FEE_BPS) || 200;
+    const serviceFee = Math.round((fuelCost * serviceFeeBps) / 10_000);
+
+    const totalPrice = fuelCost + deliveryFee + serviceFee;
 
     const orderData: any = {
       user: req.userId,
@@ -159,6 +180,7 @@ router.post("/", requireAuth, validate(createOrderSchema), async (req, res) => {
       unit: fuel.unit,
       fuelCost,
       deliveryFee,
+      serviceFee,
       totalPrice,
       // For liquid orders, totalCharged === totalPrice from the start.
       // LPG orders update this on weigh-in (rider app).
@@ -230,17 +252,27 @@ router.post("/", requireAuth, validate(createOrderSchema), async (req, res) => {
 // ===================== GET MY ORDERS (with filter & pagination) =====================
 router.get("/", requireAuth, async (req, res) => {
   try {
-    const { status, startDate, endDate } = req.query;
+    // SECURITY (audit E.4): validate query inputs before they reach
+    // Mongo. Garbage `startDate=foo` previously surfaced as a 500
+    // because `new Date("foo").getTime()` is NaN.
+    const parsed = listOrdersQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      return res.status(400).json({
+        message: "Invalid query parameters",
+        issues: parsed.error.issues,
+      });
+    }
+    const { status, startDate, endDate } = parsed.data;
 
     const filter: any = { user: req.userId };
     if (status) {
-      const statuses = (status as string).split(",").map((s) => s.trim()).filter(Boolean);
+      const statuses = status.split(",").map((s) => s.trim()).filter(Boolean);
       filter.status = statuses.length > 1 ? { $in: statuses } : statuses[0];
     }
     if (startDate || endDate) {
       filter.createdAt = {};
-      if (startDate) filter.createdAt.$gte = new Date(startDate as string);
-      if (endDate) filter.createdAt.$lte = new Date(endDate as string);
+      if (startDate) filter.createdAt.$gte = new Date(startDate);
+      if (endDate) filter.createdAt.$lte = new Date(endDate);
     }
 
     const { page: pageNum, limit: limitNum, skip } = parsePagination(req.query as Record<string, unknown>);
@@ -276,8 +308,6 @@ router.get("/:orderId", requireAuth, async (req, res) => {
       .populate("fuel")
       .populate("station")
       .populate("deliveryAddress")
-      // Customer-safe rider fields only — never expose phone if order
-      // hasn't reached the rider-on-site phase yet (privacy).
       .populate({
         path: "riderId",
         select: "displayName phone profileImage",
@@ -288,6 +318,26 @@ router.get("/:orderId", requireAuth, async (req, res) => {
 
     if (order.user.toString() !== req.userId)
       return res.status(403).json({ message: "Forbidden" });
+
+    // SECURITY (audit E.9): the customer doesn't need the rider's
+    // phone until the rider is en-route or on-site. Hide it for
+    // earlier statuses so an idly-watched order can't harvest rider
+    // numbers.
+    const PHONE_VISIBLE_STATUSES = new Set([
+      "picked_up",
+      "in-transit",
+      "arrived",
+      "dispensing",
+      "awaiting_confirmation",
+    ]);
+    if (
+      order.riderId &&
+      typeof order.riderId === "object" &&
+      !PHONE_VISIBLE_STATUSES.has(order.status as string)
+    ) {
+      const rider = order.riderId as unknown as Record<string, unknown>;
+      if ("phone" in rider) rider.phone = undefined;
+    }
 
     // Side-load the rider profile (vehicle plate + rating) when a
     // rider is assigned. Cheap extra query; keeps the populate chain
@@ -319,62 +369,88 @@ router.get("/:orderId", requireAuth, async (req, res) => {
 
 // ===================== ROUTE POLYLINE =====================
 /**
- * GET /api/orders/:orderId/route?riderLat=&riderLng=
+ * GET /api/orders/:orderId/route?riderLat=&riderLng=&target=station|destination
  *
- * Returns the rider→destination polyline as an array of [lat,lng]
- * tuples, plus distance + duration. Backed by Google Directions API
- * with a 30s in-memory cache keyed on the order id (rider position
- * doesn't move enough between fetches to redraw the road every push).
- *
- * Customer is the only consumer; ownership-checked.
+ * Returns the rider→target polyline (decoded [lat,lng] tuples) plus
+ * distance + duration. Backed by the shared `computeRoute` helper
+ * (Directions API + 30s cache + per-order throttle). Both customer
+ * and assigned rider are allowed; subsequent updates arrive over the
+ * `route:update` socket event broadcast from the rider:location handler.
  */
-const routeCache = new Map<
-  string,
-  { polyline: [number, number][]; distanceMeters: number; durationSeconds: number; expiresAt: number }
->();
-const ROUTE_CACHE_TTL_MS = 30_000;
-
 router.get("/:orderId/route", requireAuth, async (req, res) => {
   try {
     const order = await Order.findById(req.params.orderId)
-      .populate({ path: "deliveryAddress", select: "latitude longitude" })
-      .populate({ path: "station", select: "location" })
+      .select("user")
       .lean();
     if (!order) return res.status(404).json({ message: "Order not found" });
-    if (order.user.toString() !== req.userId)
+
+    // Authorise: order's customer OR the assigned rider. The rider
+    // needs the same data to draw their own polyline.
+    const isCustomer = order.user.toString() === req.userId;
+    let isRider = false;
+    if (!isCustomer) {
+      const assigned = await Delivery.findOne({
+        order: order._id,
+        rider: req.userId,
+      })
+        .select("_id")
+        .lean();
+      isRider = !!assigned;
+    }
+    if (!isCustomer && !isRider)
       return res.status(403).json({ message: "Forbidden" });
 
-    const riderLat = Number(req.query.riderLat);
-    const riderLng = Number(req.query.riderLng);
-    if (!Number.isFinite(riderLat) || !Number.isFinite(riderLng))
-      return res.status(400).json({ message: "riderLat & riderLng required" });
+    let riderLat: number;
+    let riderLng: number;
 
-    /**
-     * Route target — `station` for the rider's outbound leg
-     * (assigned / at-pickup phases) or `destination` (default) for
-     * the customer-bound leg (in-transit / almost-there). Picking
-     * the wrong target would route the wrong geometry to the
-     * customer screen, so the client passes this explicitly.
-     */
-    const target =
+    // SECURITY (audit A.9): the customer is NOT trusted to provide
+    // the rider's coords. Without this gate, a customer could poll
+    // `/route?riderLat=<random>&riderLng=<random>` to drive Directions
+    // API spend + spam route:update broadcasts. For customer callers
+    // we resolve from the rider's last-known GPS server-side and
+    // ignore body coords entirely. Rider callers (drawing their own
+    // map) keep passing live GPS.
+    if (isCustomer) {
+      const delivery = await Delivery.findOne({
+        order: order._id,
+        status: { $nin: ["delivered", "dropped", "failed"] },
+      })
+        .select("rider")
+        .lean();
+      if (!delivery?.rider) {
+        return res
+          .status(404)
+          .json({ message: "No active rider on this order yet" });
+      }
+      const profile = await RiderProfile.findOne({ user: delivery.rider })
+        .select("currentLocation")
+        .lean();
+      const lat = profile?.currentLocation?.lat;
+      const lng = profile?.currentLocation?.lng;
+      if (lat == null || lng == null) {
+        return res
+          .status(404)
+          .json({ message: "Rider has not shared a location yet" });
+      }
+      riderLat = lat;
+      riderLng = lng;
+    } else {
+      riderLat = Number(req.query.riderLat);
+      riderLng = Number(req.query.riderLng);
+      if (!Number.isFinite(riderLat) || !Number.isFinite(riderLng))
+        return res.status(400).json({ message: "riderLat & riderLng required" });
+    }
+
+    const target: RouteTarget =
       req.query.target === "station" ? "station" : "destination";
 
-    let destLat: number | undefined;
-    let destLng: number | undefined;
-    if (target === "station") {
-      const station = order.station as unknown as
-        | { location?: { lat?: number; lng?: number } }
-        | undefined;
-      destLat = station?.location?.lat;
-      destLng = station?.location?.lng;
-    } else {
-      const dest = order.deliveryAddress as unknown as
-        | { latitude?: number; longitude?: number }
-        | undefined;
-      destLat = dest?.latitude;
-      destLng = dest?.longitude;
-    }
-    if (destLat == null || destLng == null) {
+    const result = await computeRoute(
+      String(order._id),
+      riderLat,
+      riderLng,
+      target
+    );
+    if (!result) {
       return res.status(400).json({
         message:
           target === "station"
@@ -383,145 +459,44 @@ router.get("/:orderId/route", requireAuth, async (req, res) => {
       });
     }
 
-    // Cache key includes the target so a station+destination route
-    // pair for the same rider position doesn't collide.
-    const cacheKey = `${order._id.toString()}:${target}:${riderLat.toFixed(
-      3
-    )},${riderLng.toFixed(3)}`;
-    const cached = routeCache.get(cacheKey);
-    if (cached && cached.expiresAt > Date.now()) {
-      return res.json({
-        polyline: cached.polyline,
-        distanceMeters: cached.distanceMeters,
-        durationSeconds: cached.durationSeconds,
-      });
-    }
-
-    const apiKey = process.env.GOOGLE_MAPS_API_KEY;
-    if (!apiKey) {
-      // No API key configured — return a straight-line fallback so the
-      // mobile client at least has a polyline to draw.
-      return res.json({
-        polyline: [
-          [riderLat, riderLng],
-          [destLat, destLng],
-        ],
-        distanceMeters: undefined,
-        durationSeconds: undefined,
-      });
-    }
-
-    const params = new URLSearchParams({
-      origin: `${riderLat},${riderLng}`,
-      destination: `${destLat},${destLng}`,
-      mode: "driving",
-      key: apiKey,
-    });
-    const directionsRes = await fetch(
-      `https://maps.googleapis.com/maps/api/directions/json?${params}`
-    );
-    const directionsData = (await directionsRes.json()) as {
-      status: string;
-      routes?: {
-        overview_polyline?: { points: string };
-        legs?: { distance?: { value: number }; duration?: { value: number } }[];
-      }[];
-    };
-
-    if (directionsData.status !== "OK" || !directionsData.routes?.[0]) {
-      // Failure — straight-line fallback.
-      return res.json({
-        polyline: [
-          [riderLat, riderLng],
-          [destLat, destLng],
-        ],
-      });
-    }
-
-    const route = directionsData.routes[0];
-    const encoded = route.overview_polyline?.points ?? "";
-    const polyline = decodePolyline(encoded);
-    const leg = route.legs?.[0];
-    const distanceMeters = leg?.distance?.value ?? 0;
-    const durationSeconds = leg?.duration?.value ?? 0;
-
-    routeCache.set(cacheKey, {
-      polyline,
-      distanceMeters,
-      durationSeconds,
-      expiresAt: Date.now() + ROUTE_CACHE_TTL_MS,
-    });
-
-    // Phase 3 — emit route:update to the customer so multi-device
-    // sessions (or a customer who recently reconnected) stay in
-    // sync without their own poll. The matching Delivery's room
-    // exists once a rider has accepted; before that there's
-    // nothing to broadcast. Best-effort: lookup is cheap, failure
-    // is silently fine (the requesting client got the polyline
-    // back synchronously).
-    try {
-      const { emitToDelivery } = await import("../socket");
-      const Delivery = (await import("../models/Delivery")).default;
-      const activeDelivery = await Delivery.findOne({
-        order: order._id,
-        status: { $nin: ["delivered", "dropped", "failed"] },
-      })
-        .select("_id")
-        .lean();
-      if (activeDelivery) {
-        emitToDelivery(String(activeDelivery._id), "route:update", {
-          orderId: String(order._id),
-          polyline,
-          distanceM: distanceMeters,
-          durationS: durationSeconds,
-          target,
-        });
+    // Broadcast freshly-computed routes to the delivery room so a
+    // second device (rider's phone, customer on web) sees the same
+    // geometry without polling. Cache hits skip the broadcast — the
+    // recipients already have it from the prior fresh call.
+    if (!result.cached) {
+      try {
+        const activeDelivery = await Delivery.findOne({
+          order: order._id,
+          status: { $nin: ["delivered", "dropped", "failed"] },
+        })
+          .select("_id")
+          .lean();
+        if (activeDelivery) {
+          emitToDelivery(String(activeDelivery._id), "route:update", {
+            orderId: String(order._id),
+            polyline: result.polyline,
+            distanceM: result.distanceMeters,
+            durationS: result.durationSeconds,
+            steps: result.steps,
+            target,
+          });
+        }
+      } catch {
+        // non-fatal — synchronous response covers the requester
       }
-    } catch {
-      // non-fatal — the synchronous response covers the requester
     }
 
-    res.json({ polyline, distanceMeters, durationSeconds });
+    res.json({
+      polyline: result.polyline,
+      distanceMeters: result.distanceMeters,
+      durationSeconds: result.durationSeconds,
+      steps: result.steps,
+    });
   } catch (err) {
     console.error("[orders/:orderId/route]", err);
     res.status(500).json({ message: "Failed to load route" });
   }
 });
-
-/**
- * Decode Google's encoded polyline string into [lat, lng] tuples.
- * Reference algorithm:
- *   https://developers.google.com/maps/documentation/utilities/polylinealgorithm
- */
-function decodePolyline(encoded: string): [number, number][] {
-  const points: [number, number][] = [];
-  let index = 0;
-  let lat = 0;
-  let lng = 0;
-  while (index < encoded.length) {
-    let result = 0;
-    let shift = 0;
-    let b: number;
-    do {
-      b = encoded.charCodeAt(index++) - 63;
-      result |= (b & 0x1f) << shift;
-      shift += 5;
-    } while (b >= 0x20);
-    const dlat = (result & 1) !== 0 ? ~(result >> 1) : result >> 1;
-    lat += dlat;
-    result = 0;
-    shift = 0;
-    do {
-      b = encoded.charCodeAt(index++) - 63;
-      result |= (b & 0x1f) << shift;
-      shift += 5;
-    } while (b >= 0x20);
-    const dlng = (result & 1) !== 0 ? ~(result >> 1) : result >> 1;
-    lng += dlng;
-    points.push([lat / 1e5, lng / 1e5]);
-  }
-  return points;
-}
 
 // ===================== UPDATE ORDER STATUS =====================
 /**
@@ -696,7 +671,7 @@ router.patch("/:orderId/cancel", requireAuth, async (req, res) => {
  *
  * Returns: { stamped: boolean, customerHereAt: Date }
  */
-router.post("/:orderId/customer-here", requireAuth, async (req, res) => {
+router.post("/:orderId/customer-here", requireAuth, requireCustomer, async (req, res) => {
   try {
     const order = await Order.findById(req.params.orderId);
     if (!order) return res.status(404).json({ message: "Order not found" });
@@ -751,7 +726,7 @@ router.post("/:orderId/customer-here", requireAuth, async (req, res) => {
 });
 
 // ===================== CUSTOMER CONFIRMS DELIVERY RECEIPT =====================
-router.patch("/:orderId/confirm-delivery", requireAuth, async (req, res) => {
+router.patch("/:orderId/confirm-delivery", requireAuth, requireCustomer, async (req, res) => {
   try {
     // Phase 9 — atomic confirm. We fetch first to read the existing
     // totalCharged + totalPrice (needed to compute the LPG fallback),
@@ -853,7 +828,7 @@ router.patch("/:orderId/confirm-delivery", requireAuth, async (req, res) => {
 });
 
 // ===================== RATE A STATION =====================
-router.post("/:orderId/rate", requireAuth, validate(rateOrderSchema), async (req, res) => {
+router.post("/:orderId/rate", requireAuth, requireCustomer, validate(rateOrderSchema), async (req, res) => {
   try {
     const { score, stars, comment, note, tags, tip } = req.body;
     const finalStars = stars ?? score;

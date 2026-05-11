@@ -21,11 +21,39 @@ const REQUIRED_ENV_VARS = [
   "RESEND_API_KEY",
 ];
 
+/**
+ * Production-only required env vars. Treated as REQUIRED when
+ * `NODE_ENV=production`; permitted to be missing in dev (the dev OTP
+ * console fallback covers signup/login locally).
+ *
+ * SECURITY (audit A.1): without this gate, a prod deploy that forgot
+ * to inject the WA credentials would silently flip into dev mode and
+ * accept the fixed `123456` OTP for every account.
+ */
+const PROD_REQUIRED_ENV_VARS = [
+  "WA_ACCESS_TOKEN",
+  "WA_PHONE_NUMBER_ID",
+];
+
 function validateEnv() {
   const missing = REQUIRED_ENV_VARS.filter((key) => !process.env[key]);
+  if (process.env.NODE_ENV === "production") {
+    for (const key of PROD_REQUIRED_ENV_VARS) {
+      if (!process.env[key]) missing.push(key);
+    }
+  }
   if (missing.length > 0) {
     throw new Error(
       `Missing required environment variables: ${missing.join(", ")}`
+    );
+  }
+  // Loud warn in non-prod so the bypass is never an unnoticed default.
+  if (
+    process.env.NODE_ENV !== "production" &&
+    (!process.env.WA_ACCESS_TOKEN || !process.env.WA_PHONE_NUMBER_ID)
+  ) {
+    console.warn(
+      "[startup] WA_ACCESS_TOKEN/WA_PHONE_NUMBER_ID not set — dev OTP mode active. Fixed code 123456 will be accepted. This is a development-only bypass."
     );
   }
 }

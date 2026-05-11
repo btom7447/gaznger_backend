@@ -30,6 +30,20 @@ const router = Router();
 
 /* ─────────────────────────── helpers ───────────────────────────── */
 
+/**
+ * Email Paystack records on the transaction. Use the user's real
+ * address when set, otherwise an opaque per-user identifier — never
+ * derive from `user.phone` (audit F.3): the phone number is PII we
+ * don't want sitting in a third-party's logs/console under a "user
+ * email" label, and Paystack's dashboard exposes it to anyone with
+ * staff access.
+ */
+function paystackEmailFor(user: { email?: string | null; _id: unknown }): string {
+  if (user.email) return user.email;
+  const id = (user._id as { toString(): string }).toString();
+  return `${id}@users.gaznger.app`;
+}
+
 /** Persist Paystack's `authorization` block on the customer's User doc. */
 async function saveCardOnUser(userId: string, auth?: PaystackAuthorization) {
   if (!auth || !auth.authorization_code || !auth.last4 || !auth.reusable) return;
@@ -131,7 +145,7 @@ router.post("/initialize", requireAuth, moneyLimiter, idempotencyKey(), async (r
     const amountKobo = Math.round(order.totalPrice * 100);
 
     const paymentData = await initializePayment({
-      email: user.email,
+      email: paystackEmailFor(user),
       amount: amountKobo,
       reference,
       metadata: { orderId: order._id.toString(), kind: "order_charge" },
@@ -244,7 +258,7 @@ router.post("/charge-saved", requireAuth, moneyLimiter, idempotencyKey({ enforce
 
     const data = await chargeAuthorization({
       authorization_code: user.lastPaystackAuth.authorizationCode,
-      email: user.email,
+      email: paystackEmailFor(user),
       amount: amountKobo,
       reference,
       metadata: { orderId: order._id.toString(), kind: "order_charge_saved" },
@@ -426,7 +440,7 @@ router.post("/topup/initialize", requireAuth, moneyLimiter, idempotencyKey(), as
     const amountKobo = Math.round(amountNum * 100);
 
     const paymentData = await initializePayment({
-      email: user.email,
+      email: paystackEmailFor(user),
       amount: amountKobo,
       reference,
       metadata: { kind: "wallet_topup", userId: user._id.toString(), amountNgn: amountNum },

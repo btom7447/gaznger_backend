@@ -35,6 +35,24 @@ export interface IPlatformConfig extends Document {
   /** Toggle: any in-app withdrawals enabled. */
   withdrawalsEnabled: boolean;
 
+  /**
+   * Minimum mobile-app native version still allowed. Compared against
+   * the X-App-Version header sent by the mobile (lib/api.ts via
+   * expo-application). Below this → 426 + X-Min-Version response
+   * header so the mobile force-update screen activates. Empty string
+   * means no gate (default — never force-update accidentally).
+   */
+  minMobileVersion: string;
+
+  /**
+   * Server-wide maintenance switch. When true, every API endpoint
+   * (except /health) returns 503 with code: "MAINTENANCE" so the
+   * mobile routes to the maintenance screen. `expectedBackAt` rides
+   * along on the response so the screen can show an ETA.
+   */
+  maintenanceMode: boolean;
+  maintenanceExpectedBackAt?: Date;
+
   createdAt: Date;
   updatedAt: Date;
 }
@@ -54,6 +72,10 @@ const PlatformConfigSchema: Schema<IPlatformConfig> = new Schema(
 
     paymentsEnabled: { type: Boolean, default: true },
     withdrawalsEnabled: { type: Boolean, default: true },
+
+    minMobileVersion: { type: String, default: "" },
+    maintenanceMode: { type: Boolean, default: false },
+    maintenanceExpectedBackAt: { type: Date },
   },
   { timestamps: true }
 );

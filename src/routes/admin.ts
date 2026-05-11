@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { validate } from "../middleware/validate";
 import { requireAuth, requireAdmin } from "../middleware/auth";
 import User from "../models/User";
 import GasStation from "../models/Station";
@@ -6,6 +7,8 @@ import Order from "../models/Order";
 import RiderProfile from "../models/RiderProfile";
 import Earning from "../models/Earning";
 import Delivery from "../models/Delivery";
+import { adminVerificationDecisionSchema } from "../validators/auth.validators";
+import { emitToUser } from "../socket";
 
 const router = Router();
 
@@ -269,6 +272,130 @@ router.patch("/riders/:id/verify", async (req, res) => {
     res.json({ message: `Rider ${isVerified ? "verified" : "unverified"}`, profile });
   } catch (err) {
     res.status(500).json({ message: "Failed to update rider" });
+  }
+});
+
+// ===================== VERIFICATION DECISION (v4) =====================
+/**
+ * Approve / reject a rider or vendor's submitted verification. Replaces
+ * the legacy `riders/:id/verify` toggle for v4 — uses the unified
+ * User.verificationStatus field. Emits `verification:status` to the
+ * user's socket room so the mobile pending-lobby flips in real-time.
+ */
+router.patch(
+  "/users/:id/verification",
+  validate(adminVerificationDecisionSchema),
+  async (req, res) => {
+    try {
+      const { status, reason } = req.body as {
+        status: "approved" | "rejected";
+        reason?: string;
+      };
+
+      const user = await User.findById(req.params.id);
+      if (!user) return res.status(404).json({ message: "User not found" });
+      if (user.role !== "rider" && user.role !== "vendor") {
+        return res
+          .status(400)
+          .json({ message: "Verification only applies to rider/vendor." });
+      }
+
+      user.verificationStatus = status;
+      user.verificationReason = reason;
+      user.verificationReviewedAt = new Date();
+      user.verificationReviewedBy = req.userId as never;
+      await user.save();
+
+      // Push to the user's socket room — mobile pending-lobby listens.
+      emitToUser(String(user._id), "verification:status", {
+        userId: String(user._id),
+        status,
+        reason,
+      });
+
+      res.json({
+        message: `Verification ${status}`,
+        verificationStatus: user.verificationStatus,
+        verificationReason: user.verificationReason,
+      });
+    } catch {
+      res.status(500).json({ message: "Failed to update verification" });
+    }
+  }
+);
+
+// ===================== ACCOUNT STATUS (v4) =====================
+/**
+ * Suspend / re-activate an account. Used by trust+safety to immediately
+ * kick out a violator. Mobile detects via 403 + accountStatus on the
+ * next /auth/me sync (or any auth-gated call).
+ */
+router.patch("/users/:id/account-status", async (req, res) => {
+  try {
+    const { status, reason } = req.body as {
+      status?: "active" | "suspended" | "pending";
+      reason?: string;
+    };
+    if (!status || !["active", "suspended", "pending"].includes(status)) {
+      return res.status(400).json({
+        message: "status must be 'active', 'suspended', or 'pending'",
+      });
+    }
+    const user = await User.findByIdAndUpdate(
+      req.params.id,
+      { $set: { accountStatus: status } },
+      { new: true }
+    ).select("accountStatus role displayName phone");
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    // Best-effort push so the user gets bounced from any open session.
+    if (status === "suspended") {
+      emitToUser(String(user._id), "account:suspended", {
+        reason,
+      });
+    }
+
+    res.json({ message: `Account ${status}`, user });
+  } catch {
+    res.status(500).json({ message: "Failed to update account status" });
+  }
+});
+
+// ===================== WITHDRAWAL HOLD (v4) =====================
+/**
+ * Set or clear withdrawal hold on a vendor/rider account. The wallet
+ * withdraw endpoint reads this flag and 403s when active so the mobile
+ * routes to /states/withdrawal-hold.
+ */
+router.patch("/users/:id/withdrawal-hold", async (req, res) => {
+  try {
+    const { active, reason } = req.body as {
+      active?: boolean;
+      reason?: string;
+    };
+    if (typeof active !== "boolean") {
+      return res.status(400).json({ message: "active (boolean) is required" });
+    }
+    const update = active
+      ? {
+          "withdrawalHold.active": true,
+          "withdrawalHold.reason": reason ?? "Standard payout review.",
+          "withdrawalHold.setBy": req.userId,
+          "withdrawalHold.setAt": new Date(),
+        }
+      : {
+          "withdrawalHold.active": false,
+          "withdrawalHold.reason": "",
+        };
+    const user = await User.findByIdAndUpdate(
+      req.params.id,
+      { $set: update },
+      { new: true }
+    ).select("withdrawalHold role displayName");
+    if (!user) return res.status(404).json({ message: "User not found" });
+    res.json({ message: `Hold ${active ? "set" : "cleared"}`, user });
+  } catch {
+    res.status(500).json({ message: "Failed to update withdrawal hold" });
   }
 });
 

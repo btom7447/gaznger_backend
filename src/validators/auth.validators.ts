@@ -1,37 +1,94 @@
 import { z } from "zod";
 
-export const registerSchema = z.object({
-  email: z.string().email("Invalid email address"),
-  password: z.string().min(8, "Password must be at least 8 characters"),
-  displayName: z.string().optional(),
-  phone: z.string().refine(val => !val || val.length >= 10, "Phone number must be at least 10 digits").optional(),
-  gender: z.enum(["male", "female"]).optional(),
-  profileImage: z.string().url("Invalid image URL").optional(),
-  role: z.enum(["customer", "vendor", "rider"]).optional().default("customer"),
+/**
+ * E.164 — leading "+" then 8-15 digits. Mobile normalises before send;
+ * server enforces the same regex so a malformed number can't sneak
+ * past via the mobile bypassing its own validation.
+ */
+const e164 = z.string().regex(/^\+\d{8,15}$/, "Phone must be in E.164 format (+countryDigits)");
+
+const purposeEnum = z.enum(["signup", "login", "recovery"]);
+
+const pin4 = z.string().regex(/^\d{4}$/, "PIN must be 4 digits");
+
+export const checkPhoneSchema = z.object({
+  phone: e164,
 });
 
-export const loginSchema = z.object({
-  email: z.string().email("Invalid email address"),
-  password: z.string().min(1, "Password is required"),
+export const sendOtpSchema = z.object({
+  phone: e164,
+  purpose: purposeEnum,
 });
 
 export const verifyOtpSchema = z.object({
-  email: z.string().email("Invalid email address"),
+  phone: e164,
+  otp: z.string().length(6, "OTP must be exactly 6 digits"),
+  purpose: purposeEnum,
+});
+
+export const signupSchema = z.object({
+  verificationToken: z.string().min(16, "verificationToken required"),
+  role: z.enum(["customer", "rider", "vendor"]),
+  pin: pin4,
+  biometricPreference: z.enum(["face", "touch", "pin"]).optional(),
+  profile: z.object({
+    // Customer fields
+    firstName: z.string().min(2).max(60).optional(),
+    lastName: z.string().min(2).max(60).optional(),
+    email: z.string().email().optional(),
+    // Rider fields
+    fullName: z.string().min(3).max(120).optional(),
+    plate: z.string().min(4).max(20).optional(),
+    vehicleType: z.enum(["motorcycle", "tricycle", "van"]).optional(),
+    // Vendor fields
+    stationName: z.string().min(3).max(120).optional(),
+    licence: z.string().min(6).max(64).optional(),
+    contact: z.string().min(8).max(20).optional(),
+    address: z.string().min(6).max(240).optional(),
+    state: z.string().min(2).max(40).optional(),
+    lga: z.string().max(80).optional(),
+    latitude: z.number().min(-90).max(90).optional(),
+    longitude: z.number().min(-180).max(180).optional(),
+    products: z.array(z.string()).max(8).optional(),
+  }),
+});
+
+export const phoneLoginSchema = z.object({
+  phone: e164,
+  pin: pin4,
+  /** Required when knownDevice was false on /auth/check-phone. */
+  verificationToken: z.string().optional(),
+});
+
+export const forgotPinStartSchema = z.object({
+  phone: e164,
+});
+
+export const forgotPinVerifySchema = z.object({
+  phone: e164,
   otp: z.string().length(6, "OTP must be exactly 6 digits"),
 });
 
-export const resendOtpSchema = z.object({
-  email: z.string().email("Invalid email address"),
+export const forgotPinResetSchema = z.object({
+  resetToken: z.string().min(16, "resetToken required"),
+  newPin: pin4,
 });
 
-export const forgotPasswordSchema = z.object({
-  email: z.string().email("Invalid email address"),
+export const verificationSubmitSchema = z.object({
+  documents: z
+    .array(
+      z.object({
+        kind: z.string().min(2).max(64),
+        url: z.string().url(),
+      })
+    )
+    .min(1, "At least one document required")
+    .max(20),
 });
 
-export const resetPasswordSchema = z.object({
-  email: z.string().email("Invalid email address"),
-  otp: z.string().length(6, "OTP must be exactly 6 digits"),
-  newPassword: z.string().min(8, "Password must be at least 8 characters"),
+export const adminVerificationDecisionSchema = z.object({
+  status: z.enum(["approved", "rejected"]),
+  reason: z.string().max(280).optional(),
 });
 
 export const updateProfileSchema = z.object({

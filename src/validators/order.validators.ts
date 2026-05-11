@@ -32,6 +32,21 @@ export const createOrderSchema = z
     path: ["fuelId"],
   });
 
+// Query params for `GET /api/orders` listing. Validates the customer-
+// supplied filters before they hit Mongo so a malformed `startDate`
+// doesn't surface as a 500. (audit E.4)
+export const listOrdersQuerySchema = z.object({
+  status: z
+    .string()
+    .max(200)
+    .regex(/^[a-zA-Z0-9_,\-]+$/, "Invalid status filter")
+    .optional(),
+  startDate: z.string().datetime("startDate must be ISO-8601").optional(),
+  endDate: z.string().datetime("endDate must be ISO-8601").optional(),
+  page: z.coerce.number().int().min(1).max(10_000).optional(),
+  limit: z.coerce.number().int().min(1).max(100).optional(),
+});
+
 export const updateOrderStatusSchema = z.object({
   status: z.enum(["pending", "confirmed", "assigned", "in-transit", "delivered", "cancelled"] as const, {
     error: "Invalid status value",
