@@ -1,7 +1,8 @@
 import { v2 as cloudinary } from "cloudinary";
-import dotenv from "dotenv";
 
-dotenv.config();
+// env is loaded by src/index.ts (only in dev) — no need to re-call
+// dotenv.config() here. On Railway it printed a confusing
+// "[dotenv] injecting env (0) from .env" line every boot.
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
