@@ -32,13 +32,21 @@ const WA_GRAPH_VERSION = process.env.WA_GRAPH_VERSION ?? "v21.0";
 /** True when we should bypass the real provider. Mobile sees no difference. */
 export function isDevSmsMode(): boolean {
   // SECURITY (audit A.1): the dev gate must NEVER trip in production
-  // even if the WA env vars are accidentally unset — that bypass would
-  // accept the fixed `DEV_FIXED_OTP` for every login attempt and amount
-  // to a full account-takeover footgun. We require BOTH non-production
-  // env AND missing WA credentials. The WA vars are also enforced as
-  // REQUIRED_ENV_VARS at boot (see index.ts) so a misconfigured prod
-  // deploy fails fast instead of silently flipping to dev mode.
-  if (process.env.NODE_ENV === "production") return false;
+  // unless the operator EXPLICITLY opts in via ALLOW_DEV_OTP_IN_PROD=true.
+  // This is the soft-launch escape hatch — it lets us deploy to Railway
+  // before WhatsApp Business onboarding completes, while keeping the
+  // accidental-bypass guard intact for the normal case.
+  //
+  // The flag must be the literal string "true" — any other value
+  // (including 1/yes/on) keeps the gate engaged. Missing WA creds in
+  // prod still fail-fast at boot via REQUIRED_ENV_VARS unless this
+  // flag is set (see index.ts).
+  if (process.env.NODE_ENV === "production") {
+    if (process.env.ALLOW_DEV_OTP_IN_PROD === "true") {
+      return !WA_ACCESS_TOKEN || !WA_PHONE_NUMBER_ID;
+    }
+    return false;
+  }
   return !WA_ACCESS_TOKEN || !WA_PHONE_NUMBER_ID;
 }
 

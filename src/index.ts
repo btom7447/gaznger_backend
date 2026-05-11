@@ -37,7 +37,9 @@ const PROD_REQUIRED_ENV_VARS = [
 
 function validateEnv() {
   const missing = REQUIRED_ENV_VARS.filter((key) => !process.env[key]);
-  if (process.env.NODE_ENV === "production") {
+  const allowDevOtpInProd = process.env.ALLOW_DEV_OTP_IN_PROD === "true";
+  if (process.env.NODE_ENV === "production" && !allowDevOtpInProd) {
+    // Standard prod path: WA creds are mandatory.
     for (const key of PROD_REQUIRED_ENV_VARS) {
       if (!process.env[key]) missing.push(key);
     }
@@ -47,14 +49,16 @@ function validateEnv() {
       `Missing required environment variables: ${missing.join(", ")}`
     );
   }
-  // Loud warn in non-prod so the bypass is never an unnoticed default.
-  if (
-    process.env.NODE_ENV !== "production" &&
-    (!process.env.WA_ACCESS_TOKEN || !process.env.WA_PHONE_NUMBER_ID)
-  ) {
-    console.warn(
-      "[startup] WA_ACCESS_TOKEN/WA_PHONE_NUMBER_ID not set — dev OTP mode active. Fixed code 123456 will be accepted. This is a development-only bypass."
-    );
+  // Loud warn whenever the dev-OTP bypass is live — dev OR prod soft-launch.
+  if (!process.env.WA_ACCESS_TOKEN || !process.env.WA_PHONE_NUMBER_ID) {
+    const banner =
+      process.env.NODE_ENV === "production" && allowDevOtpInProd
+        ? "[startup] ⚠⚠⚠ PRODUCTION DEV-OTP BYPASS ACTIVE — ALLOW_DEV_OTP_IN_PROD=true. " +
+          "Code 123456 is being accepted as a valid OTP for every signup/login. " +
+          "Unset ALLOW_DEV_OTP_IN_PROD the moment WA_ACCESS_TOKEN + WA_PHONE_NUMBER_ID are configured. " +
+          "This is a soft-launch escape hatch, NOT a long-term setting."
+        : "[startup] WA_ACCESS_TOKEN/WA_PHONE_NUMBER_ID not set — dev OTP mode active. Fixed code 123456 will be accepted. This is a development-only bypass.";
+    console.warn(banner);
   }
 }
 
@@ -71,6 +75,24 @@ const startServer = async () => {
   server.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
   });
+
+  // Periodic re-warn when the prod dev-OTP bypass is on. Re-prints every
+  // 30 min so the bypass can't drift out of operator awareness during a
+  // long soft-launch. Drops itself the moment WA creds appear (treat env
+  // as mutable across reboots — the next deploy will run validateEnv anew).
+  if (
+    process.env.NODE_ENV === "production" &&
+    process.env.ALLOW_DEV_OTP_IN_PROD === "true" &&
+    (!process.env.WA_ACCESS_TOKEN || !process.env.WA_PHONE_NUMBER_ID)
+  ) {
+    setInterval(
+      () =>
+        console.warn(
+          "[runtime] dev-OTP bypass still active in production — replace ALLOW_DEV_OTP_IN_PROD with WA_ACCESS_TOKEN + WA_PHONE_NUMBER_ID ASAP",
+        ),
+      30 * 60 * 1000,
+    );
+  }
 
   const shutdown = async (signal: string) => {
     console.log(`Received ${signal}. Shutting down gracefully...`);
