@@ -1,5 +1,10 @@
 import dotenv from "dotenv";
-dotenv.config({ path: ".env.local" });
+// Only load .env.local in non-prod. On Railway / any prod platform the
+// process env is already populated, and pointing dotenv at a non-existent
+// .env.local prints a confusing "injecting env (0)" warning every boot.
+if (process.env.NODE_ENV !== "production") {
+  dotenv.config({ path: ".env.local" });
+}
 
 import http from "http";
 import mongoose from "mongoose";
