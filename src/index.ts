@@ -1,11 +1,4 @@
 import dotenv from "dotenv";
-// One-line boot probe so we can see what NODE_ENV actually is at
-// runtime. Strips a layer of guessing whenever Railway / a shell /
-// dotenv combine in unexpected ways.
-console.log(
-  `[boot] NODE_ENV=${JSON.stringify(process.env.NODE_ENV)} ` +
-    `RAILWAY_ENVIRONMENT=${JSON.stringify(process.env.RAILWAY_ENVIRONMENT)}`,
-);
 // Only load .env.local in non-prod. On Railway / any prod platform the
 // process env is already populated, and pointing dotenv at a non-existent
 // .env.local prints a confusing "injecting env (0)" warning every boot.
