@@ -17,6 +17,7 @@ import addressRoutes from "./routes/address";
 import paymentRoutes from "./routes/payments";
 import vendorRoutes from "./routes/vendor";
 import vendorBulkRoutes from "./routes/vendorBulk";
+import vendorTeamRoutes from "./routes/vendorTeam";
 import riderRoutes from "./routes/rider";
 import adminRoutes from "./routes/admin";
 import adminPaymentRoutes from "./routes/adminPayments";
@@ -188,6 +189,7 @@ app.use("/api/payments", apiLimiter, paymentRoutes);
 // route, so order doesn't matter as long as paths don't collide
 // (vendorBulk's paths all start with /plants or /bulk-purchases).
 app.use("/api/vendor", apiLimiter, vendorBulkRoutes);
+app.use("/api/vendor", apiLimiter, vendorTeamRoutes);
 app.use("/api/vendor", apiLimiter, vendorRoutes);
 app.use("/api/rider", apiLimiter, riderRoutes);
 app.use("/api/admin", apiLimiter, adminRoutes);
