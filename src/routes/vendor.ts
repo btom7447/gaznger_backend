@@ -1236,7 +1236,19 @@ router.get("/stations/:id/reviews", requireAuth, requireVendor, async (req, res)
 // Body: { stationId?, name?, address?, state?, lga?, isActive?, autoAcceptOrders?, operatingHours?, images?, location? }
 router.patch("/station", requireAuth, requireVendor, async (req, res) => {
   try {
-    const { stationId, name, address, state, lga, isActive, autoAcceptOrders, operatingHours, images, location } = req.body;
+    const {
+      stationId,
+      name,
+      address,
+      state,
+      lga,
+      isActive,
+      autoAcceptOrders,
+      operatingHours,
+      images,
+      location,
+      paymentOptions,
+    } = req.body;
     const update: Record<string, unknown> = {};
     if (name !== undefined) update.name = name;
     if (address !== undefined) update.address = address;
@@ -1252,6 +1264,12 @@ router.patch("/station", requireAuth, requireVendor, async (req, res) => {
     }
     if (location?.lat !== undefined) update["location.lat"] = Number(location.lat);
     if (location?.lng !== undefined) update["location.lng"] = Number(location.lng);
+    // v6 station-edit: payment methods toggles. We persist the raw array
+    // (e.g. ["Card & POS", "Bank transfer", "USSD"]); the customer app
+    // already reads this for the amenity chips on the station detail.
+    if (Array.isArray(paymentOptions)) {
+      update.paymentOptions = paymentOptions.map(String);
+    }
 
     if (Object.keys(update).length === 0) return res.status(400).json({ message: "Nothing to update" });
 
