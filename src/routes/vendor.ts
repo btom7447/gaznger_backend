@@ -455,27 +455,76 @@ router.get("/today", requireAuth, requireVendor, async (req, res) => {
   }
 });
 
-// ===================== GET VENDOR ORDERS (all stations) =====================
+// ===================== GET VENDOR ORDERS (filter pills) =====================
+/**
+ * GET /api/vendor/orders
+ *
+ * v6 filter pills:
+ *   ?filter=all       — every status (default)
+ *   ?filter=new       — pending | confirmed (need rider assignment)
+ *   ?filter=in-flight — any active status downstream of "assigned"
+ *
+ * Optional ?stationId scopes to one station; otherwise spans all the
+ * vendor's stations. ?status= still accepted as raw enum for power
+ * users / admin tooling; it overrides ?filter when both are supplied.
+ *
+ * Returns preformatted preview rows so the mobile OrderRow component
+ * can render straight from the response.
+ */
+const FILTER_STATUS_GROUPS = {
+  all: null as null | string[],
+  new: ["pending", "confirmed"],
+  "in-flight": [
+    "assigned",
+    "in-transit",
+    "at_plant",
+    "refilling",
+    "returning",
+    "arrived",
+    "dispensing",
+    "awaiting_confirmation",
+  ],
+} as const;
+
 router.get("/orders", requireAuth, requireVendor, async (req, res) => {
   try {
     const stations = await GasStation.find({ vendorId: req.userId }).select("_id").lean();
-    if (!stations.length) return res.status(404).json({ message: "No stations found" });
+    if (!stations.length) {
+      return res.status(200).json({ orders: [], total: 0, page: 1, pages: 0 });
+    }
 
-    const stationIds = stations.map((s) => s._id);
-    const { status, stationId, page = "1", limit = "20" } = req.query as Record<string, string>;
+    const allStationIds = stations.map((s) => s._id);
+    const {
+      status,
+      filter: filterName,
+      stationId,
+      page = "1",
+      limit = "20",
+    } = req.query as Record<string, string>;
     const pageNum = Math.max(1, parseInt(page, 10));
     const limitNum = Math.min(50, Math.max(1, parseInt(limit, 10)));
     const skip = (pageNum - 1) * limitNum;
 
-    const filter: Record<string, unknown> = { station: { $in: stationIds } };
-    if (status) filter.status = status;
-    if (stationId) filter.station = stationId;
+    const scopedStationIds =
+      stationId && allStationIds.some((id) => id.toString() === stationId)
+        ? [new mongoose.Types.ObjectId(stationId)]
+        : allStationIds;
 
-    const [orders, total] = await Promise.all([
+    const filter: Record<string, unknown> = { station: { $in: scopedStationIds } };
+    if (status) {
+      filter.status = status;
+    } else if (filterName && filterName in FILTER_STATUS_GROUPS) {
+      const group =
+        FILTER_STATUS_GROUPS[filterName as keyof typeof FILTER_STATUS_GROUPS];
+      if (group) filter.status = { $in: group };
+    }
+
+    const [docs, total] = await Promise.all([
       Order.find(filter)
         .populate("user", "displayName phone")
         .populate("fuel", "name unit")
-        .populate("station", "name")
+        .populate("station", "name address")
+        .populate("deliveryAddress", "street city")
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limitNum)
@@ -483,11 +532,503 @@ router.get("/orders", requireAuth, requireVendor, async (req, res) => {
       Order.countDocuments(filter),
     ]);
 
-    res.json({ orders, total, page: pageNum, pages: Math.ceil(total / limitNum) });
+    const orders = docs.map((o: any) => {
+      const qtyUnit = `${o.quantity ?? 0} ${o.fuel?.unit ?? ""}`.trim();
+      // Address line — prefer deliveryAddress.street, fall back to the
+      // first comma-stripped chunk of station.address.
+      const addr =
+        o.deliveryAddress?.street ??
+        o.station?.address?.split(",")[0]?.trim() ??
+        null;
+      return {
+        id: String(o._id),
+        customer: o.user?.displayName ?? "Customer",
+        phone: o.user?.phone ?? null,
+        fuel: o.fuel?.name ?? "Fuel",
+        qty: qtyUnit,
+        price: `₦${Number(o.totalPrice ?? 0).toLocaleString("en-NG")}`,
+        priceKobo: o.totalPrice ?? 0,
+        status: o.status,
+        addr,
+        riderId: o.riderId ? String(o.riderId) : null,
+        createdAt: o.createdAt,
+        stationName: o.station?.name ?? null,
+        // ETA is computed by the rider's GPS pings during in-transit; we
+        // don't have a reliable static number for the list view, so the
+        // mobile OrderRow accepts null.
+        etaMin: null,
+      };
+    });
+
+    res.json({
+      orders,
+      total,
+      page: pageNum,
+      pages: Math.ceil(total / limitNum),
+    });
   } catch (err) {
     res.status(500).json({ message: "Failed to fetch orders" });
   }
 });
+
+// ===================== GET VENDOR ORDER BY ID =====================
+/**
+ * GET /api/vendor/orders/:id
+ *
+ * Order detail with everything the vendor needs to act on it: customer
+ * (full info), fuel + qty + price math, address, current status,
+ * assigned rider (if any), age. Vendor must own the station the order
+ * belongs to.
+ */
+router.get("/orders/:id", requireAuth, requireVendor, async (req, res) => {
+  try {
+    const stations = await GasStation.find({ vendorId: req.userId })
+      .select("_id")
+      .lean();
+    const stationIds = stations.map((s) => s._id);
+
+    const order = (await Order.findOne({
+      _id: req.params.id,
+      station: { $in: stationIds },
+    })
+      .populate("user", "displayName phone profileImage")
+      .populate("fuel", "name unit")
+      .populate("station", "name address location")
+      .populate("deliveryAddress", "street city state latitude longitude")
+      .populate("riderId", "displayName phone profileImage")
+      .lean()) as any;
+
+    if (!order) return res.status(404).json({ message: "Order not found" });
+
+    // Side-load rider plate + rating when assigned.
+    let riderProfile: { plate?: string; rating?: number } | null = null;
+    if (order.riderId) {
+      const RiderProfile = (await import("../models/RiderProfile")).default;
+      const rp = await RiderProfile.findOne({
+        user:
+          typeof order.riderId === "object" && order.riderId !== null && "_id" in order.riderId
+            ? (order.riderId as any)._id
+            : order.riderId,
+      })
+        .select("vehiclePlate rating")
+        .lean();
+      if (rp) riderProfile = { plate: rp.vehiclePlate, rating: rp.rating };
+    }
+
+    res.json({ ...order, riderProfile });
+  } catch (err) {
+    console.error("[vendor/orders/:id]", err);
+    res.status(500).json({ message: "Failed to fetch order" });
+  }
+});
+
+// ===================== VENDOR RIDERS (roster for assign sheet) =====================
+/**
+ * GET /api/vendor/riders?stationId=<id>
+ *
+ * Roster of riders the vendor can assign. Like /today's team-status,
+ * derived from past 30-day Order assignments at the vendor's stations
+ * until the proper vendor↔rider affiliation model lands in Phase 5.
+ *
+ * Each row carries everything the AssignRiderSheet needs to render:
+ *   id, name, plate, rating, trips, distanceKm (optional), status,
+ *   phone (for the copy action).
+ *
+ * Sorted: active first (so they're visible but greyed in the UI),
+ * idle by rating desc, offline last by lastSeen desc.
+ */
+router.get("/riders", requireAuth, requireVendor, async (req, res) => {
+  try {
+    const stations = await GasStation.find({ vendorId: req.userId })
+      .select("_id location")
+      .lean();
+    const allStationIds = stations.map((s) => s._id);
+    if (!allStationIds.length) {
+      return res.status(200).json({ riders: [] });
+    }
+
+    const { stationId } = req.query as { stationId?: string };
+    const scopedStationIds =
+      stationId && allStationIds.some((id) => id.toString() === stationId)
+        ? [new mongoose.Types.ObjectId(stationId)]
+        : allStationIds;
+
+    // Active-status set — same shape as /today.
+    const ACTIVE_STATUSES = [
+      "pending",
+      "confirmed",
+      "assigned",
+      "in-transit",
+      "at_plant",
+      "refilling",
+      "returning",
+      "arrived",
+      "dispensing",
+      "awaiting_confirmation",
+    ];
+
+    // Riders who delivered orders at any of these stations in the last
+    // 30 days. Same heuristic as /today's team count.
+    const THIRTY_DAYS_AGO = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const riderIds = await Order.distinct("riderId", {
+      station: { $in: allStationIds },
+      riderId: { $exists: true },
+      deliveredAt: { $gte: THIRTY_DAYS_AGO },
+    });
+    if (!riderIds.length) {
+      return res.status(200).json({ riders: [] });
+    }
+
+    const RiderProfile = (await import("../models/RiderProfile")).default;
+    const [users, profiles, activeOnOrder, tripCounts] = await Promise.all([
+      User.find({ _id: { $in: riderIds } })
+        .select("displayName phone profileImage")
+        .lean(),
+      RiderProfile.find({ user: { $in: riderIds } })
+        .select("user isAvailable vehiclePlate rating currentLocation")
+        .lean(),
+      Order.distinct("riderId", {
+        station: { $in: scopedStationIds },
+        status: { $in: ACTIVE_STATUSES },
+        riderId: { $in: riderIds },
+      }),
+      Order.aggregate([
+        {
+          $match: {
+            riderId: { $in: riderIds },
+            station: { $in: scopedStationIds },
+            status: "delivered",
+          },
+        },
+        { $group: { _id: "$riderId", trips: { $sum: 1 } } },
+      ]),
+    ]);
+
+    const activeSet = new Set(activeOnOrder.map((r) => String(r)));
+    const tripsById = new Map(
+      tripCounts.map((t: any) => [String(t._id), t.trips as number]),
+    );
+    const userById = new Map(users.map((u: any) => [String(u._id), u]));
+    const profileById = new Map(
+      profiles.map((p: any) => [String(p.user), p]),
+    );
+
+    // Optional distance — only when we have a single-station scope and
+    // that station has coords. Cheap haversine in JS.
+    const scopedStation =
+      stationId && scopedStationIds.length === 1
+        ? stations.find((s) => s._id.toString() === stationId)
+        : null;
+    const stationCoord =
+      scopedStation?.location?.lat && scopedStation?.location?.lng
+        ? { lat: scopedStation.location.lat, lng: scopedStation.location.lng }
+        : null;
+    const haversineKm = (
+      a: { lat: number; lng: number },
+      b: { lat: number; lng: number },
+    ) => {
+      const R = 6371;
+      const dLat = ((b.lat - a.lat) * Math.PI) / 180;
+      const dLng = ((b.lng - a.lng) * Math.PI) / 180;
+      const x =
+        Math.sin(dLat / 2) ** 2 +
+        Math.cos((a.lat * Math.PI) / 180) *
+          Math.cos((b.lat * Math.PI) / 180) *
+          Math.sin(dLng / 2) ** 2;
+      return 2 * R * Math.asin(Math.sqrt(x));
+    };
+
+    const rows = riderIds.map((rid) => {
+      const id = String(rid);
+      const u = userById.get(id);
+      const p = profileById.get(id);
+      const isActive = activeSet.has(id);
+      const isAvailable = !!p?.isAvailable;
+      const status: "active" | "idle" | "offline" = isActive
+        ? "active"
+        : isAvailable
+          ? "idle"
+          : "offline";
+      const distanceKm =
+        stationCoord && p?.currentLocation?.lat && p?.currentLocation?.lng
+          ? Number(
+              haversineKm(stationCoord, {
+                lat: p.currentLocation.lat,
+                lng: p.currentLocation.lng,
+              }).toFixed(1),
+            )
+          : null;
+      return {
+        id,
+        name: u?.displayName ?? "Rider",
+        phone: u?.phone ?? null,
+        plate: p?.vehiclePlate ?? null,
+        rating: typeof p?.rating === "number" ? p.rating : null,
+        trips: tripsById.get(id) ?? 0,
+        distanceKm,
+        status,
+      };
+    });
+
+    // Sort: idle first (by rating desc, then nearest), active next, offline last.
+    rows.sort((a, b) => {
+      const rank = (r: typeof a) =>
+        r.status === "idle" ? 0 : r.status === "active" ? 1 : 2;
+      if (rank(a) !== rank(b)) return rank(a) - rank(b);
+      if (a.status === "idle" && b.status === "idle") {
+        const ra = a.rating ?? 0;
+        const rb = b.rating ?? 0;
+        if (ra !== rb) return rb - ra;
+        const da = a.distanceKm ?? Infinity;
+        const db = b.distanceKm ?? Infinity;
+        return da - db;
+      }
+      return 0;
+    });
+
+    res.json({ riders: rows });
+  } catch (err) {
+    console.error("[vendor/riders]", err);
+    res.status(500).json({ message: "Failed to fetch riders" });
+  }
+});
+
+// ===================== ASSIGN RIDER (vendor manual override) =====================
+/**
+ * PATCH /api/vendor/orders/:id/assign  { riderId }
+ *
+ * Vendor explicitly picks a rider. Allowed when order is in
+ * "pending" or "confirmed" with no current riderId, OR via /reassign
+ * for orders that already have a rider.
+ *
+ * Side effects:
+ *   - Order.status → "assigned"
+ *   - Order.riderId → req.body.riderId
+ *   - Order.riderAssignedAt → now
+ *   - Delete any pending broadcast Delivery rows for this order so
+ *     the auto-dispatch cron doesn't fight us.
+ *   - Create a single Delivery row for the picked rider (status:
+ *     "accepted" — the rider didn't accept via broadcast, but the
+ *     vendor's manual assign is equivalent for downstream code).
+ *   - Emit socket order:update to customer + delivery:dispatch to rider.
+ */
+router.patch("/orders/:id/assign", requireAuth, requireVendor, async (req, res) => {
+  try {
+    const { riderId } = req.body as { riderId?: string };
+    if (!riderId) return res.status(400).json({ message: "riderId required" });
+
+    const stations = await GasStation.find({ vendorId: req.userId })
+      .select("_id")
+      .lean();
+    const stationIds = stations.map((s) => s._id);
+
+    const order = await Order.findOne({
+      _id: req.params.id,
+      station: { $in: stationIds },
+    });
+    if (!order) return res.status(404).json({ message: "Order not found" });
+
+    // Only assignable while no rider is committed yet. /reassign covers
+    // the "rider already assigned, swap them" case.
+    if (
+      !["pending", "confirmed"].includes(order.status) ||
+      order.riderId
+    ) {
+      return res.status(409).json({
+        message: "Order is no longer in an assignable state",
+      });
+    }
+
+    const Delivery = (await import("../models/Delivery")).default;
+    await Delivery.deleteMany({ order: order._id, status: "pending" });
+
+    const delivery = await Delivery.create({
+      order: order._id,
+      rider: riderId,
+      station: order.station,
+      status: "accepted",
+      riderEarnings: 0,
+      platformEarnings: 0,
+    });
+
+    order.status = "assigned";
+    order.riderId = new mongoose.Types.ObjectId(riderId);
+    order.riderAssignedAt = new Date();
+    await order.save();
+
+    // Socket — customer hears the new rider, rider hears the new gig.
+    emitToUser(order.user.toString(), "order:update", {
+      orderId: String(order._id),
+      status: "assigned",
+      riderId,
+    });
+    emitToUser(riderId, "delivery:dispatch", {
+      deliveryId: delivery._id,
+      orderId: order._id,
+    });
+    notifyUser(
+      riderId,
+      "dispatch",
+      "New delivery assigned",
+      "Open the app to start the trip.",
+    ).catch(() => {});
+
+    res.json({ order, delivery });
+  } catch (err) {
+    console.error("[vendor/orders/:id/assign]", err);
+    res.status(500).json({ message: "Failed to assign rider" });
+  }
+});
+
+// ===================== REASSIGN RIDER (mid-flight swap) =====================
+/**
+ * PATCH /api/vendor/orders/:id/reassign  { riderId }
+ *
+ * Vendor swaps the rider on an already-assigned order. Permitted only
+ * before pickup ("assigned" / "in-transit"). The previous rider's
+ * Delivery row is moved to "dropped" so settlement math stays honest.
+ */
+router.patch(
+  "/orders/:id/reassign",
+  requireAuth,
+  requireVendor,
+  async (req, res) => {
+    try {
+      const { riderId } = req.body as { riderId?: string };
+      if (!riderId) return res.status(400).json({ message: "riderId required" });
+
+      const stations = await GasStation.find({ vendorId: req.userId })
+        .select("_id")
+        .lean();
+      const stationIds = stations.map((s) => s._id);
+
+      const order = await Order.findOne({
+        _id: req.params.id,
+        station: { $in: stationIds },
+      });
+      if (!order) return res.status(404).json({ message: "Order not found" });
+
+      if (!["assigned", "in-transit"].includes(order.status)) {
+        return res.status(409).json({
+          message: "Order is past the point where rider can be swapped",
+        });
+      }
+      if (order.riderId?.toString() === riderId) {
+        return res.status(409).json({ message: "Already this rider" });
+      }
+
+      const Delivery = (await import("../models/Delivery")).default;
+      // Mark the previous rider's delivery dropped.
+      if (order.riderId) {
+        await Delivery.updateMany(
+          { order: order._id, rider: order.riderId, status: { $in: ["accepted", "picked_up"] } },
+          { $set: { status: "dropped" } },
+        );
+      }
+
+      const delivery = await Delivery.create({
+        order: order._id,
+        rider: riderId,
+        station: order.station,
+        status: "accepted",
+        riderEarnings: 0,
+        platformEarnings: 0,
+      });
+
+      const previousRiderId = order.riderId?.toString();
+      order.riderId = new mongoose.Types.ObjectId(riderId);
+      order.riderAssignedAt = new Date();
+      // Status stays "assigned" — reassign before pickup; downstream
+      // events flip status as the new rider progresses.
+      order.status = "assigned";
+      await order.save();
+
+      emitToUser(order.user.toString(), "order:update", {
+        orderId: String(order._id),
+        status: "assigned",
+        riderId,
+      });
+      emitToUser(riderId, "delivery:dispatch", {
+        deliveryId: delivery._id,
+        orderId: order._id,
+      });
+      if (previousRiderId) {
+        emitToUser(previousRiderId, "delivery:cancelled", {
+          orderId: String(order._id),
+        });
+      }
+
+      res.json({ order, delivery });
+    } catch (err) {
+      console.error("[vendor/orders/:id/reassign]", err);
+      res.status(500).json({ message: "Failed to reassign rider" });
+    }
+  },
+);
+
+// ===================== CANCEL ORDER (vendor-initiated) =====================
+/**
+ * PATCH /api/vendor/orders/:id/cancel  { reason? }
+ *
+ * Vendor cancels — typically because tanks ran dry or station is
+ * closing early. Allowed for any pre-delivery status. Refund flow runs
+ * server-side on the customer side via Payment.refund (out of scope
+ * for this slice; payment routes already handle it).
+ */
+router.patch(
+  "/orders/:id/cancel",
+  requireAuth,
+  requireVendor,
+  async (req, res) => {
+    try {
+      const { reason } = req.body as { reason?: string };
+      const stations = await GasStation.find({ vendorId: req.userId })
+        .select("_id")
+        .lean();
+      const stationIds = stations.map((s) => s._id);
+
+      const order = await Order.findOne({
+        _id: req.params.id,
+        station: { $in: stationIds },
+      });
+      if (!order) return res.status(404).json({ message: "Order not found" });
+
+      const TERMINAL = ["delivered", "cancelled"];
+      if (TERMINAL.includes(order.status)) {
+        return res.status(409).json({
+          message: "Order is already terminal",
+        });
+      }
+
+      order.status = "cancelled";
+      order.cancellationReason = reason?.trim() || "Vendor cancelled";
+      await order.save();
+
+      // Tidy: drop any in-flight Delivery rows.
+      const Delivery = (await import("../models/Delivery")).default;
+      await Delivery.updateMany(
+        { order: order._id, status: { $in: ["pending", "accepted", "picked_up"] } },
+        { $set: { status: "dropped" } },
+      );
+
+      emitToUser(order.user.toString(), "order:update", {
+        orderId: String(order._id),
+        status: "cancelled",
+      });
+      notifyUser(
+        order.user.toString(),
+        "cancelled",
+        "Order cancelled",
+        order.cancellationReason,
+      ).catch(() => {});
+
+      res.json({ order });
+    } catch (err) {
+      console.error("[vendor/orders/:id/cancel]", err);
+      res.status(500).json({ message: "Failed to cancel order" });
+    }
+  },
+);
 
 // ===================== CONFIRM ORDER =====================
 router.patch("/orders/:id/confirm", requireAuth, requireVendor, async (req, res) => {
