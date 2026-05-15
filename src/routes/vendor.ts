@@ -177,6 +177,284 @@ router.patch("/profile/picture", requireAuth, requireVendor, upload.single("imag
   }
 });
 
+// ===================== TODAY (hero) =====================
+/**
+ * GET /api/vendor/today?stationId=<id>
+ *
+ * Aggregated snapshot for the Vendor Today (hero) screen. Scoped to a
+ * single station — vendor app sends the active station id from
+ * useVendorStationStore. Falls back to "all stations owned by this
+ * vendor" when stationId is omitted.
+ *
+ * Response shape (one round-trip, mobile renders the hero immediately):
+ *
+ *   {
+ *     stationName: string | null,
+ *     revenueToday: number,        // NGN whole units (not kobo)
+ *     breakdown: {
+ *       ordersDone: number,        // delivered today
+ *       ordersInFlight: number,    // confirmed | assigned | in-transit | ...
+ *       bulkInTransit: number,     // bulk fuel purchases mid-pipeline
+ *     },
+ *     alerts: Array<{
+ *       id: string,
+ *       tone: "warning" | "info" | "success" | "error" | "primary",
+ *       title: string,
+ *       sub?: string,
+ *       cta?: string,
+ *       route?: string,            // mobile pushes this on chip tap
+ *     }>,
+ *     nextOrder: { ... } | null,   // oldest unassigned order in queue
+ *     teamStatus: {
+ *       active: number,            // riders currently on an order at this station
+ *       idle: number,               // available, not on order
+ *       offline: number,            // ever delivered here, currently unavailable
+ *     },
+ *     queue: Array<OrderPreview>,  // up to 3 most-recent queue rows
+ *   }
+ *
+ * "Team" infers from past Order assignments. Proper Team model lands
+ * in Phase 5 with a vendor↔rider affiliation document; until then a
+ * rider is "on this vendor's team" iff they've delivered an order at
+ * one of this vendor's stations in the last 30 days.
+ */
+router.get("/today", requireAuth, requireVendor, async (req, res) => {
+  try {
+    const stations = await GasStation.find({ vendorId: req.userId })
+      .select("_id name")
+      .lean();
+    if (!stations.length) {
+      return res.status(200).json({
+        stationName: null,
+        revenueToday: 0,
+        breakdown: { ordersDone: 0, ordersInFlight: 0, bulkInTransit: 0 },
+        alerts: [],
+        nextOrder: null,
+        teamStatus: { active: 0, idle: 0, offline: 0 },
+        queue: [],
+      });
+    }
+
+    const allStationIds = stations.map((s) => s._id);
+    const { stationId } = req.query as { stationId?: string };
+    const scopedStationIds =
+      stationId && allStationIds.some((id) => id.toString() === stationId)
+        ? [new mongoose.Types.ObjectId(stationId)]
+        : allStationIds;
+    const stationName =
+      stationId && scopedStationIds.length === 1
+        ? stations.find((s) => s._id.toString() === stationId)?.name ?? null
+        : null;
+
+    // Day boundary in Africa/Lagos (UTC+1, no DST). Mongo timestamps are
+    // UTC; we shift the window so "today" matches local-time perception.
+    const now = new Date();
+    const lagosOffsetMin = -60; // UTC+1 → offset of UTC FROM Lagos is -60
+    const lagosNow = new Date(now.getTime() - lagosOffsetMin * 60_000);
+    const startOfLagosDay = new Date(
+      Date.UTC(
+        lagosNow.getUTCFullYear(),
+        lagosNow.getUTCMonth(),
+        lagosNow.getUTCDate(),
+      ) +
+        lagosOffsetMin * 60_000,
+    );
+
+    const ACTIVE_STATUSES = [
+      "pending",
+      "confirmed",
+      "assigned",
+      "in-transit",
+      "at_plant",
+      "refilling",
+      "returning",
+      "arrived",
+      "dispensing",
+      "awaiting_confirmation",
+    ];
+
+    // Parallel fan-out — every count is a Mongo COUNT() under the hood.
+    const [
+      ordersDone,
+      ordersInFlight,
+      revenueAgg,
+      nextOrderDoc,
+      queueDocs,
+      bulkInTransitDoc,
+    ] = await Promise.all([
+      Order.countDocuments({
+        station: { $in: scopedStationIds },
+        status: "delivered",
+        deliveredAt: { $gte: startOfLagosDay },
+      }),
+      Order.countDocuments({
+        station: { $in: scopedStationIds },
+        status: { $in: ACTIVE_STATUSES },
+      }),
+      Order.aggregate([
+        {
+          $match: {
+            station: { $in: scopedStationIds },
+            status: "delivered",
+            deliveredAt: { $gte: startOfLagosDay },
+          },
+        },
+        // Sum the vendor-relevant slice of each order: fuelCost. We
+        // intentionally don't include deliveryFee (that's the rider's)
+        // or serviceFee (that's the platform's).
+        { $group: { _id: null, total: { $sum: "$fuelCost" } } },
+      ]),
+      Order.findOne({
+        station: { $in: scopedStationIds },
+        status: { $in: ["pending", "confirmed"] },
+        riderId: { $exists: false },
+      })
+        .sort({ createdAt: 1 })
+        .populate("user", "displayName")
+        .populate("fuel", "name unit")
+        .populate("station", "name")
+        .lean(),
+      Order.find({
+        station: { $in: scopedStationIds },
+        status: { $in: ACTIVE_STATUSES },
+      })
+        .sort({ createdAt: -1 })
+        .limit(3)
+        .populate("user", "displayName")
+        .populate("fuel", "name unit")
+        .populate("station", "name")
+        .lean(),
+      // Bulk fuel purchases mid-pipeline.
+      (async () => {
+        try {
+          const FuelPlantOrder = (await import("../models/FuelPlantOrder"))
+            .default;
+          return await FuelPlantOrder.countDocuments({
+            vendor: req.userId,
+            status: { $in: ["pending", "confirmed", "in-transit"] },
+          });
+        } catch {
+          return 0;
+        }
+      })(),
+    ]);
+
+    const revenueToday = revenueAgg[0]?.total ?? 0;
+
+    // Map nextOrder + queue into a slim shape the mobile renders directly.
+    const orderToPreview = (o: any) => ({
+      id: String(o._id),
+      customer: o.user?.displayName ?? "Customer",
+      fuel: o.fuel?.name ?? "Fuel",
+      qty: `${o.quantity ?? 0} ${o.fuel?.unit ?? ""}`.trim(),
+      price: `₦${Number(o.totalPrice ?? 0).toLocaleString("en-NG")}`,
+      status: o.status,
+      etaMin: null,
+      addr: o.station?.name ?? null,
+    });
+
+    // Team status — riders who delivered at this vendor's stations in
+    // the last 30 days. Bucket by current availability.
+    const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+    const thirtyDaysAgo = new Date(Date.now() - THIRTY_DAYS_MS);
+    const riderIds = await Order.distinct("riderId", {
+      station: { $in: scopedStationIds },
+      riderId: { $exists: true },
+      deliveredAt: { $gte: thirtyDaysAgo },
+    });
+
+    let teamActive = 0;
+    let teamIdle = 0;
+    let teamOffline = 0;
+    if (riderIds.length > 0) {
+      const RiderProfile = (await import("../models/RiderProfile")).default;
+      const [profiles, activeOnOrder] = await Promise.all([
+        RiderProfile.find({ user: { $in: riderIds } })
+          .select("user isAvailable")
+          .lean(),
+        Order.distinct("riderId", {
+          station: { $in: scopedStationIds },
+          status: { $in: ACTIVE_STATUSES },
+          riderId: { $in: riderIds },
+        }),
+      ]);
+      const activeSet = new Set(activeOnOrder.map((r) => String(r)));
+      for (const p of profiles) {
+        if (activeSet.has(String(p.user))) teamActive += 1;
+        else if (p.isAvailable) teamIdle += 1;
+        else teamOffline += 1;
+      }
+    }
+
+    // Alerts — derived from queue state + station inventory.
+    const alerts: Array<{
+      id: string;
+      tone: "warning" | "info" | "success" | "error" | "primary";
+      title: string;
+      sub?: string;
+      cta?: string;
+      route?: string;
+    }> = [];
+
+    // (a) Pending > 90s and unassigned.
+    if (nextOrderDoc) {
+      const ageSec =
+        (Date.now() - new Date((nextOrderDoc as any).createdAt).getTime()) /
+        1000;
+      if (ageSec > 90) {
+        alerts.push({
+          id: "pending-unassigned",
+          tone: "warning",
+          title: "Pending > 90s",
+          sub: "Tap to assign a rider.",
+          cta: "Assign",
+          route: "/(vendor)/(orders)",
+        });
+      }
+    }
+
+    // (b) Stale dispatch — any order in 'confirmed' for > 5 min with no rider.
+    const FIVE_MIN_AGO = new Date(Date.now() - 5 * 60 * 1000);
+    const staleDispatchCount = await Order.countDocuments({
+      station: { $in: scopedStationIds },
+      status: "confirmed",
+      riderId: { $exists: false },
+      createdAt: { $lt: FIVE_MIN_AGO },
+    });
+    if (staleDispatchCount > 0) {
+      alerts.push({
+        id: "stale-dispatch",
+        tone: "warning",
+        title: `${staleDispatchCount} order${staleDispatchCount === 1 ? "" : "s"} need a rider`,
+        sub: "Auto-dispatch hasn't matched yet.",
+        cta: "Open",
+        route: "/(vendor)/(orders)",
+      });
+    }
+
+    res.json({
+      stationName,
+      revenueToday,
+      breakdown: {
+        ordersDone,
+        ordersInFlight,
+        bulkInTransit: bulkInTransitDoc ?? 0,
+      },
+      alerts,
+      nextOrder: nextOrderDoc ? orderToPreview(nextOrderDoc) : null,
+      teamStatus: {
+        active: teamActive,
+        idle: teamIdle,
+        offline: teamOffline,
+      },
+      queue: queueDocs.map(orderToPreview),
+    });
+  } catch (err) {
+    console.error("[vendor/today]", err);
+    res.status(500).json({ message: "Failed to fetch today snapshot" });
+  }
+});
+
 // ===================== GET VENDOR ORDERS (all stations) =====================
 router.get("/orders", requireAuth, requireVendor, async (req, res) => {
   try {
