@@ -16,6 +16,7 @@ import notificationRoutes from "./routes/notifications";
 import addressRoutes from "./routes/address";
 import paymentRoutes from "./routes/payments";
 import vendorRoutes from "./routes/vendor";
+import vendorBulkRoutes from "./routes/vendorBulk";
 import riderRoutes from "./routes/rider";
 import adminRoutes from "./routes/admin";
 import adminPaymentRoutes from "./routes/adminPayments";
@@ -182,6 +183,11 @@ app.use("/api/orders", apiLimiter, orderRoutes);
 app.use("/api/notifications", apiLimiter, notificationRoutes);
 app.use("/api/address-book", apiLimiter, addressRoutes);
 app.use("/api/payments", apiLimiter, paymentRoutes);
+// Phase 4 bulk routes mounted on the same /api/vendor base so the
+// mobile client speaks one root URL. Express picks the first matching
+// route, so order doesn't matter as long as paths don't collide
+// (vendorBulk's paths all start with /plants or /bulk-purchases).
+app.use("/api/vendor", apiLimiter, vendorBulkRoutes);
 app.use("/api/vendor", apiLimiter, vendorRoutes);
 app.use("/api/rider", apiLimiter, riderRoutes);
 app.use("/api/admin", apiLimiter, adminRoutes);
