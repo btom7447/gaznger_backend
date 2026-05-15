@@ -18,6 +18,7 @@ import paymentRoutes from "./routes/payments";
 import vendorRoutes from "./routes/vendor";
 import vendorBulkRoutes from "./routes/vendorBulk";
 import vendorTeamRoutes from "./routes/vendorTeam";
+import vendorFinanceRoutes from "./routes/vendorFinance";
 import riderRoutes from "./routes/rider";
 import adminRoutes from "./routes/admin";
 import adminPaymentRoutes from "./routes/adminPayments";
@@ -190,6 +191,7 @@ app.use("/api/payments", apiLimiter, paymentRoutes);
 // (vendorBulk's paths all start with /plants or /bulk-purchases).
 app.use("/api/vendor", apiLimiter, vendorBulkRoutes);
 app.use("/api/vendor", apiLimiter, vendorTeamRoutes);
+app.use("/api/vendor", apiLimiter, vendorFinanceRoutes);
 app.use("/api/vendor", apiLimiter, vendorRoutes);
 app.use("/api/rider", apiLimiter, riderRoutes);
 app.use("/api/admin", apiLimiter, adminRoutes);
