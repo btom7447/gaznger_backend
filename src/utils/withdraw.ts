@@ -74,7 +74,32 @@ export async function handleWithdrawRequest(
     // Gate: bank account + KYC
     let bankAccount: any;
     if (role === "vendor") {
-      if (!user.vendorBankAccount?.accountNumber) {
+      // Multi-bank support (Phase 6): caller can pass `bankAccountId`
+      // to pick a specific saved bank. If omitted, fall back to the
+      // user's vendorBankAccount mirror (legacy single-bank field).
+      const requestedBankId = (req.body as any)?.bankAccountId as
+        | string
+        | undefined;
+      if (requestedBankId) {
+        const BankAccount = (await import("../models/BankAccount")).default;
+        const picked = await BankAccount.findOne({
+          _id: requestedBankId,
+          user: req.userId,
+        }).lean();
+        if (!picked) {
+          return res
+            .status(404)
+            .json({ message: "Bank account not found" });
+        }
+        bankAccount = {
+          bankName: picked.bankName,
+          accountNumber: picked.accountNumber,
+          accountName: picked.accountName,
+          bankCode: picked.bankCode,
+        };
+      } else if (user.vendorBankAccount?.accountNumber) {
+        bankAccount = user.vendorBankAccount;
+      } else {
         return res
           .status(400)
           .json({ message: "Add a bank account before requesting a payout" });
@@ -84,7 +109,6 @@ export async function handleWithdrawRequest(
           message: "Vendor verification required before withdrawals",
         });
       }
-      bankAccount = user.vendorBankAccount;
     } else {
       const profile = await RiderProfile.findOne({ user: req.userId }).lean();
       if (!profile?.bankAccount?.accountNumber) {
