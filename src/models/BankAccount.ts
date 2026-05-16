@@ -11,6 +11,13 @@ import mongoose, { Schema, Document } from "mongoose";
  */
 export interface IBankAccount extends Document {
   user: mongoose.Types.ObjectId;
+  /**
+   * Station this bank account settles for. Optional for backwards
+   * compatibility with rows created before the bank↔station link;
+   * those legacy rows show up as "unassigned" in the UI until the
+   * vendor edits them. New rows should always include it.
+   */
+  station?: mongoose.Types.ObjectId;
   /** Bank short name (display). */
   bankName: string;
   /** Paystack/CBN bank code (e.g. "058" for GTBank). */
@@ -21,7 +28,11 @@ export interface IBankAccount extends Document {
   accountName: string;
   /** Paystack transfer-recipient code (cached after first successful withdraw). */
   paystackRecipientCode?: string;
-  /** Whether this account is the default for payouts. */
+  /**
+   * Whether this account is the primary destination FOR ITS STATION.
+   * Each station has at most one primary bank; the partial unique
+   * index below enforces that.
+   */
   isPrimary: boolean;
   /** BVN-match verification result. */
   bvnVerified: boolean;
@@ -32,6 +43,7 @@ export interface IBankAccount extends Document {
 const BankAccountSchema: Schema = new Schema(
   {
     user: { type: Schema.Types.ObjectId, ref: "User", required: true },
+    station: { type: Schema.Types.ObjectId, ref: "GasStation" },
     bankName: { type: String, required: true },
     bankCode: { type: String, required: true },
     accountNumber: { type: String, required: true },
@@ -44,9 +56,17 @@ const BankAccountSchema: Schema = new Schema(
 );
 
 BankAccountSchema.index({ user: 1 });
+BankAccountSchema.index({ user: 1, station: 1 });
+// At most one primary bank per station. Legacy rows with no station
+// (null) fall outside the partial index, so they don't collide.
 BankAccountSchema.index(
-  { user: 1, isPrimary: 1 },
-  { partialFilterExpression: { isPrimary: true } },
+  { station: 1, isPrimary: 1 },
+  {
+    partialFilterExpression: {
+      isPrimary: true,
+      station: { $exists: true },
+    },
+  },
 );
 BankAccountSchema.index(
   { user: 1, bankCode: 1, accountNumber: 1 },
