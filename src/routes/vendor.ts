@@ -227,7 +227,16 @@ router.get("/today", requireAuth, requireVendor, async (req, res) => {
       return res.status(200).json({
         stationName: null,
         revenueToday: 0,
-        breakdown: { ordersDone: 0, ordersInFlight: 0, bulkInTransit: 0 },
+        revenueYesterday: 0,
+        prevDayLabel: "",
+        ordersTotal: 0,
+        breakdown: {
+          ordersQueue: 0,
+          ordersDone: 0,
+          ordersInFlight: 0,
+          bulkInTransit: 0,
+        },
+        perStation: [],
         alerts: [],
         nextOrder: null,
         teamStatus: { active: 0, idle: 0, offline: 0 },
@@ -259,6 +268,14 @@ router.get("/today", requireAuth, requireVendor, async (req, res) => {
       ) +
         lagosOffsetMin * 60_000,
     );
+    const startOfPrevLagosDay = new Date(
+      startOfLagosDay.getTime() - 24 * 60 * 60 * 1000,
+    );
+    // Three-letter weekday for the prev day in Lagos local time. The
+    // hero card renders this as "vs Mon" etc.
+    const prevLagosDay = new Date(lagosNow.getTime() - 24 * 60 * 60 * 1000);
+    const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const prevDayLabel = WEEKDAYS[prevLagosDay.getUTCDay()] ?? "";
 
     const ACTIVE_STATUSES = [
       "pending",
@@ -277,7 +294,9 @@ router.get("/today", requireAuth, requireVendor, async (req, res) => {
     const [
       ordersDone,
       ordersInFlight,
+      ordersQueue,
       revenueAgg,
+      revenueYesterdayAgg,
       nextOrderDoc,
       queueDocs,
       bulkInTransitDoc,
@@ -291,6 +310,13 @@ router.get("/today", requireAuth, requireVendor, async (req, res) => {
         station: { $in: scopedStationIds },
         status: { $in: ACTIVE_STATUSES },
       }),
+      // Queue = pending/confirmed orders awaiting a rider. The hero card
+      // surfaces this as the leftmost stat tile.
+      Order.countDocuments({
+        station: { $in: scopedStationIds },
+        status: { $in: ["pending", "confirmed"] },
+        riderId: { $exists: false },
+      }),
       Order.aggregate([
         {
           $match: {
@@ -302,6 +328,20 @@ router.get("/today", requireAuth, requireVendor, async (req, res) => {
         // Sum the vendor-relevant slice of each order: fuelCost. We
         // intentionally don't include deliveryFee (that's the rider's)
         // or serviceFee (that's the platform's).
+        { $group: { _id: null, total: { $sum: "$fuelCost" } } },
+      ]),
+      // Yesterday's same slice — drives the "vs Mon" comparison.
+      Order.aggregate([
+        {
+          $match: {
+            station: { $in: scopedStationIds },
+            status: "delivered",
+            deliveredAt: {
+              $gte: startOfPrevLagosDay,
+              $lt: startOfLagosDay,
+            },
+          },
+        },
         { $group: { _id: null, total: { $sum: "$fuelCost" } } },
       ]),
       Order.findOne({
@@ -340,6 +380,83 @@ router.get("/today", requireAuth, requireVendor, async (req, res) => {
     ]);
 
     const revenueToday = revenueAgg[0]?.total ?? 0;
+    const revenueYesterday = revenueYesterdayAgg[0]?.total ?? 0;
+    // "Across N orders" — every order touching today (delivered + in-
+    // flight + queue). Doesn't double-count: queue is unassigned, in-
+    // flight is assigned-or-later, delivered is final.
+    const ordersTotal = ordersDone + ordersInFlight + ordersQueue;
+
+    // Per-station breakdown for the hero carousel. Only computed when
+    // there's more than one station — single-station vendors never see
+    // the carousel so we don't pay for the fan-out. The aggregate above
+    // is the headline card; these become the cards that peek to the
+    // right of it.
+    let perStation: Array<{
+      stationId: string;
+      stationName: string;
+      revenueToday: number;
+      revenueYesterday: number;
+      ordersTotal: number;
+      ordersQueue: number;
+      ordersInFlight: number;
+      ordersDone: number;
+    }> = [];
+    if (stations.length > 1) {
+      perStation = await Promise.all(
+        stations.map(async (s) => {
+          const sid = s._id;
+          const [done, inFlight, queue, revAgg, revYAgg] = await Promise.all([
+            Order.countDocuments({
+              station: sid,
+              status: "delivered",
+              deliveredAt: { $gte: startOfLagosDay },
+            }),
+            Order.countDocuments({
+              station: sid,
+              status: { $in: ACTIVE_STATUSES },
+            }),
+            Order.countDocuments({
+              station: sid,
+              status: { $in: ["pending", "confirmed"] },
+              riderId: { $exists: false },
+            }),
+            Order.aggregate([
+              {
+                $match: {
+                  station: sid,
+                  status: "delivered",
+                  deliveredAt: { $gte: startOfLagosDay },
+                },
+              },
+              { $group: { _id: null, total: { $sum: "$fuelCost" } } },
+            ]),
+            Order.aggregate([
+              {
+                $match: {
+                  station: sid,
+                  status: "delivered",
+                  deliveredAt: {
+                    $gte: startOfPrevLagosDay,
+                    $lt: startOfLagosDay,
+                  },
+                },
+              },
+              { $group: { _id: null, total: { $sum: "$fuelCost" } } },
+            ]),
+          ]);
+          return {
+            stationId: String(sid),
+            stationName: s.name,
+            revenueToday: revAgg[0]?.total ?? 0,
+            revenueYesterday: revYAgg[0]?.total ?? 0,
+            ordersTotal: done + inFlight + queue,
+            ordersQueue: queue,
+            ordersInFlight: inFlight,
+            ordersDone: done,
+          };
+        }),
+      );
+    }
 
     // Map nextOrder + queue into a slim shape the mobile renders directly.
     const orderToPreview = (o: any) => ({
@@ -435,11 +552,16 @@ router.get("/today", requireAuth, requireVendor, async (req, res) => {
     res.json({
       stationName,
       revenueToday,
+      revenueYesterday,
+      prevDayLabel,
+      ordersTotal,
       breakdown: {
+        ordersQueue,
         ordersDone,
         ordersInFlight,
         bulkInTransit: bulkInTransitDoc ?? 0,
       },
+      perStation,
       alerts,
       nextOrder: nextOrderDoc ? orderToPreview(nextOrderDoc) : null,
       teamStatus: {
