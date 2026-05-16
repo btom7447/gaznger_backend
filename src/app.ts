@@ -25,6 +25,7 @@ import adminPaymentRoutes from "./routes/adminPayments";
 import walletRoutes from "./routes/wallet";
 import disputeRoutes from "./routes/disputes";
 import chatRoutes from "./routes/chats";
+import supportRoutes from "./routes/support";
 
 import { startCronJobs } from "./jobs";
 import { errorHandler } from "./middleware/errorHandler";
@@ -200,6 +201,7 @@ app.use("/api/admin", apiLimiter, adminPaymentRoutes);
 app.use("/api/wallet", apiLimiter, walletRoutes);
 app.use("/api/disputes", apiLimiter, disputeRoutes);
 app.use("/api/chats", apiLimiter, chatRoutes);
+app.use("/api", apiLimiter, supportRoutes);
 
 startCronJobs();
 

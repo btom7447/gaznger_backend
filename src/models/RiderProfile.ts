@@ -9,6 +9,13 @@ export interface IBankAccount {
 
 export interface IRiderProfile extends Document {
   user: mongoose.Types.ObjectId;
+  /**
+   * The station this rider is currently bound to. Set on invite-
+   * accept; mutable via `PATCH /vendor/riders/:id/reassign`. A rider
+   * only ever has ONE active home station — dispatch prefers them
+   * for orders out of this station first.
+   */
+  homeStation?: mongoose.Types.ObjectId;
   vehicleType: "motorcycle" | "car" | "truck";
   vehicleBrand?: string;
   vehiclePlate: string;
@@ -36,6 +43,7 @@ export interface IRiderProfile extends Document {
 const RiderProfileSchema: Schema = new Schema(
   {
     user: { type: Schema.Types.ObjectId, ref: "User", required: true, unique: true },
+    homeStation: { type: Schema.Types.ObjectId, ref: "GasStation" },
     vehicleType: {
       type: String,
       enum: ["motorcycle", "car", "truck"],

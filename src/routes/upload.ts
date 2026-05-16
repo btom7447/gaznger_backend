@@ -88,4 +88,92 @@ router.post("/image", requireAuth, upload.single("image"), async (req, res) => {
   }
 });
 
+// ===================== CHAT MEDIA UPLOAD =====================
+/**
+ * POST /api/upload/media  (field: "media")
+ *
+ * Image OR video for chat attachments. Larger size cap than profile
+ * pics (50 MB) so a short phone-shot video fits. Returns:
+ *   { kind, url, thumbUrl, width, height, durationSec?, mime }
+ *
+ * Cloudinary's resource_type:"auto" detects image vs video from the
+ * buffer so we don't have to branch on mime. Videos get a frame-1
+ * JPG thumb via `eager` so the chat grid renders instantly without
+ * triggering a video decode for the poster.
+ */
+
+const CHAT_MIME = [
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/heic",
+  "image/heif",
+  "video/mp4",
+  "video/quicktime",
+];
+
+const chatUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 50 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (CHAT_MIME.includes(file.mimetype)) cb(null, true);
+    else cb(new Error("Unsupported media type"));
+  },
+});
+
+router.post(
+  "/media",
+  requireAuth,
+  chatUpload.single("media"),
+  async (req: any, res) => {
+    try {
+      if (!req.file)
+        return res.status(400).json({ message: "No file uploaded" });
+
+      const isVideo = req.file.mimetype.startsWith("video/");
+      const userId = req.userId;
+      const result = await new Promise<any>((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+          {
+            resource_type: "auto",
+            folder: `users/${userId}/chat`,
+            // For videos, request a frame-1 JPG thumbnail eagerly so
+            // the grid renders without decoding the video.
+            eager: isVideo
+              ? [
+                  {
+                    format: "jpg",
+                    transformation: [
+                      { start_offset: "0", width: 480, crop: "limit" },
+                    ],
+                  },
+                ]
+              : undefined,
+          },
+          (error, r) => {
+            if (error) reject(error);
+            else resolve(r);
+          },
+        );
+        stream.end(req.file!.buffer);
+      });
+
+      res.json({
+        kind: isVideo ? "video" : "image",
+        url: result.secure_url,
+        thumbUrl: isVideo
+          ? result.eager?.[0]?.secure_url ?? null
+          : result.secure_url,
+        width: result.width,
+        height: result.height,
+        durationSec: isVideo ? result.duration ?? null : undefined,
+        mime: req.file.mimetype,
+      });
+    } catch (err) {
+      console.error("[upload/media]", err);
+      res.status(500).json({ message: "Upload failed" });
+    }
+  },
+);
+
 export default router;
