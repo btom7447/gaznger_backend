@@ -27,6 +27,12 @@ export type RiderInviteStatus = "pending" | "accepted" | "expired" | "revoked";
 
 export interface IRiderInvite extends Document {
   vendor: mongoose.Types.ObjectId;
+  /**
+   * Station the rider is being invited to. Riders are bound to one
+   * station at a time; reassign is a separate vendor action against
+   * the rider's profile, not the invite.
+   */
+  station: mongoose.Types.ObjectId;
   /** Phone in E.164 (e.g. +2348012345678). */
   phone: string;
   /** Optional human-friendly note shown to the vendor. */
@@ -46,6 +52,9 @@ const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const RiderInviteSchema: Schema = new Schema(
   {
     vendor: { type: Schema.Types.ObjectId, ref: "User", required: true },
+    // Riders are bound to one station at invite time. Reassign is a
+    // separate post-signup mutation on the RiderProfile.
+    station: { type: Schema.Types.ObjectId, ref: "GasStation", required: true },
     phone: { type: String, required: true, trim: true },
     displayName: { type: String, trim: true },
     token: {

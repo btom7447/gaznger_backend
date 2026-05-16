@@ -53,9 +53,54 @@ export interface IPlatformConfig extends Document {
   maintenanceMode: boolean;
   maintenanceExpectedBackAt?: Date;
 
+  /**
+   * Per-role customer-support config. Drives the shared SupportHub
+   * screen across customer/vendor/rider profiles. Admin web edits
+   * each block independently; mobile reads `GET /api/support-info?role=`.
+   */
+  support: {
+    customer: ISupportBlock;
+    vendor: ISupportBlock;
+    rider: ISupportBlock;
+  };
+
   createdAt: Date;
   updatedAt: Date;
 }
+
+export interface ISupportBlock {
+  /** E.164 phone, e.g. "+2348000000000". Empty hides the row. */
+  phone: string;
+  /** Empty hides the row. */
+  email: string;
+  /** "24/7" or "Mon–Fri 9–5" etc. */
+  hours: string;
+  /** Toggle live-chat tile on/off per role. */
+  liveChatEnabled: boolean;
+  faqs: { q: string; a: string }[];
+}
+
+const SupportBlockSchema = new Schema<ISupportBlock>(
+  {
+    phone: { type: String, default: "" },
+    email: { type: String, default: "" },
+    hours: { type: String, default: "" },
+    liveChatEnabled: { type: Boolean, default: true },
+    faqs: {
+      type: [
+        new Schema(
+          {
+            q: { type: String, required: true },
+            a: { type: String, required: true },
+          },
+          { _id: false },
+        ),
+      ],
+      default: [],
+    },
+  },
+  { _id: false },
+);
 
 const PlatformConfigSchema: Schema<IPlatformConfig> = new Schema(
   {
@@ -76,6 +121,12 @@ const PlatformConfigSchema: Schema<IPlatformConfig> = new Schema(
     minMobileVersion: { type: String, default: "" },
     maintenanceMode: { type: Boolean, default: false },
     maintenanceExpectedBackAt: { type: Date },
+
+    support: {
+      customer: { type: SupportBlockSchema, default: () => ({}) },
+      vendor: { type: SupportBlockSchema, default: () => ({}) },
+      rider: { type: SupportBlockSchema, default: () => ({}) },
+    },
   },
   { timestamps: true }
 );

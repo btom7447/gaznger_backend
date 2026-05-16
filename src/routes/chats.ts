@@ -354,9 +354,28 @@ router.post("/:id/messages", requireAuth, async (req: any, res) => {
       ? req.params.id[0]
       : (req.params.id as string);
     const meId = String(req.userId);
-    const { text } = req.body as { text?: string };
-    if (!text || !text.trim()) {
-      return res.status(400).json({ message: "text required" });
+    const { text, attachments } = req.body as {
+      text?: string;
+      attachments?: Array<{
+        kind: "image" | "video";
+        url: string;
+        thumbUrl?: string;
+        width?: number;
+        height?: number;
+        durationSec?: number;
+        mime?: string;
+      }>;
+    };
+    const cleanText = (text ?? "").trim();
+    const safeAttachments = Array.isArray(attachments)
+      ? attachments
+          .filter((a) => a && (a.kind === "image" || a.kind === "video") && typeof a.url === "string" && a.url)
+          .slice(0, 9)
+      : [];
+    if (!cleanText && safeAttachments.length === 0) {
+      return res
+        .status(400)
+        .json({ message: "text or attachments required" });
     }
 
     const chat = await Chat.findById(idStr);
@@ -370,11 +389,22 @@ router.post("/:id/messages", requireAuth, async (req: any, res) => {
       chat: chat._id,
       sender: new mongoose.Types.ObjectId(meId),
       kind: "text",
-      text: text.trim(),
+      text: cleanText,
+      attachments: safeAttachments,
       readBy: [
         { user: new mongoose.Types.ObjectId(meId), at: new Date() },
       ],
     });
+
+    // Preview line — text wins, otherwise an attachment-count placeholder
+    // so the thread list shows "📷 Photo" / "🎥 Video" / "📎 N attachments".
+    const preview = cleanText
+      ? cleanText.slice(0, 140)
+      : safeAttachments.length === 1
+        ? safeAttachments[0].kind === "image"
+          ? "📷 Photo"
+          : "🎥 Video"
+        : `📎 ${safeAttachments.length} attachments`;
 
     // Bump unread for every OTHER participant; reset for me.
     (chat as any).participants = (chat as any).participants.map((p: any) => {
@@ -384,7 +414,7 @@ router.post("/:id/messages", requireAuth, async (req: any, res) => {
       return { ...p, unread: (p.unread ?? 0) + 1 };
     });
     (chat as any).lastMessageAt = (msg as any).createdAt;
-    (chat as any).lastMessagePreview = text.trim().slice(0, 140);
+    (chat as any).lastMessagePreview = preview;
     await chat.save();
 
     // Emit to every participant (including sender, for multi-device).
@@ -398,6 +428,59 @@ router.post("/:id/messages", requireAuth, async (req: any, res) => {
   } catch (err) {
     console.error("[chats send]", err);
     res.status(500).json({ message: "Failed to send" });
+  }
+});
+
+// ===================== SOFT-DELETE MESSAGE =====================
+/**
+ * DELETE /api/chats/:id/messages/:mid
+ *
+ * Sender soft-deletes their own message. Row stays in Mongo with
+ * `deletedAt`/`deletedBy` set; client renders a tombstone bubble.
+ * Admin can delete any message in any thread.
+ */
+router.delete("/:id/messages/:mid", requireAuth, async (req: any, res) => {
+  try {
+    const chatIdStr = Array.isArray(req.params.id)
+      ? req.params.id[0]
+      : (req.params.id as string);
+    const msgIdStr = Array.isArray(req.params.mid)
+      ? req.params.mid[0]
+      : (req.params.mid as string);
+    const meId = String(req.userId);
+
+    const chat = await Chat.findById(chatIdStr);
+    if (!chat) return res.status(404).json({ message: "Thread not found" });
+    if (!(chat as any).participants.some((p: any) => String(p.user) === meId))
+      return res.status(403).json({ message: "Not a participant" });
+
+    const msg = await Message.findOne({ _id: msgIdStr, chat: chatIdStr });
+    if (!msg) return res.status(404).json({ message: "Message not found" });
+    if (msg.deletedAt) return res.json({ message: msg });
+
+    const meRoleVal = meRole(req);
+    if (String(msg.sender ?? "") !== meId && meRoleVal !== "admin") {
+      return res
+        .status(403)
+        .json({ message: "Only the sender can delete this message" });
+    }
+
+    msg.deletedAt = new Date();
+    msg.deletedBy = new mongoose.Types.ObjectId(meId);
+    await msg.save();
+
+    // Broadcast to every participant so threads update in real time.
+    for (const p of (chat as any).participants) {
+      emitToUser(String(p.user), "chat:message-deleted", {
+        chatId: String(chat._id),
+        messageId: String(msg._id),
+        deletedAt: msg.deletedAt,
+      });
+    }
+    res.json({ message: msg });
+  } catch (err) {
+    console.error("[chats delete-message]", err);
+    res.status(500).json({ message: "Failed to delete message" });
   }
 });
 

@@ -235,12 +235,26 @@ router.get("/team", requireAuth, requireVendor, async (req, res) => {
  */
 router.post("/riders/invite", requireAuth, requireVendor, async (req, res) => {
   try {
-    const { phone, displayName } = req.body as {
+    const { phone, displayName, stationId } = req.body as {
       phone?: string;
       displayName?: string;
+      stationId?: string;
     };
     if (!phone || !/^\+?\d{10,15}$/.test(phone.replace(/\s+/g, ""))) {
       return res.status(400).json({ message: "Valid phone required" });
+    }
+    if (!stationId || !mongoose.Types.ObjectId.isValid(stationId)) {
+      return res.status(400).json({ message: "stationId required" });
+    }
+    // Confirm the station belongs to this vendor.
+    const station = await GasStation.findOne({
+      _id: stationId,
+      vendorId: req.userId,
+    }).select("_id").lean();
+    if (!station) {
+      return res
+        .status(403)
+        .json({ message: "Station does not belong to this vendor" });
     }
     const normPhone = phone.startsWith("+") ? phone : `+${phone}`;
 
@@ -251,13 +265,15 @@ router.post("/riders/invite", requireAuth, requireVendor, async (req, res) => {
       status: { $in: ["pending", "accepted"] },
     });
     if (invite && invite.status === "pending") {
-      // Bump TTL.
+      // Bump TTL + allow re-targeting station / name on re-invite.
       invite.expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+      invite.station = new mongoose.Types.ObjectId(stationId);
       if (displayName?.trim()) invite.displayName = displayName.trim();
       await invite.save();
     } else if (!invite) {
       invite = await RiderInvite.create({
         vendor: req.userId,
+        station: stationId,
         phone: normPhone,
         displayName: displayName?.trim() || undefined,
       });
@@ -312,6 +328,73 @@ router.patch(
       res.json({ invite });
     } catch (err) {
       res.status(500).json({ message: "Failed to revoke invite" });
+    }
+  },
+);
+
+// ===================== REASSIGN RIDER STATION =====================
+/**
+ * PATCH /api/vendor/riders/:riderId/reassign { stationId }
+ *
+ * Move a rider's home station. The vendor must own both the rider
+ * (i.e. the rider has an accepted invite from this vendor) and the
+ * target station. Dispatch picks up the new homeStation immediately
+ * on the next order match — no re-invite needed.
+ */
+router.patch(
+  "/riders/:riderId/reassign",
+  requireAuth,
+  requireVendor,
+  async (req, res) => {
+    try {
+      const riderId = Array.isArray(req.params.riderId)
+        ? req.params.riderId[0]
+        : (req.params.riderId as string);
+      const { stationId } = req.body as { stationId?: string };
+      if (!stationId || !mongoose.Types.ObjectId.isValid(stationId)) {
+        return res.status(400).json({ message: "stationId required" });
+      }
+
+      // Confirm the station belongs to this vendor.
+      const station = await GasStation.findOne({
+        _id: stationId,
+        vendorId: req.userId,
+      })
+        .select("_id name")
+        .lean();
+      if (!station) {
+        return res
+          .status(403)
+          .json({ message: "Station does not belong to this vendor" });
+      }
+
+      // Confirm we own this rider — there must be an accepted invite
+      // tying them to this vendor.
+      const invite = await RiderInvite.findOne({
+        vendor: req.userId,
+        acceptedBy: riderId,
+        status: "accepted",
+      })
+        .select("_id")
+        .lean();
+      if (!invite) {
+        return res
+          .status(403)
+          .json({ message: "Rider is not affiliated with this vendor" });
+      }
+
+      const profile = await RiderProfile.findOneAndUpdate(
+        { user: riderId },
+        { $set: { homeStation: stationId } },
+        { new: true },
+      );
+      if (!profile) {
+        return res.status(404).json({ message: "Rider profile not found" });
+      }
+      res.json({ rider: profile, station: { _id: station._id, name: station.name } });
+    } catch (err) {
+      console.error("[vendor/riders/reassign]", err);
+      res.status(500).json({ message: "Failed to reassign rider" });
     }
   },
 );
