@@ -316,11 +316,33 @@ router.get("/earnings/periods", requireAuth, requireVendor, async (req, res) => 
     const total = buckets.reduce((acc, b) => acc + b.value, 0);
     const periodAvg = bucketCount > 0 ? Math.round(total / bucketCount) : 0;
 
+    // Previous-period total — same-shape window immediately preceding
+    // `windowStart`. Drives the "▲ N% vs last week" delta on the
+    // earnings hero.
+    const windowSpanMs = (() => {
+      const { start: firstStart } = bucketBoundaries(0);
+      const { end: lastEnd } = bucketBoundaries(bucketCount - 1);
+      return lastEnd.getTime() - firstStart.getTime();
+    })();
+    const prevStart = new Date(windowStart.getTime() - windowSpanMs);
+    const prevAgg = await Transaction.aggregate([
+      {
+        $match: {
+          wallet: wallet._id,
+          kind: "vendor_earning_credit",
+          createdAt: { $gte: prevStart, $lt: windowStart },
+        },
+      },
+      { $group: { _id: null, total: { $sum: "$amount" } } },
+    ]);
+    const prevTotal = prevAgg[0]?.total ?? 0;
+
     res.json({
       period,
       buckets,
       total,
       periodAvg,
+      prevTotal,
       breakdown: Object.entries(breakdown).map(([label, value]) => ({
         label,
         value,
