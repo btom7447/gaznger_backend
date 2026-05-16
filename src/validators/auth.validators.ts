@@ -31,26 +31,34 @@ export const signupSchema = z.object({
   role: z.enum(["customer", "rider", "vendor"]),
   pin: pin4,
   biometricPreference: z.enum(["face", "touch", "pin"]).optional(),
-  profile: z.object({
-    // Customer fields
-    firstName: z.string().min(2).max(60).optional(),
-    lastName: z.string().min(2).max(60).optional(),
-    email: z.string().email().optional(),
-    // Rider fields
-    fullName: z.string().min(3).max(120).optional(),
-    plate: z.string().min(4).max(20).optional(),
-    vehicleType: z.enum(["motorcycle", "tricycle", "van"]).optional(),
-    // Vendor fields
-    stationName: z.string().min(3).max(120).optional(),
-    licence: z.string().min(6).max(64).optional(),
-    contact: z.string().min(8).max(20).optional(),
-    address: z.string().min(6).max(240).optional(),
-    state: z.string().min(2).max(40).optional(),
-    lga: z.string().max(80).optional(),
-    latitude: z.number().min(-90).max(90).optional(),
-    longitude: z.number().min(-180).max(180).optional(),
-    products: z.array(z.string()).max(8).optional(),
-  }),
+  // Profile is fully optional — the v7 unified onboarding wizard
+  // creates the account with `profile: {}` and fills fields in via
+  // PUT /auth/me + role-specific setup endpoints afterwards. Legacy
+  // signup flows still send the full profile here in one shot.
+  profile: z
+    .object({
+      displayName: z.string().min(2).max(120).optional(),
+      // Customer fields
+      firstName: z.string().min(2).max(60).optional(),
+      lastName: z.string().min(2).max(60).optional(),
+      email: z.string().email().optional(),
+      // Rider fields
+      fullName: z.string().min(3).max(120).optional(),
+      plate: z.string().min(4).max(20).optional(),
+      vehicleType: z.enum(["motorcycle", "tricycle", "van"]).optional(),
+      // Vendor fields
+      stationName: z.string().min(3).max(120).optional(),
+      licence: z.string().min(6).max(64).optional(),
+      contact: z.string().min(8).max(20).optional(),
+      address: z.string().min(6).max(240).optional(),
+      state: z.string().min(2).max(40).optional(),
+      lga: z.string().max(80).optional(),
+      latitude: z.number().min(-90).max(90).optional(),
+      longitude: z.number().min(-180).max(180).optional(),
+      products: z.array(z.string()).max(8).optional(),
+    })
+    .optional()
+    .default({}),
 });
 
 export const phoneLoginSchema = z.object({
@@ -93,9 +101,15 @@ export const adminVerificationDecisionSchema = z.object({
 
 export const updateProfileSchema = z.object({
   displayName: z.string().optional(),
+  email: z.string().email("Invalid email").optional(),
   phone: z.string().refine(val => !val || val.length >= 10, "Phone number must be at least 10 digits").optional(),
   gender: z.enum(["male", "female"]).optional(),
   profileImage: z.string().url("Invalid image URL").optional(),
+  vendorBusinessName: z
+    .string()
+    .min(2, "Business name must be at least 2 characters")
+    .max(120)
+    .optional(),
 
   /**
    * Customer preferences. Each field optional; the route handler patches

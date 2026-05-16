@@ -68,6 +68,12 @@ export interface IUser extends Document {
   otpExpiresAt?: Date;
   isVerified?: boolean;
 
+  /**
+   * Public business name for vendors (e.g. "Abkon Oil Ltd"). Set in
+   * the vendor onboarding wizard's Step 1; surfaced on station cards
+   * + invoices. Customers see this, not the owner's displayName.
+   */
+  vendorBusinessName?: string;
   vendorBankAccount?: { bankName: string; accountNumber: string; accountName: string };
   vendorVerification?: {
     status: "none" | "pending" | "verified" | "rejected";
@@ -242,6 +248,7 @@ const UserSchema: Schema<IUser> = new Schema(
     otpExpiresAt: { type: Date },
     isVerified: { type: Boolean, default: false },
 
+    vendorBusinessName: { type: String, trim: true },
     vendorBankAccount: {
       bankName: { type: String, default: "" },
       accountNumber: { type: String, default: "" },
