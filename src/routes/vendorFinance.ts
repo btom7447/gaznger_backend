@@ -85,14 +85,37 @@ router.get("/wallet", requireAuth, requireVendor, async (req, res) => {
  *   { id, dateIso, kind, type, description, amount, amountFormatted,
  *     signed, status, orderRef?, bulkRef?, withdrawalRef? }
  */
-type TxFilter = "all" | "orders" | "bulk" | "payouts" | "topups";
+type TxFilter =
+  | "all"
+  | "orders"
+  | "bulk"
+  | "payouts"
+  | "topups"
+  // Design-aligned filters (v7) — sit alongside the legacy keys so the
+  // old transactions screen keeps working while the new UI rolls out.
+  | "credit"
+  | "payout"
+  | "hold"
+  | "debit";
 
 const FILTER_KINDS: Record<TxFilter, string[] | null> = {
   all: null,
+  // Legacy
   orders: ["vendor_earning_credit", "order_charge_credit", "refund_credit"],
-  bulk: ["escrow_release_debit"], // bulk-related debits land here when integration completes
+  bulk: ["escrow_release_debit"],
   payouts: ["withdraw_debit", "withdraw_fee_debit", "withdraw_reversal_credit"],
   topups: ["topup_credit"],
+  // v7 design semantics
+  credit: [
+    "vendor_earning_credit",
+    "order_charge_credit",
+    "refund_credit",
+    "topup_credit",
+    "withdraw_reversal_credit",
+  ],
+  payout: ["withdraw_debit"],
+  hold: ["escrow_release_debit"], // escrow holds will share this bucket
+  debit: ["withdraw_fee_debit", "admin_adjust"],
 };
 
 router.get("/transactions", requireAuth, requireVendor, async (req, res) => {
@@ -430,10 +453,16 @@ router.get("/payouts/:id", requireAuth, requireVendor, async (req, res) => {
 });
 
 // ===================== SAVED BANKS LIST =====================
-router.get("/banks/saved", requireAuth, requireVendor, async (_req, res) => {
+router.get("/banks/saved", requireAuth, requireVendor, async (req, res) => {
   try {
-    const accounts = await BankAccount.find({ user: _req.userId })
+    const { stationId } = req.query as { stationId?: string };
+    const q: Record<string, unknown> = { user: req.userId };
+    if (stationId) {
+      q.station = new mongoose.Types.ObjectId(stationId);
+    }
+    const accounts = await BankAccount.find(q)
       .sort({ isPrimary: -1, createdAt: -1 })
+      .populate("station", "name")
       .lean();
     res.json({ accounts });
   } catch (err) {
@@ -450,14 +479,28 @@ router.get("/banks/saved", requireAuth, requireVendor, async (_req, res) => {
  */
 router.post("/banks/saved", requireAuth, requireVendor, async (req, res) => {
   try {
-    const { bankName, bankCode, accountNumber } = req.body as {
+    const { bankName, bankCode, accountNumber, stationId } = req.body as {
       bankName?: string;
       bankCode?: string;
       accountNumber?: string;
+      stationId?: string;
     };
-    if (!bankName || !bankCode || !accountNumber) {
+    if (!bankName || !bankCode || !accountNumber || !stationId) {
       return res.status(400).json({
-        message: "bankName, bankCode, accountNumber required",
+        message:
+          "bankName, bankCode, accountNumber, stationId required",
+      });
+    }
+
+    // Confirm the station belongs to this vendor.
+    const GasStation = (await import("../models/Station")).default;
+    const station = await GasStation.findOne({
+      _id: stationId,
+      vendorId: req.userId,
+    }).lean();
+    if (!station) {
+      return res.status(404).json({
+        message: "Station not found or not owned by you",
       });
     }
 
@@ -493,15 +536,19 @@ router.post("/banks/saved", requireAuth, requireVendor, async (req, res) => {
       });
     }
 
-    // First saved bank → primary.
-    const count = await BankAccount.countDocuments({ user: req.userId });
+    // First saved bank FOR THIS STATION → primary for that station.
+    const stationCount = await BankAccount.countDocuments({
+      user: req.userId,
+      station: stationId,
+    });
     const account = await BankAccount.create({
       user: req.userId,
+      station: stationId,
       bankName,
       bankCode,
       accountNumber,
       accountName,
-      isPrimary: count === 0,
+      isPrimary: stationCount === 0,
       bvnVerified: false,
     });
     res.status(201).json({ account });
@@ -529,10 +576,19 @@ router.patch(
       if (target.isPrimary) {
         return res.json({ account: target });
       }
-      await BankAccount.updateMany(
-        { user: req.userId },
-        { $set: { isPrimary: false } },
-      );
+      // Scope the "only one primary" rule to this bank's station, so
+      // setting a primary for Station A doesn't disturb Station B's
+      // primary. Legacy rows with no station still demote across all
+      // user-owned legacy rows.
+      const peerFilter: Record<string, unknown> = { user: req.userId };
+      if (target.station) {
+        peerFilter.station = target.station;
+      } else {
+        peerFilter.station = { $exists: false };
+      }
+      await BankAccount.updateMany(peerFilter, {
+        $set: { isPrimary: false },
+      });
       target.isPrimary = true;
       await target.save();
       res.json({ account: target });
