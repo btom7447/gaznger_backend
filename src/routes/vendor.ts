@@ -113,16 +113,35 @@ router.get("/stations", requireAuth, requireVendor, async (req, res) => {
 // ===================== CREATE ADDITIONAL STATION =====================
 router.post("/stations", requireAuth, requireVendor, async (req, res) => {
   try {
-    const { stationName, address, state, lga, location, fuels, images } = req.body;
-    if (!stationName || !address || !state || !lga || !fuels?.length) {
+    const {
+      stationName,
+      name,
+      address,
+      state,
+      lga,
+      location,
+      operatingHours,
+      fuels,
+      images,
+    } = req.body;
+    // Accept both `stationName` (legacy mobile shape) and `name`
+    // (v7 vendor onboarding wizard shape).
+    const stationLabel: string | undefined = stationName ?? name;
+    if (!stationLabel || !address || !state || !lga || !fuels?.length) {
       return res.status(400).json({ message: "Missing required fields" });
     }
     const station = await GasStation.create({
-      name: stationName,
+      name: stationLabel,
       address,
       state,
       lga,
       location: { lat: location?.lat ?? 0, lng: location?.lng ?? 0 },
+      operatingHours: operatingHours
+        ? {
+            open: operatingHours.open ?? undefined,
+            close: operatingHours.close ?? undefined,
+          }
+        : undefined,
       fuels,
       image: images?.[0] ?? "",
       images: images ?? [],

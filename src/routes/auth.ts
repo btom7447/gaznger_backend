@@ -4,6 +4,8 @@ import User from "../models/User";
 import RefreshToken from "../models/RefreshToken";
 import OtpRecord from "../models/OtpRecord";
 import VerificationToken from "../models/VerificationToken";
+import RiderInvite from "../models/RiderInvite";
+import RiderProfile from "../models/RiderProfile";
 import { hashPassword, comparePassword } from "../utils/hash";
 import { signAccessToken, signRefreshToken, verifyRefreshToken } from "../utils/jwt";
 import { requireAuth } from "../middleware/auth";
@@ -417,16 +419,31 @@ router.post(
       // station details + rider profile both live here. When the rider
       // queue / vendor dashboard need richer per-role docs they'll
       // copy fields out on first dashboard mount.
+      //
+      // The v7 unified onboarding wizard creates the account with an
+      // empty `profile` (just role + pin + verificationToken) and
+      // fills in details later via PUT /auth/me + role-specific
+      // setup endpoints. We default the displayName so legacy callers
+      // (which DO send profile fields) and the new wizard both work.
       const displayName = (() => {
         if (role === "customer") {
-          const fn = (profile.firstName as string) ?? "";
-          const ln = (profile.lastName as string) ?? "";
-          return [fn, ln].filter(Boolean).join(" ").trim() || "Guest";
+          const fn = (profile?.firstName as string) ?? "";
+          const ln = (profile?.lastName as string) ?? "";
+          const combined = [fn, ln].filter(Boolean).join(" ").trim();
+          return combined || (profile?.displayName as string) || "Guest";
         }
         if (role === "rider") {
-          return (profile.fullName as string) ?? "Rider";
+          return (
+            (profile?.fullName as string) ??
+            (profile?.displayName as string) ??
+            "Rider"
+          );
         }
-        return (profile.stationName as string) ?? "Station";
+        return (
+          (profile?.stationName as string) ??
+          (profile?.displayName as string) ??
+          "Station"
+        );
       })();
 
       const pinHash = await hashPassword(pin);
@@ -609,6 +626,9 @@ router.post("/login", validate(phoneLoginSchema), async (req, res) => {
 
     if (!isKnownDevice) {
       if (!verificationToken) {
+        console.log(
+          `[auth/login 401] new-device path; phone=${phone} deviceId=${deviceId} knownCount=${user.knownDevices?.length ?? 0}`,
+        );
         return res.status(401).json({
           message: "OTP verification required for new device.",
         });
@@ -619,6 +639,9 @@ router.post("/login", validate(phoneLoginSchema), async (req, res) => {
         phone,
       });
       if (!tokenDoc || tokenDoc.expiresAt.getTime() < Date.now()) {
+        console.log(
+          `[auth/login 401] verificationToken expired/missing; phone=${phone}`,
+        );
         return res.status(401).json({
           message: "Verification expired. Restart from your phone number.",
         });
@@ -629,6 +652,9 @@ router.post("/login", validate(phoneLoginSchema), async (req, res) => {
 
     const ok = await comparePassword(pin, user.pinHash);
     if (!ok) {
+      console.log(
+        `[auth/login 401] wrong-pin; phone=${phone} attempts=${user.pinFailures?.count ?? 0}`,
+      );
       const userIdStr = (user._id as { toString(): string }).toString();
       const { locked } = await recordPinFailure(userIdStr);
       if (locked) {
@@ -1139,7 +1165,15 @@ router.post("/me/delete", requireAuth, async (req, res) => {
 // ===================== UPDATE PROFILE =====================
 router.put("/me", requireAuth, validate(updateProfileSchema), async (req, res) => {
   try {
-    const { displayName, phone, gender, profileImage, preferences } = req.body;
+    const {
+      displayName,
+      email,
+      phone,
+      gender,
+      profileImage,
+      vendorBusinessName,
+      preferences,
+    } = req.body;
 
     // Build a `$set` payload with dot-paths so nested `preferences` fields
     // patch in place — Mongo's default behaviour with a top-level
@@ -1147,9 +1181,12 @@ router.put("/me", requireAuth, validate(updateProfileSchema), async (req, res) =
     // away any other preference the client didn't include in this call.
     const updates: Record<string, any> = {};
     if (displayName !== undefined) updates.displayName = displayName;
+    if (email !== undefined) updates.email = email;
     if (phone !== undefined) updates.phone = phone;
     if (gender !== undefined) updates.gender = gender;
     if (profileImage !== undefined) updates.profileImage = profileImage;
+    if (vendorBusinessName !== undefined)
+      updates.vendorBusinessName = vendorBusinessName;
     if (preferences && typeof preferences === "object") {
       const allowedKeys = [
         "autoRedeemPoints",
@@ -1510,6 +1547,89 @@ router.delete("/sessions", requireAuth, async (req, res) => {
     res.json({ message: "Other sessions revoked", count: result.deletedCount });
   } catch (err) {
     res.status(500).json({ message: "Failed to revoke sessions" });
+  }
+});
+
+// ===================== REDEEM RIDER INVITE =====================
+/**
+ * POST /auth/redeem-invite { code }
+ *
+ * Called by the rider onboarding wizard's Step 1 when the user enters
+ * an invite code (or arrived via a deep-link with the code pre-filled).
+ * On success:
+ *   - marks the RiderInvite as accepted by this user
+ *   - sets RiderProfile.homeStation to the station the invite binds to
+ *
+ * Caller must be authenticated as a rider; the user must NOT already
+ * have a homeStation (we don't silently overwrite an existing binding —
+ * use the vendor's reassign endpoint instead).
+ */
+router.post("/redeem-invite", requireAuth, async (req: any, res) => {
+  try {
+    const meId = String(req.userId);
+    const me = await User.findById(meId).select("phone role").lean();
+    if (!me) return res.status(404).json({ message: "User not found" });
+    if ((me as any).role !== "rider") {
+      return res
+        .status(403)
+        .json({ message: "Only riders can redeem invites" });
+    }
+
+    const { code } = req.body as { code?: string };
+    const cleaned = (code ?? "").trim();
+    if (!cleaned) {
+      return res.status(400).json({ message: "Invite code is required" });
+    }
+
+    const invite = await RiderInvite.findOne({ token: cleaned });
+    if (!invite) {
+      return res.status(404).json({ message: "Invite code not found" });
+    }
+    if (invite.status === "revoked" || invite.status === "expired") {
+      return res
+        .status(410)
+        .json({ message: "This invite is no longer valid" });
+    }
+    if (invite.expiresAt && invite.expiresAt.getTime() < Date.now()) {
+      invite.status = "expired";
+      await invite.save();
+      return res.status(410).json({ message: "This invite has expired" });
+    }
+    // Phone must match — keeps an attacker who scrapes the SMS from
+    // binding the invite to a different account.
+    if (invite.phone && invite.phone !== (me as any).phone) {
+      return res
+        .status(403)
+        .json({ message: "Invite was issued to a different phone number" });
+    }
+
+    invite.status = "accepted";
+    (invite as any).acceptedBy = meId;
+    (invite as any).acceptedAt = new Date();
+    await invite.save();
+
+    // Bind the rider to the inviting vendor's station. If the rider
+    // already has a homeStation set we treat that as an explicit prior
+    // affiliation and DON'T overwrite — vendor must reassign instead.
+    const profile = await RiderProfile.findOne({ user: meId });
+    if (profile) {
+      if (!(profile as any).homeStation) {
+        (profile as any).homeStation = invite.station;
+        await profile.save();
+      }
+    }
+
+    res.json({
+      invite: {
+        _id: invite._id,
+        vendor: invite.vendor,
+        station: invite.station,
+        status: invite.status,
+      },
+    });
+  } catch (err) {
+    console.error("[auth/redeem-invite]", err);
+    res.status(500).json({ message: "Failed to redeem invite" });
   }
 });
 
