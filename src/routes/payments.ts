@@ -768,4 +768,63 @@ router.post("/webhook", async (req, res) => {
   }
 });
 
+/* ─────────────── DEV: mark order paid (no Paystack hit) ─────────────── */
+/**
+ * EDGE P0-4 — closes the dev-only "bank-transfer Continue" loophole
+ * where the customer mobile shortcut at
+ * `app/(customer)/(order)/payment.tsx:437-457` jumped to the receipt
+ * without telling the server the order was paid. The result was
+ * customers in dev landing on a receipt for an UNPAID order.
+ *
+ * This endpoint flips the order to `paid` + `confirmed` exactly the
+ * way a real Paystack verify would, but without a Paystack roundtrip
+ * — it's the missing server half of the dev shortcut. Hard-gated to
+ * non-production; refuses to run in prod under any flag combination.
+ *
+ * Mobile counterpart (Phase 1B) calls this immediately after the dev
+ * Continue tap so the order state stays consistent.
+ */
+router.post(
+  "/dev-mark-paid",
+  requireAuth,
+  moneyLimiter,
+  idempotencyKey(),
+  async (req, res) => {
+    if (process.env.NODE_ENV === "production") {
+      return res.status(404).json({ message: "Not found" });
+    }
+    try {
+      const { orderId } = req.body as { orderId?: string };
+      if (!orderId) {
+        return res.status(400).json({ message: "orderId required" });
+      }
+      const order = await Order.findOne({ _id: orderId, user: req.userId });
+      if (!order) {
+        return res.status(404).json({ message: "Order not found" });
+      }
+      if (order.paymentStatus === "paid") {
+        return res.json({ order, alreadyPaid: true });
+      }
+      order.paymentStatus = "paid";
+      order.paymentRef = `dev-mark-paid:${Date.now()}`;
+      if (order.status === "pending") {
+        order.status = "confirmed";
+      }
+      await order.save();
+
+      emitToUser(req.userId, "order:update", {
+        orderId: String(order._id),
+        status: order.status,
+        paymentStatus: order.paymentStatus,
+      });
+
+      res.json({ order });
+    } catch (err) {
+      console.error("[payments/dev-mark-paid]", err);
+      res.status(500).json({ message: "Failed to mark paid" });
+    }
+  },
+);
+
+
 export default router;

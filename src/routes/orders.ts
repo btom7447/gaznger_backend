@@ -9,6 +9,7 @@ import User from "../models/User";
 import Point from "../models/Point";
 import { requireAuth, requireCustomer } from "../middleware/auth";
 import { validate } from "../middleware/validate";
+import { idempotencyKey } from "../middleware/idempotency";
 import {
   createOrderSchema,
   updateOrderStatusSchema,
@@ -69,7 +70,14 @@ async function awardPoints(
 // customers (they'd just create a malformed order doc), but
 // defense-in-depth: a vendor or rider session token shouldn't be
 // able to call any of them at all.
-router.post("/", requireAuth, requireCustomer, validate(createOrderSchema), async (req, res) => {
+// SECURITY M3 (audit) — accepts (but does not yet enforce) the
+// Idempotency-Key header so retries from the mobile client can be
+// deduped server-side. Phase 2 flips `enforce: true` once every
+// client build sends the header, and wraps the handler body in
+// `withIdempotency` for response caching. Today the middleware just
+// stashes the key on req for future use; behaviour is unchanged for
+// clients that don't send it.
+router.post("/", requireAuth, requireCustomer, idempotencyKey(), validate(createOrderSchema), async (req, res) => {
   try {
     const {
       fuelId,
