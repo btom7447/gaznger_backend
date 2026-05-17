@@ -1,8 +1,10 @@
 import { Router } from "express";
+import mongoose from "mongoose";
 import User from "../models/User";
 import Point from "../models/Point";
 import Order from "../models/Order";
 import { requireAuth } from "../middleware/auth";
+import { idempotencyKey } from "../middleware/idempotency";
 import { parsePagination } from "../utils/pagination";
 
 const router = Router();
@@ -57,7 +59,13 @@ router.get("/history", requireAuth, async (req, res) => {
 });
 
 // ===================== REDEEM POINTS =====================
-router.post("/redeem", requireAuth, async (req, res) => {
+// BUSINESS P0-3 — server-side cap so client can't redeem more than
+// the order's outstanding total (would otherwise debit points
+// without a matching discount).
+// BUSINESS P1-1 — wrapped in a Mongo transaction so deduct + order
+// update + Point.create either ALL happen or none. Idempotency
+// header dedupes a retry of the same logical operation.
+router.post("/redeem", requireAuth, idempotencyKey(), async (req, res) => {
   try {
     const { orderId, pointsToRedeem } = req.body;
 
@@ -79,7 +87,20 @@ router.post("/redeem", requireAuth, async (req, res) => {
     if (order.status !== "pending")
       return res.status(400).json({ message: "Points can only be redeemed on pending orders" });
 
-    // Prevent double-redeem: check if points were already applied to this order
+    // BUSINESS P0-3 — clamp at the smaller of (user points balance,
+    // request, order total). 1 point = ₦1.
+    const cappedRedeem = Math.min(pointsToRedeem, order.totalPrice);
+    if (cappedRedeem <= 0) {
+      return res.status(400).json({
+        message: "Order total is already zero; nothing to redeem against.",
+      });
+    }
+
+    // BUSINESS P1-1 — guard against double-redeem races. Pre-check
+    // outside the transaction is for fast-fail UX; the actual
+    // dedupe lives in the unique-keyed Point doc (same description
+    // hash) so a concurrent second writer hits a duplicate-key
+    // error inside the txn and the txn aborts cleanly.
     const alreadyRedeemed = await Point.findOne({
       user: req.userId,
       type: "redeem",
@@ -88,26 +109,38 @@ router.post("/redeem", requireAuth, async (req, res) => {
     if (alreadyRedeemed)
       return res.status(409).json({ message: "Points have already been redeemed on this order" });
 
-    // Each point is worth ₦1 in discount (customize as needed)
-    const discountAmount = pointsToRedeem;
-    order.totalPrice = Math.max(0, order.totalPrice - discountAmount);
-    await order.save();
+    const discountAmount = cappedRedeem;
+    const session = await mongoose.startSession();
+    try {
+      await session.withTransaction(async () => {
+        order.totalPrice = Math.max(0, order.totalPrice - discountAmount);
+        await order.save({ session });
 
-    user.points -= pointsToRedeem;
-    await user.save();
+        user.points -= cappedRedeem;
+        await user.save({ session });
 
-    await Point.create({
-      user: req.userId,
-      change: -pointsToRedeem,
-      type: "redeem",
-      description: `Redeemed ${pointsToRedeem} points on order #${order._id.toString().slice(-6).toUpperCase()}`,
-      settled: true,
-    });
+        await Point.create(
+          [
+            {
+              user: req.userId,
+              change: -cappedRedeem,
+              type: "redeem",
+              description: `Redeemed ${cappedRedeem} points on order #${order._id.toString().slice(-6).toUpperCase()}`,
+              settled: true,
+            },
+          ],
+          { session },
+        );
+      });
+    } finally {
+      session.endSession();
+    }
 
     res.json({
-      message: `${pointsToRedeem} points redeemed. Order discount: ₦${discountAmount}`,
+      message: `${cappedRedeem} points redeemed. Order discount: ₦${discountAmount}`,
       newPointsBalance: user.points,
       updatedOrderTotal: order.totalPrice,
+      cappedAt: cappedRedeem !== pointsToRedeem ? cappedRedeem : undefined,
     });
   } catch (err) {
     res.status(500).json({ message: "Failed to redeem points" });

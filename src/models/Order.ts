@@ -87,6 +87,11 @@ export interface IOrder extends Document {
     ratedAt: Date;
   };
 
+  // EDGE P1-6 — monotonic status-revision counter. Bumped before
+  // every order:update emit so mobile clients can drop stale events
+  // in the cancel-vs-accept race. See utils/orderVersion.ts.
+  version: number;
+
   // Gas-specific fields
   cylinderType?: string;
   deliveryType?: "cylinder_swap" | "home_refill";
@@ -197,6 +202,20 @@ const OrderSchema: Schema = new Schema(
       age: { type: String },
       test: { type: String },
     },
+
+    /**
+     * EDGE P1-6 — monotonic version counter bumped on every status
+     * write so the mobile client can drop stale socket events from
+     * the cancel-vs-accept race. Starts at 0; the status-change
+     * helpers (and direct order.save() calls in this codebase) bump
+     * via `order.version += 1; await order.save();` before emitting
+     * the matching `order:update` event.
+     *
+     * Mongoose has a built-in `__v` but it's incremented on save
+     * regardless of whether status changed; this dedicated field
+     * carries the "status revision" semantic the audit requires.
+     */
+    version: { type: Number, default: 0 },
   },
   { timestamps: true }
 );

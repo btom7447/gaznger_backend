@@ -20,6 +20,15 @@ import { parsePagination } from "../utils/pagination";
 import { notifyUser } from "../utils/notify";
 import { emitToUser, emitToDelivery } from "../socket";
 import { haversineDistance, calcDeliveryFee } from "../utils/haversine";
+import { computeDeliveryFee } from "../utils/deliveryFee";
+import {
+  bumpAndSaveOrder,
+  emitOrderUpdate,
+  emitOrderConfirmed,
+  emitOrderRejected,
+  emitRiderAssigned,
+} from "../utils/orderEvents";
+import { emitPaymentFailed, emitRatingSubmitted } from "../utils/alertEvents";
 import { createVendorPendingEarning, settleOrderEarnings } from "../utils/earningsUtils";
 import Delivery from "../models/Delivery";
 import RiderProfile from "../models/RiderProfile";
@@ -146,28 +155,18 @@ router.post("/", requireAuth, requireCustomer, idempotencyKey(), validate(create
     const pricePerUnit = stationFuelEntry.pricePerUnit;
     const fuelCost = Math.round(quantity * pricePerUnit);
 
-    // Calculate delivery fee via haversine if both coords are present
-    let deliveryFee = 0;
-    const stationHasCoords = station.location.lat !== 0 && station.location.lng !== 0;
-    const addressHasCoords = address.latitude !== 0 && address.longitude !== 0;
-    if (stationHasCoords && addressHasCoords) {
-      const distanceKm = haversineDistance(
-        { lat: station.location.lat, lng: station.location.lng },
-        { lat: address.latitude, lng: address.longitude }
-      );
-      deliveryFee = calcDeliveryFee(distanceKm);
-    } else {
-      // Fallback: use base fee only when coords are unavailable
-      deliveryFee = Number(process.env.DELIVERY_BASE_FEE) || 500;
-    }
-
-    // LPG-swap is a 2-trip job (delivery + return pickup), so the rider
-    // gets paid for two legs even though it's one Earning row at settle
-    // time. Double the fee at order-create time so escrow holds the
-    // right total upfront.
-    if (fuel.name === "Gas" && deliveryType === "cylinder_swap") {
-      deliveryFee = deliveryFee * 2;
-    }
+    // BUSINESS_RULES P0-2 — single source of truth for the fee math
+    // shared with the mobile preview via /api/orders/quote (added
+    // below in this PR). The helper handles base + per-km + the
+    // LPG-swap 2-trip multiplier in one place so client + server
+    // can never drift.
+    const feeBreakdown = computeDeliveryFee({
+      from: { lat: station.location.lat, lng: station.location.lng },
+      to: { lat: address.latitude, lng: address.longitude },
+      fuelName: fuel.name,
+      deliveryType,
+    });
+    const deliveryFee = feeBreakdown.finalFee;
 
     // Platform service fee (audit C.4). Configurable in basis points
     // via SERVICE_FEE_BPS (200 = 2%, the default). Computed off the
@@ -214,15 +213,18 @@ router.post("/", requireAuth, requireCustomer, idempotencyKey(), validate(create
     // ── Socket events fire immediately; notifications follow in background ──
     if (station.autoAcceptOrders) {
       order.status = "confirmed";
-      await order.save();
+      // Bump version so first emit carries v1 (post-creation)
+      await bumpAndSaveOrder(order);
 
       // 1. Instant socket events (no await)
-      emitToUser(req.userId, "order:update", { orderId: String(order._id), status: "confirmed" });
-      if (station.vendorId) {
-        const vendorId = station.vendorId.toString();
-        emitToUser(vendorId, "order:new", { orderId: String(order._id), status: "confirmed", fuelName: fuel.name, quantity, unit: fuel.unit });
+      const vendorIdStr = station.vendorId ? station.vendorId.toString() : null;
+      emitOrderUpdate(order, vendorIdStr);
+      // Granular confirm event (SYNC P1 / WS_VS_API #4)
+      emitOrderConfirmed(order, vendorIdStr);
+      if (vendorIdStr) {
+        emitToUser(vendorIdStr, "order:new", { orderId: String(order._id), status: "confirmed", fuelName: fuel.name, quantity, unit: fuel.unit });
         // Create vendor earnings + emit earnings event (fast DB write)
-        createVendorPendingEarning(vendorId, order._id.toString(), fuelCost).catch(() => {});
+        createVendorPendingEarning(vendorIdStr, order._id.toString(), fuelCost).catch(() => {});
       }
 
       // 2. Background: DB notifications + push (do not block response)
@@ -254,6 +256,72 @@ router.post("/", requireAuth, requireCustomer, idempotencyKey(), validate(create
     res.status(201).json(order);
   } catch (err) {
     res.status(500).json({ message: "Failed to place order" });
+  }
+});
+
+// ===================== QUOTE (PREVIEW) =====================
+/**
+ * BUSINESS_RULES P0-2 — authoritative delivery-fee preview for the
+ * customer's Payment screen. The mobile client used to mirror the
+ * server's formula and silently missed the LPG-swap 2× multiplier.
+ * From this PR onward, the client calls this endpoint and displays
+ * exactly what the server will charge.
+ *
+ * GET /api/orders/quote?stationId=...&addressId=...&fuelTypeId=lpg&deliveryType=cylinder_swap
+ *
+ * Response:
+ *   { breakdown: { base, perKm, distanceKm, rawFee, multiplier, reason, finalFee } }
+ *
+ * Cheap read (two findById's + the pure math helper); no DB writes.
+ */
+router.get("/quote", requireAuth, requireCustomer, async (req, res) => {
+  try {
+    const stationId = String(req.query.stationId ?? "");
+    const addressId = String(req.query.addressId ?? "");
+    const fuelTypeId = String(req.query.fuelTypeId ?? "").toLowerCase();
+    const deliveryType = req.query.deliveryType
+      ? String(req.query.deliveryType)
+      : undefined;
+    if (!stationId || !addressId || !fuelTypeId) {
+      return res.status(400).json({
+        message: "stationId, addressId, fuelTypeId are required",
+      });
+    }
+
+    const SLUG_TO_NAME: Record<string, RegExp> = {
+      petrol: /^petrol$/i,
+      diesel: /^diesel$/i,
+      kero: /^kero(sene)?$/i,
+      lpg: /^(lpg|gas|cooking gas)$/i,
+    };
+    const matcher = SLUG_TO_NAME[fuelTypeId];
+    if (!matcher) {
+      return res.status(400).json({ message: "Unknown fuelTypeId" });
+    }
+
+    const [station, address, fuel] = await Promise.all([
+      GasStation.findById(stationId).select("location").lean(),
+      Address.findById(addressId).select("latitude longitude").lean(),
+      FuelType.findOne({ name: matcher }).select("name").lean(),
+    ]);
+    if (!station)
+      return res.status(404).json({ message: "Station not found" });
+    if (!address)
+      return res.status(404).json({ message: "Address not found" });
+    if (!fuel)
+      return res.status(404).json({ message: "Fuel type not found" });
+
+    const breakdown = computeDeliveryFee({
+      from: { lat: station.location.lat, lng: station.location.lng },
+      to: { lat: address.latitude, lng: address.longitude },
+      fuelName: fuel.name,
+      deliveryType,
+    });
+
+    res.json({ breakdown });
+  } catch (err) {
+    console.error("[orders/quote]", err);
+    res.status(500).json({ message: "Failed to compute quote" });
   }
 });
 
@@ -568,12 +636,24 @@ router.patch("/:orderId/status", requireAuth, validate(updateOrderStatusSchema),
     }
 
     order.status = status;
-    await order.save();
+    // EDGE P1-6 / WS_VS_API P0 — bump version + save in one go, then
+    // emit a full-OrderDetail update to the vendor namespace so the
+    // vendor app doesn't have to GET /api/vendor/orders/:id on every
+    // event.
+    await bumpAndSaveOrder(order);
 
     const userId = order.user.toString();
 
-    // Instant socket event first
-    emitToUser(userId, "order:update", { orderId: String(order._id), status });
+    // Resolve vendorId for the dual emit.
+    let vendorId: string | null = null;
+    {
+      const GasStation = (await import("../models/Station")).default;
+      const station = await GasStation.findById(order.station)
+        .select("vendorId")
+        .lean();
+      vendorId = (station as any)?.vendorId ? String((station as any).vendorId) : null;
+    }
+    emitOrderUpdate(order, vendorId);
 
     // Background notifications (do not block response)
     Promise.resolve().then(async () => {
@@ -878,6 +958,25 @@ router.post("/:orderId/rate", requireAuth, requireCustomer, validate(rateOrderSc
     const ratings = (await Rating.find({ station: order.station }).lean()) as IRating[];
     const avgRating = ratings.reduce((sum, r) => sum + r.score, 0) / ratings.length;
     await GasStation.findByIdAndUpdate(order.station, { rating: avgRating });
+
+    // SYNC P0 — emit rating:submitted to the vendor so the dashboard
+    // average + count refresh instantly. Without this the vendor only
+    // saw a new rating on next manual refresh.
+    const station = await GasStation.findById(order.station)
+      .select("vendorId")
+      .lean();
+    const vendorIdStr = (station as any)?.vendorId
+      ? String((station as any).vendorId)
+      : null;
+    if (vendorIdStr) {
+      emitRatingSubmitted(vendorIdStr, {
+        orderId: String(order._id),
+        stationId: String(order.station),
+        stars: finalStars,
+        newAverage: Math.round(avgRating * 10) / 10,
+        totalRatings: ratings.length,
+      });
+    }
 
     await awardPoints(req.userId, POINTS_CONFIG.rateStation, "Points for rating a station");
 

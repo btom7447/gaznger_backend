@@ -7,6 +7,7 @@ import WebhookEvent from "../models/WebhookEvent";
 import { requireAuth } from "../middleware/auth";
 import { idempotencyKey } from "../middleware/idempotency";
 import { moneyLimiter } from "../middleware/moneyLimiter";
+import { emitPaymentFailed } from "../utils/alertEvents";
 import {
   initializePayment,
   verifyPayment,
@@ -742,6 +743,13 @@ router.post("/webhook", async (req, res) => {
             emitToUser(w.user.toString(), "withdrawal:update", {
               withdrawalId: w._id,
               status: "failed",
+            });
+            // WS_VS_API #3 — explicit payment:failed for the toast +
+            // any UI that wants to react beyond the generic wallet
+            // refresh.
+            emitPaymentFailed(w.user.toString(), {
+              reason: `Paystack ${event}`,
+              amount: w.amount,
             });
             await notifyUser(
               w.user.toString(),
