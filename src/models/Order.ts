@@ -47,6 +47,16 @@ export interface IOrder extends Document {
    */
   returnSwapAt?: Date | null;
 
+  /**
+   * USE_CASES C-5 / decision D3 — scheduled order. When set, the
+   * order doesn't enter the dispatch pool until ~30 min before
+   * this time. Min lead: 30 min from place. Max lead: 7 days.
+   * Pricing locked at place time (fuelCost + deliveryFee already
+   * snapshotted on the order doc — server doesn't requote at
+   * delivery). Null/undefined = immediate dispatch.
+   */
+  scheduledAt?: Date | null;
+
   /** Customer-paid delivery timestamp (set on customer-confirm-delivered). */
   deliveredAt?: Date;
 
@@ -174,6 +184,7 @@ const OrderSchema: Schema = new Schema(
 
     note: { type: String, maxlength: 500 },
     returnSwapAt: { type: Date, default: null },
+    scheduledAt: { type: Date, default: null },
     deliveredAt: { type: Date },
     customerHereAt: { type: Date },
     totalCharged: { type: Number },

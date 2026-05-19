@@ -98,8 +98,34 @@ router.post("/", requireAuth, requireCustomer, idempotencyKey(), validate(create
       deliveryType,
       cylinderImages,
       returnSwapAt,
+      scheduledAt,
       note,
     } = req.body;
+
+    // USE_CASES C-5 / decision D3 — validate scheduledAt window.
+    // Min 30 min from now (anything earlier is treated as immediate);
+    // max 7 days. Server rejects out-of-window scheduled orders so
+    // the client doesn't silently lose the schedule on POST.
+    let scheduledAtDate: Date | null = null;
+    if (scheduledAt) {
+      const t = new Date(scheduledAt);
+      if (Number.isNaN(t.getTime())) {
+        return res.status(400).json({ message: "Invalid scheduledAt" });
+      }
+      const minLeadMs = 30 * 60 * 1000;
+      const maxLeadMs = 7 * 24 * 60 * 60 * 1000;
+      const lead = t.getTime() - Date.now();
+      if (lead > 0 && lead < minLeadMs) {
+        // Less than 30 min lead — treat as immediate
+        scheduledAtDate = null;
+      } else if (lead > maxLeadMs) {
+        return res.status(400).json({
+          message: "Scheduled time is more than 7 days away.",
+        });
+      } else if (lead > 0) {
+        scheduledAtDate = t;
+      }
+    }
 
     // Enforce one active order at a time
     const activeOrder = await Order.findOne({
@@ -196,6 +222,7 @@ router.post("/", requireAuth, requireCustomer, idempotencyKey(), validate(create
       deliveryAddress: deliveryAddressId,
       note: note?.trim() || undefined,
       returnSwapAt: returnSwapAt ? new Date(returnSwapAt) : undefined,
+      scheduledAt: scheduledAtDate,
     };
 
     if (fuel.name === "Gas") {
@@ -211,7 +238,11 @@ router.post("/", requireAuth, requireCustomer, idempotencyKey(), validate(create
     let order = await Order.create(orderData);
 
     // ── Socket events fire immediately; notifications follow in background ──
-    if (station.autoAcceptOrders) {
+    // USE_CASES C-5 — scheduled orders skip auto-accept. They sit in
+    // `pending` until the schedule cron picks them up ~30 min before
+    // the slot. Vendor still gets the order:new ping so they can
+    // pre-confirm if they want.
+    if (station.autoAcceptOrders && !scheduledAtDate) {
       order.status = "confirmed";
       // Bump version so first emit carries v1 (post-creation)
       await bumpAndSaveOrder(order);
@@ -696,18 +727,30 @@ router.patch("/:orderId/status", requireAuth, validate(updateOrderStatusSchema),
 // ===================== CANCEL ORDER =====================
 router.patch("/:orderId/cancel", requireAuth, async (req, res) => {
   try {
-    // Phase 9 — atomic cancel. The status filter `pending` ensures
-    // two concurrent cancel requests can't both succeed; the loser
-    // gets null back and a 409. Replaces the read-then-write that
-    // was a tiny but real race window (customer double-taps the
-    // cancel button, both requests in flight before the first save).
+    const reason =
+      typeof req.body?.reason === "string"
+        ? req.body.reason.slice(0, 200)
+        : undefined;
+    // USE_CASES C-7 / decision D2 — customer self-cancel is allowed
+    // while the order is `pending` OR `confirmed` (no rider assigned
+    // yet). Once a rider is committed (status: assigned, in-transit,
+    // etc.) we don't auto-cancel — the rider's already moving and
+    // the order has to go through vendor-side cancel + manual refund.
+    // Atomic findOneAndUpdate prevents the double-tap race.
     const order = await Order.findOneAndUpdate(
       {
         _id: req.params.orderId,
         user: req.userId,
-        status: "pending",
+        status: { $in: ["pending", "confirmed"] },
+        riderId: { $exists: false },
       },
-      { status: "cancelled" },
+      {
+        $set: {
+          status: "cancelled",
+          cancellationReason: reason ?? "Cancelled by customer",
+        },
+        $inc: { version: 1 },
+      },
       { new: true }
     );
     if (!order) {
@@ -715,24 +758,80 @@ router.patch("/:orderId/cancel", requireAuth, async (req, res) => {
       // for accurate error messages. Cheap second query, only on the
       // rare error path.
       const exists = await Order.findById(req.params.orderId)
-        .select("user status")
+        .select("user status riderId")
         .lean();
       if (!exists) return res.status(404).json({ message: "Order not found" });
       if (String(exists.user) !== req.userId)
         return res.status(403).json({ message: "Forbidden" });
+      if (exists.riderId) {
+        return res.status(400).json({
+          message:
+            "A rider has already been assigned to this order. Contact support to cancel.",
+        });
+      }
       return res
         .status(400)
-        .json({ message: "Only pending orders can be cancelled" });
+        .json({ message: "Only pending or confirmed orders can be cancelled" });
     }
 
-    emitToUser(req.userId, "order:update", { orderId: String(order._id), status: "cancelled" });
+    // Resolve vendorId for the cross-role emit.
+    const station = await GasStation.findById(order.station)
+      .select("vendorId")
+      .lean();
+    const vendorIdStr = (station as any)?.vendorId
+      ? String((station as any).vendorId)
+      : null;
+
+    // Decision D2 — auto-refund to wallet (instant) for any paid
+    // order. Unpaid orders skip the refund step entirely. The
+    // refund credits Wallet.available; original payment method is
+    // never touched (Paystack chargebacks are slow + confusing).
+    if (order.paymentStatus === "paid") {
+      try {
+        const { getOrCreateUserWallet, getOrCreateSystemWallet, postTransfer } =
+          await import("../utils/wallet");
+        const userWallet = await getOrCreateUserWallet(req.userId!);
+        const escrow = await getOrCreateSystemWallet("platform-escrow");
+        await postTransfer({
+          from: escrow,
+          to: userWallet,
+          amount: order.totalCharged ?? order.totalPrice,
+          state: "available",
+          kinds: ["refund_credit", "escrow_release_debit"],
+          description: `Customer-cancel refund for order ${order._id}`,
+          opts: {
+            idempotencyKey: `order-cancel-refund:${order._id}`,
+            order: order._id,
+          },
+        });
+        order.paymentStatus = "refunded";
+        await order.save();
+      } catch (err) {
+        console.error("[orders/cancel] refund failed:", err);
+        // Refund failure shouldn't roll back the cancel — admin
+        // can reconcile from logs. The order stays cancelled.
+      }
+    }
+
+    // Customer + vendor notifications + sockets.
+    emitOrderUpdate(order, vendorIdStr);
 
     await notifyUser(
       req.userId,
       "cancelled",
       "Order Cancelled",
-      "Your order has been cancelled and any earned points have been reversed."
+      order.paymentStatus === "refunded"
+        ? "Your order is cancelled. Refund credited to your wallet."
+        : "Your order is cancelled."
     );
+    if (vendorIdStr) {
+      await notifyUser(
+        vendorIdStr,
+        "cancelled",
+        "Order cancelled by customer",
+        `Order ${String(order._id).slice(-6).toUpperCase()} was cancelled by the customer before assignment.`
+      ).catch(() => {});
+    }
 
     res.json({ message: "Order cancelled", order });
   } catch (err) {

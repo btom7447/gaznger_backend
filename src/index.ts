@@ -12,6 +12,7 @@ import app from "./app";
 import { connectDB } from "./config/db";
 import { initSocket } from "./socket";
 import { startOrderWatchdog } from "./jobs/orderWatchdog";
+import { startScheduledOrdersJob } from "./jobs/scheduledOrders";
 
 // Hard requirements — server cannot boot without these. The rest of
 // the integrations (Cloudinary, Firebase, Resend) degrade gracefully
@@ -108,6 +109,7 @@ const startServer = async () => {
   const server = http.createServer(app);
   initSocket(server);
   startOrderWatchdog();
+  startScheduledOrdersJob();
 
   server.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
