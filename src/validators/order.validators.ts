@@ -12,6 +12,9 @@ export const createOrderSchema = z
     deliveryAddressId: z.string().min(1, "Delivery address is required"),
     // LPG-Swap return-trip ISO. Null = same-trip.
     returnSwapAt: z.string().datetime().nullable().optional(),
+    // USE_CASES C-5 — scheduled delivery ISO. Server validates the
+    // 30min-min / 7-day-max window in the route handler.
+    scheduledAt: z.string().datetime().nullable().optional(),
     note: z.string().max(500).optional(),
     cylinderType: z.string().optional(),
     deliveryType: z.enum(["cylinder_swap", "home_refill"]).optional(),

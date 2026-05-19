@@ -1,7 +1,16 @@
 import { Router } from "express";
 import mongoose from "mongoose";
 import multer from "multer";
-import { requireAuth, requireVendor } from "../middleware/auth";
+import { requireAuth, requireVendor, requireVerifiedVendor } from "../middleware/auth";
+import {
+  bumpAndSaveOrder,
+  emitOrderUpdate,
+  emitOrderConfirmed,
+  emitOrderRejected,
+  emitRiderAssigned,
+} from "../utils/orderEvents";
+import { emitStockAlert } from "../utils/alertEvents";
+import { getPlatformConfig } from "../utils/platformConfig";
 import User from "../models/User";
 import GasStation from "../models/Station";
 import Order from "../models/Order";
@@ -953,7 +962,7 @@ router.get("/riders", requireAuth, requireVendor, async (req, res) => {
  *     vendor's manual assign is equivalent for downstream code).
  *   - Emit socket order:update to customer + delivery:dispatch to rider.
  */
-router.patch("/orders/:id/assign", requireAuth, requireVendor, async (req, res) => {
+router.patch("/orders/:id/assign", requireAuth, requireVerifiedVendor, async (req, res) => {
   try {
     const { riderId } = req.body as { riderId?: string };
     if (!riderId) return res.status(400).json({ message: "riderId required" });
@@ -995,13 +1004,27 @@ router.patch("/orders/:id/assign", requireAuth, requireVendor, async (req, res) 
     order.status = "assigned";
     order.riderId = new mongoose.Types.ObjectId(riderId);
     order.riderAssignedAt = new Date();
-    await order.save();
+    await bumpAndSaveOrder(order);
 
-    // Socket — customer hears the new rider, rider hears the new gig.
-    emitToUser(order.user.toString(), "order:update", {
-      orderId: String(order._id),
-      status: "assigned",
+    // Resolve rider for the granular event payload.
+    const RiderUser = (await import("../models/User")).default;
+    const riderUser = await RiderUser.findById(riderId)
+      .select("displayName phone")
+      .lean();
+    const RiderProfile = (await import("../models/RiderProfile")).default;
+    const riderProfile = await RiderProfile.findOne({ user: riderId })
+      .select("vehiclePlate")
+      .lean();
+
+    // Socket — customer + vendor hear the new rider via the granular
+    // order:rider-assigned event AND the generic order:update for
+    // cache patching. Rider gets the legacy delivery:dispatch.
+    emitOrderUpdate(order, req.userId!, { riderId });
+    emitRiderAssigned(order, req.userId!, {
       riderId,
+      riderName: riderUser?.displayName,
+      riderPlate: (riderProfile as any)?.vehiclePlate,
+      riderPhone: riderUser?.phone,
     });
     emitToUser(riderId, "delivery:dispatch", {
       deliveryId: delivery._id,
@@ -1082,12 +1105,24 @@ router.patch(
       // Status stays "assigned" — reassign before pickup; downstream
       // events flip status as the new rider progresses.
       order.status = "assigned";
-      await order.save();
+      await bumpAndSaveOrder(order);
 
-      emitToUser(order.user.toString(), "order:update", {
-        orderId: String(order._id),
-        status: "assigned",
+      // Resolve rider for granular event.
+      const RiderUser = (await import("../models/User")).default;
+      const riderUser = await RiderUser.findById(riderId)
+        .select("displayName phone")
+        .lean();
+      const RiderProfile = (await import("../models/RiderProfile")).default;
+      const riderProfile = await RiderProfile.findOne({ user: riderId })
+        .select("vehiclePlate")
+        .lean();
+
+      emitOrderUpdate(order, req.userId!, { riderId });
+      emitRiderAssigned(order, req.userId!, {
         riderId,
+        riderName: riderUser?.displayName,
+        riderPlate: (riderProfile as any)?.vehiclePlate,
+        riderPhone: riderUser?.phone,
       });
       emitToUser(riderId, "delivery:dispatch", {
         deliveryId: delivery._id,
@@ -1143,7 +1178,7 @@ router.patch(
 
       order.status = "cancelled";
       order.cancellationReason = reason?.trim() || "Vendor cancelled";
-      await order.save();
+      await bumpAndSaveOrder(order);
 
       // Tidy: drop any in-flight Delivery rows.
       const Delivery = (await import("../models/Delivery")).default;
@@ -1152,10 +1187,7 @@ router.patch(
         { $set: { status: "dropped" } },
       );
 
-      emitToUser(order.user.toString(), "order:update", {
-        orderId: String(order._id),
-        status: "cancelled",
-      });
+      emitOrderUpdate(order, req.userId!);
       notifyUser(
         order.user.toString(),
         "cancelled",
@@ -1172,23 +1204,26 @@ router.patch(
 );
 
 // ===================== CONFIRM ORDER =====================
-router.patch("/orders/:id/confirm", requireAuth, requireVendor, async (req, res) => {
+router.patch("/orders/:id/confirm", requireAuth, requireVerifiedVendor, async (req, res) => {
   try {
     const stations = await GasStation.find({ vendorId: req.userId }).select("_id").lean();
     const stationIds = stations.map((s) => s._id);
 
     const order = await Order.findOneAndUpdate(
       { _id: req.params.id, station: { $in: stationIds }, status: "pending" },
-      { status: "confirmed" },
+      { $set: { status: "confirmed" }, $inc: { version: 1 } },
       { new: true }
     );
     if (!order) return res.status(404).json({ message: "Order not found or already actioned" });
 
     const customerId = order.user.toString();
 
-    // Instant socket events first
-    emitToUser(customerId, "order:update", { orderId: String(order._id), status: "confirmed" });
-    emitToUser(req.userId!, "order:update", { orderId: String(order._id), status: "confirmed" });
+    // EDGE P1-6 + WS_VS_API P0 + SYNC P1 — emit the full-payload
+    // order:update so the vendor cache patches in-place, plus the
+    // granular order:confirmed event so consumers that want the
+    // semantic cue (badges, push, etc.) don't have to parse status.
+    emitOrderUpdate(order, req.userId!);
+    emitOrderConfirmed(order, req.userId!);
 
     // Create vendor pending earning (net of platform commission) + emit
     createVendorPendingEarning(req.userId!, order._id.toString(), order.fuelCost).catch(() => {});
@@ -1208,28 +1243,42 @@ router.patch("/orders/:id/confirm", requireAuth, requireVendor, async (req, res)
 });
 
 // ===================== REJECT ORDER =====================
-router.patch("/orders/:id/reject", requireAuth, requireVendor, async (req, res) => {
+router.patch("/orders/:id/reject", requireAuth, requireVerifiedVendor, async (req, res) => {
   try {
     const stations = await GasStation.find({ vendorId: req.userId }).select("_id").lean();
     const stationIds = stations.map((s) => s._id);
     const { reason } = req.body;
 
+    // BUSINESS_RULES / decision D4 — reject reason is now structured.
+    // Accept enum value + optional notes; fall back to legacy free-text
+    // for older vendor builds via the existing `reason` field.
+    const notes = typeof req.body?.notes === "string" ? req.body.notes : undefined;
+    const reasonEnum: Record<string, string> = {
+      out_of_stock: "We're out of that fuel right now",
+      closed: "Station is closed right now",
+      unable_to_fulfil: "Can't fulfil this order",
+      other: notes ?? "Other",
+    };
+    const reasonText = reason && reasonEnum[reason] ? reasonEnum[reason] : (reason ?? "Rejected by vendor");
+
     const order = await Order.findOneAndUpdate(
       { _id: req.params.id, station: { $in: stationIds }, status: { $in: ["pending", "confirmed"] } },
-      { status: "cancelled", cancellationReason: reason ?? "Rejected by vendor" },
+      { $set: { status: "cancelled", cancellationReason: reasonText }, $inc: { version: 1 } },
       { new: true }
     );
     if (!order) return res.status(404).json({ message: "Order not found or cannot be rejected" });
 
     const customerId = order.user.toString();
 
-    // Instant socket events first
-    emitToUser(customerId, "order:update", { orderId: String(order._id), status: "cancelled" });
-    emitToUser(req.userId!, "order:update", { orderId: String(order._id), status: "cancelled" });
+    // SYNC P1 / WS_VS_API #4 — explicit order:rejected event carries
+    // the structured reason so customer + vendor UIs can render the
+    // right copy. Generic order:update follows for cache patching.
+    emitOrderUpdate(order, req.userId!);
+    emitOrderRejected(order, req.userId!, reason ?? "other", notes);
 
     // Background notification
     notifyUser(customerId, "cancelled", "Order Rejected",
-      reason ?? "Your order was rejected by the station.").catch(() => {});
+      reasonText).catch(() => {});
 
     res.json({ message: "Order rejected", orderId: order._id, status: order.status });
   } catch (err) {
@@ -1262,6 +1311,24 @@ router.patch("/station/fuels", requireAuth, requireVendor, async (req, res) => {
     ).populate("fuels.fuel");
 
     if (!station) return res.status(404).json({ message: "Station not found" });
+
+    // WS_VS_API #2 / SYNC P1 — emit stock:alert when a fuel flips to
+    // unavailable so the vendor's own other surfaces (Today screen
+    // alert strip, header badge) refresh in real-time without a
+    // refetch. Out-of-stock customers might also benefit later but
+    // the customer surface is read-via-GET today.
+    if (available === false) {
+      const fuelEntry = station.fuels.find(
+        (f: any) => f.fuel._id?.toString() === fuelId || f.fuel.toString() === fuelId,
+      );
+      emitStockAlert(req.userId!, {
+        stationId: String(station._id),
+        stationName: station.name,
+        fuel: (fuelEntry as any)?.fuel?.name,
+        kind: "unavailable",
+      });
+    }
+
     res.json({ message: "Fuel updated", fuels: station.fuels });
   } catch (err) {
     res.status(500).json({ message: "Failed to update fuel" });
@@ -1558,6 +1625,31 @@ router.post(
     await handleWithdrawRequest(req, res, "vendor");
   }
 );
+
+// ===================== WITHDRAW PREVIEW =====================
+// EDGE P1-8 — authoritative withdraw-fee preview. Mobile mirrored
+// INSTANT_FEE_RATE client-side and could drift from the server's
+// number; this endpoint returns exactly what handleWithdrawRequest
+// will charge.
+router.get("/withdraw/preview", requireAuth, requireVendor, async (req, res) => {
+  try {
+    const amountNum = Number(req.query?.amount ?? 0);
+    if (!Number.isFinite(amountNum) || amountNum <= 0) {
+      return res.status(400).json({ message: "amount query param required" });
+    }
+    const cfg = await getPlatformConfig();
+    const fee = cfg.withdrawalFeeNgn ?? 0;
+    res.json({
+      amount: amountNum,
+      fee,
+      net: Math.max(0, amountNum - 0), // net to bank = amount (fee is on top)
+      totalDebit: amountNum + fee,
+      withdrawalsEnabled: cfg.withdrawalsEnabled,
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to compute preview" });
+  }
+});
 
 // ===================== SUBSCRIBE TO PARTNER BADGE =====================
 router.post("/partner-badge/subscribe", requireAuth, requireVendor, async (req, res) => {

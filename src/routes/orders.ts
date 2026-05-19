@@ -9,6 +9,7 @@ import User from "../models/User";
 import Point from "../models/Point";
 import { requireAuth, requireCustomer } from "../middleware/auth";
 import { validate } from "../middleware/validate";
+import { idempotencyKey } from "../middleware/idempotency";
 import {
   createOrderSchema,
   updateOrderStatusSchema,
@@ -19,6 +20,15 @@ import { parsePagination } from "../utils/pagination";
 import { notifyUser } from "../utils/notify";
 import { emitToUser, emitToDelivery } from "../socket";
 import { haversineDistance, calcDeliveryFee } from "../utils/haversine";
+import { computeDeliveryFee } from "../utils/deliveryFee";
+import {
+  bumpAndSaveOrder,
+  emitOrderUpdate,
+  emitOrderConfirmed,
+  emitOrderRejected,
+  emitRiderAssigned,
+} from "../utils/orderEvents";
+import { emitPaymentFailed, emitRatingSubmitted } from "../utils/alertEvents";
 import { createVendorPendingEarning, settleOrderEarnings } from "../utils/earningsUtils";
 import Delivery from "../models/Delivery";
 import RiderProfile from "../models/RiderProfile";
@@ -69,7 +79,14 @@ async function awardPoints(
 // customers (they'd just create a malformed order doc), but
 // defense-in-depth: a vendor or rider session token shouldn't be
 // able to call any of them at all.
-router.post("/", requireAuth, requireCustomer, validate(createOrderSchema), async (req, res) => {
+// SECURITY M3 (audit) — accepts (but does not yet enforce) the
+// Idempotency-Key header so retries from the mobile client can be
+// deduped server-side. Phase 2 flips `enforce: true` once every
+// client build sends the header, and wraps the handler body in
+// `withIdempotency` for response caching. Today the middleware just
+// stashes the key on req for future use; behaviour is unchanged for
+// clients that don't send it.
+router.post("/", requireAuth, requireCustomer, idempotencyKey(), validate(createOrderSchema), async (req, res) => {
   try {
     const {
       fuelId,
@@ -81,8 +98,34 @@ router.post("/", requireAuth, requireCustomer, validate(createOrderSchema), asyn
       deliveryType,
       cylinderImages,
       returnSwapAt,
+      scheduledAt,
       note,
     } = req.body;
+
+    // USE_CASES C-5 / decision D3 — validate scheduledAt window.
+    // Min 30 min from now (anything earlier is treated as immediate);
+    // max 7 days. Server rejects out-of-window scheduled orders so
+    // the client doesn't silently lose the schedule on POST.
+    let scheduledAtDate: Date | null = null;
+    if (scheduledAt) {
+      const t = new Date(scheduledAt);
+      if (Number.isNaN(t.getTime())) {
+        return res.status(400).json({ message: "Invalid scheduledAt" });
+      }
+      const minLeadMs = 30 * 60 * 1000;
+      const maxLeadMs = 7 * 24 * 60 * 60 * 1000;
+      const lead = t.getTime() - Date.now();
+      if (lead > 0 && lead < minLeadMs) {
+        // Less than 30 min lead — treat as immediate
+        scheduledAtDate = null;
+      } else if (lead > maxLeadMs) {
+        return res.status(400).json({
+          message: "Scheduled time is more than 7 days away.",
+        });
+      } else if (lead > 0) {
+        scheduledAtDate = t;
+      }
+    }
 
     // Enforce one active order at a time
     const activeOrder = await Order.findOne({
@@ -138,28 +181,18 @@ router.post("/", requireAuth, requireCustomer, validate(createOrderSchema), asyn
     const pricePerUnit = stationFuelEntry.pricePerUnit;
     const fuelCost = Math.round(quantity * pricePerUnit);
 
-    // Calculate delivery fee via haversine if both coords are present
-    let deliveryFee = 0;
-    const stationHasCoords = station.location.lat !== 0 && station.location.lng !== 0;
-    const addressHasCoords = address.latitude !== 0 && address.longitude !== 0;
-    if (stationHasCoords && addressHasCoords) {
-      const distanceKm = haversineDistance(
-        { lat: station.location.lat, lng: station.location.lng },
-        { lat: address.latitude, lng: address.longitude }
-      );
-      deliveryFee = calcDeliveryFee(distanceKm);
-    } else {
-      // Fallback: use base fee only when coords are unavailable
-      deliveryFee = Number(process.env.DELIVERY_BASE_FEE) || 500;
-    }
-
-    // LPG-swap is a 2-trip job (delivery + return pickup), so the rider
-    // gets paid for two legs even though it's one Earning row at settle
-    // time. Double the fee at order-create time so escrow holds the
-    // right total upfront.
-    if (fuel.name === "Gas" && deliveryType === "cylinder_swap") {
-      deliveryFee = deliveryFee * 2;
-    }
+    // BUSINESS_RULES P0-2 — single source of truth for the fee math
+    // shared with the mobile preview via /api/orders/quote (added
+    // below in this PR). The helper handles base + per-km + the
+    // LPG-swap 2-trip multiplier in one place so client + server
+    // can never drift.
+    const feeBreakdown = computeDeliveryFee({
+      from: { lat: station.location.lat, lng: station.location.lng },
+      to: { lat: address.latitude, lng: address.longitude },
+      fuelName: fuel.name,
+      deliveryType,
+    });
+    const deliveryFee = feeBreakdown.finalFee;
 
     // Platform service fee (audit C.4). Configurable in basis points
     // via SERVICE_FEE_BPS (200 = 2%, the default). Computed off the
@@ -189,6 +222,7 @@ router.post("/", requireAuth, requireCustomer, validate(createOrderSchema), asyn
       deliveryAddress: deliveryAddressId,
       note: note?.trim() || undefined,
       returnSwapAt: returnSwapAt ? new Date(returnSwapAt) : undefined,
+      scheduledAt: scheduledAtDate,
     };
 
     if (fuel.name === "Gas") {
@@ -204,17 +238,24 @@ router.post("/", requireAuth, requireCustomer, validate(createOrderSchema), asyn
     let order = await Order.create(orderData);
 
     // ── Socket events fire immediately; notifications follow in background ──
-    if (station.autoAcceptOrders) {
+    // USE_CASES C-5 — scheduled orders skip auto-accept. They sit in
+    // `pending` until the schedule cron picks them up ~30 min before
+    // the slot. Vendor still gets the order:new ping so they can
+    // pre-confirm if they want.
+    if (station.autoAcceptOrders && !scheduledAtDate) {
       order.status = "confirmed";
-      await order.save();
+      // Bump version so first emit carries v1 (post-creation)
+      await bumpAndSaveOrder(order);
 
       // 1. Instant socket events (no await)
-      emitToUser(req.userId, "order:update", { orderId: String(order._id), status: "confirmed" });
-      if (station.vendorId) {
-        const vendorId = station.vendorId.toString();
-        emitToUser(vendorId, "order:new", { orderId: String(order._id), status: "confirmed", fuelName: fuel.name, quantity, unit: fuel.unit });
+      const vendorIdStr = station.vendorId ? station.vendorId.toString() : null;
+      emitOrderUpdate(order, vendorIdStr);
+      // Granular confirm event (SYNC P1 / WS_VS_API #4)
+      emitOrderConfirmed(order, vendorIdStr);
+      if (vendorIdStr) {
+        emitToUser(vendorIdStr, "order:new", { orderId: String(order._id), status: "confirmed", fuelName: fuel.name, quantity, unit: fuel.unit });
         // Create vendor earnings + emit earnings event (fast DB write)
-        createVendorPendingEarning(vendorId, order._id.toString(), fuelCost).catch(() => {});
+        createVendorPendingEarning(vendorIdStr, order._id.toString(), fuelCost).catch(() => {});
       }
 
       // 2. Background: DB notifications + push (do not block response)
@@ -246,6 +287,72 @@ router.post("/", requireAuth, requireCustomer, validate(createOrderSchema), asyn
     res.status(201).json(order);
   } catch (err) {
     res.status(500).json({ message: "Failed to place order" });
+  }
+});
+
+// ===================== QUOTE (PREVIEW) =====================
+/**
+ * BUSINESS_RULES P0-2 — authoritative delivery-fee preview for the
+ * customer's Payment screen. The mobile client used to mirror the
+ * server's formula and silently missed the LPG-swap 2× multiplier.
+ * From this PR onward, the client calls this endpoint and displays
+ * exactly what the server will charge.
+ *
+ * GET /api/orders/quote?stationId=...&addressId=...&fuelTypeId=lpg&deliveryType=cylinder_swap
+ *
+ * Response:
+ *   { breakdown: { base, perKm, distanceKm, rawFee, multiplier, reason, finalFee } }
+ *
+ * Cheap read (two findById's + the pure math helper); no DB writes.
+ */
+router.get("/quote", requireAuth, requireCustomer, async (req, res) => {
+  try {
+    const stationId = String(req.query.stationId ?? "");
+    const addressId = String(req.query.addressId ?? "");
+    const fuelTypeId = String(req.query.fuelTypeId ?? "").toLowerCase();
+    const deliveryType = req.query.deliveryType
+      ? String(req.query.deliveryType)
+      : undefined;
+    if (!stationId || !addressId || !fuelTypeId) {
+      return res.status(400).json({
+        message: "stationId, addressId, fuelTypeId are required",
+      });
+    }
+
+    const SLUG_TO_NAME: Record<string, RegExp> = {
+      petrol: /^petrol$/i,
+      diesel: /^diesel$/i,
+      kero: /^kero(sene)?$/i,
+      lpg: /^(lpg|gas|cooking gas)$/i,
+    };
+    const matcher = SLUG_TO_NAME[fuelTypeId];
+    if (!matcher) {
+      return res.status(400).json({ message: "Unknown fuelTypeId" });
+    }
+
+    const [station, address, fuel] = await Promise.all([
+      GasStation.findById(stationId).select("location").lean(),
+      Address.findById(addressId).select("latitude longitude").lean(),
+      FuelType.findOne({ name: matcher }).select("name").lean(),
+    ]);
+    if (!station)
+      return res.status(404).json({ message: "Station not found" });
+    if (!address)
+      return res.status(404).json({ message: "Address not found" });
+    if (!fuel)
+      return res.status(404).json({ message: "Fuel type not found" });
+
+    const breakdown = computeDeliveryFee({
+      from: { lat: station.location.lat, lng: station.location.lng },
+      to: { lat: address.latitude, lng: address.longitude },
+      fuelName: fuel.name,
+      deliveryType,
+    });
+
+    res.json({ breakdown });
+  } catch (err) {
+    console.error("[orders/quote]", err);
+    res.status(500).json({ message: "Failed to compute quote" });
   }
 });
 
@@ -560,12 +667,24 @@ router.patch("/:orderId/status", requireAuth, validate(updateOrderStatusSchema),
     }
 
     order.status = status;
-    await order.save();
+    // EDGE P1-6 / WS_VS_API P0 — bump version + save in one go, then
+    // emit a full-OrderDetail update to the vendor namespace so the
+    // vendor app doesn't have to GET /api/vendor/orders/:id on every
+    // event.
+    await bumpAndSaveOrder(order);
 
     const userId = order.user.toString();
 
-    // Instant socket event first
-    emitToUser(userId, "order:update", { orderId: String(order._id), status });
+    // Resolve vendorId for the dual emit.
+    let vendorId: string | null = null;
+    {
+      const GasStation = (await import("../models/Station")).default;
+      const station = await GasStation.findById(order.station)
+        .select("vendorId")
+        .lean();
+      vendorId = (station as any)?.vendorId ? String((station as any).vendorId) : null;
+    }
+    emitOrderUpdate(order, vendorId);
 
     // Background notifications (do not block response)
     Promise.resolve().then(async () => {
@@ -608,18 +727,30 @@ router.patch("/:orderId/status", requireAuth, validate(updateOrderStatusSchema),
 // ===================== CANCEL ORDER =====================
 router.patch("/:orderId/cancel", requireAuth, async (req, res) => {
   try {
-    // Phase 9 — atomic cancel. The status filter `pending` ensures
-    // two concurrent cancel requests can't both succeed; the loser
-    // gets null back and a 409. Replaces the read-then-write that
-    // was a tiny but real race window (customer double-taps the
-    // cancel button, both requests in flight before the first save).
+    const reason =
+      typeof req.body?.reason === "string"
+        ? req.body.reason.slice(0, 200)
+        : undefined;
+    // USE_CASES C-7 / decision D2 — customer self-cancel is allowed
+    // while the order is `pending` OR `confirmed` (no rider assigned
+    // yet). Once a rider is committed (status: assigned, in-transit,
+    // etc.) we don't auto-cancel — the rider's already moving and
+    // the order has to go through vendor-side cancel + manual refund.
+    // Atomic findOneAndUpdate prevents the double-tap race.
     const order = await Order.findOneAndUpdate(
       {
         _id: req.params.orderId,
         user: req.userId,
-        status: "pending",
+        status: { $in: ["pending", "confirmed"] },
+        riderId: { $exists: false },
       },
-      { status: "cancelled" },
+      {
+        $set: {
+          status: "cancelled",
+          cancellationReason: reason ?? "Cancelled by customer",
+        },
+        $inc: { version: 1 },
+      },
       { new: true }
     );
     if (!order) {
@@ -627,24 +758,80 @@ router.patch("/:orderId/cancel", requireAuth, async (req, res) => {
       // for accurate error messages. Cheap second query, only on the
       // rare error path.
       const exists = await Order.findById(req.params.orderId)
-        .select("user status")
+        .select("user status riderId")
         .lean();
       if (!exists) return res.status(404).json({ message: "Order not found" });
       if (String(exists.user) !== req.userId)
         return res.status(403).json({ message: "Forbidden" });
+      if (exists.riderId) {
+        return res.status(400).json({
+          message:
+            "A rider has already been assigned to this order. Contact support to cancel.",
+        });
+      }
       return res
         .status(400)
-        .json({ message: "Only pending orders can be cancelled" });
+        .json({ message: "Only pending or confirmed orders can be cancelled" });
     }
 
-    emitToUser(req.userId, "order:update", { orderId: String(order._id), status: "cancelled" });
+    // Resolve vendorId for the cross-role emit.
+    const station = await GasStation.findById(order.station)
+      .select("vendorId")
+      .lean();
+    const vendorIdStr = (station as any)?.vendorId
+      ? String((station as any).vendorId)
+      : null;
+
+    // Decision D2 — auto-refund to wallet (instant) for any paid
+    // order. Unpaid orders skip the refund step entirely. The
+    // refund credits Wallet.available; original payment method is
+    // never touched (Paystack chargebacks are slow + confusing).
+    if (order.paymentStatus === "paid") {
+      try {
+        const { getOrCreateUserWallet, getOrCreateSystemWallet, postTransfer } =
+          await import("../utils/wallet");
+        const userWallet = await getOrCreateUserWallet(req.userId!);
+        const escrow = await getOrCreateSystemWallet("platform-escrow");
+        await postTransfer({
+          from: escrow,
+          to: userWallet,
+          amount: order.totalCharged ?? order.totalPrice,
+          state: "available",
+          kinds: ["refund_credit", "escrow_release_debit"],
+          description: `Customer-cancel refund for order ${order._id}`,
+          opts: {
+            idempotencyKey: `order-cancel-refund:${order._id}`,
+            order: order._id,
+          },
+        });
+        order.paymentStatus = "refunded";
+        await order.save();
+      } catch (err) {
+        console.error("[orders/cancel] refund failed:", err);
+        // Refund failure shouldn't roll back the cancel — admin
+        // can reconcile from logs. The order stays cancelled.
+      }
+    }
+
+    // Customer + vendor notifications + sockets.
+    emitOrderUpdate(order, vendorIdStr);
 
     await notifyUser(
       req.userId,
       "cancelled",
       "Order Cancelled",
-      "Your order has been cancelled and any earned points have been reversed."
+      order.paymentStatus === "refunded"
+        ? "Your order is cancelled. Refund credited to your wallet."
+        : "Your order is cancelled."
     );
+    if (vendorIdStr) {
+      await notifyUser(
+        vendorIdStr,
+        "cancelled",
+        "Order cancelled by customer",
+        `Order ${String(order._id).slice(-6).toUpperCase()} was cancelled by the customer before assignment.`
+      ).catch(() => {});
+    }
 
     res.json({ message: "Order cancelled", order });
   } catch (err) {
@@ -870,6 +1057,25 @@ router.post("/:orderId/rate", requireAuth, requireCustomer, validate(rateOrderSc
     const ratings = (await Rating.find({ station: order.station }).lean()) as IRating[];
     const avgRating = ratings.reduce((sum, r) => sum + r.score, 0) / ratings.length;
     await GasStation.findByIdAndUpdate(order.station, { rating: avgRating });
+
+    // SYNC P0 — emit rating:submitted to the vendor so the dashboard
+    // average + count refresh instantly. Without this the vendor only
+    // saw a new rating on next manual refresh.
+    const station = await GasStation.findById(order.station)
+      .select("vendorId")
+      .lean();
+    const vendorIdStr = (station as any)?.vendorId
+      ? String((station as any).vendorId)
+      : null;
+    if (vendorIdStr) {
+      emitRatingSubmitted(vendorIdStr, {
+        orderId: String(order._id),
+        stationId: String(order.station),
+        stars: finalStars,
+        newAverage: Math.round(avgRating * 10) / 10,
+        totalRatings: ratings.length,
+      });
+    }
 
     await awardPoints(req.userId, POINTS_CONFIG.rateStation, "Points for rating a station");
 

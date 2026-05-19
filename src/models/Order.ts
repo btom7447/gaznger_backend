@@ -47,6 +47,16 @@ export interface IOrder extends Document {
    */
   returnSwapAt?: Date | null;
 
+  /**
+   * USE_CASES C-5 / decision D3 — scheduled order. When set, the
+   * order doesn't enter the dispatch pool until ~30 min before
+   * this time. Min lead: 30 min from place. Max lead: 7 days.
+   * Pricing locked at place time (fuelCost + deliveryFee already
+   * snapshotted on the order doc — server doesn't requote at
+   * delivery). Null/undefined = immediate dispatch.
+   */
+  scheduledAt?: Date | null;
+
   /** Customer-paid delivery timestamp (set on customer-confirm-delivered). */
   deliveredAt?: Date;
 
@@ -86,6 +96,11 @@ export interface IOrder extends Document {
     note?: string;
     ratedAt: Date;
   };
+
+  // EDGE P1-6 — monotonic status-revision counter. Bumped before
+  // every order:update emit so mobile clients can drop stale events
+  // in the cancel-vs-accept race. See utils/orderVersion.ts.
+  version: number;
 
   // Gas-specific fields
   cylinderType?: string;
@@ -169,6 +184,7 @@ const OrderSchema: Schema = new Schema(
 
     note: { type: String, maxlength: 500 },
     returnSwapAt: { type: Date, default: null },
+    scheduledAt: { type: Date, default: null },
     deliveredAt: { type: Date },
     customerHereAt: { type: Date },
     totalCharged: { type: Number },
@@ -197,6 +213,20 @@ const OrderSchema: Schema = new Schema(
       age: { type: String },
       test: { type: String },
     },
+
+    /**
+     * EDGE P1-6 — monotonic version counter bumped on every status
+     * write so the mobile client can drop stale socket events from
+     * the cancel-vs-accept race. Starts at 0; the status-change
+     * helpers (and direct order.save() calls in this codebase) bump
+     * via `order.version += 1; await order.save();` before emitting
+     * the matching `order:update` event.
+     *
+     * Mongoose has a built-in `__v` but it's incremented on save
+     * regardless of whether status changed; this dedicated field
+     * carries the "status revision" semantic the audit requires.
+     */
+    version: { type: Number, default: 0 },
   },
   { timestamps: true }
 );

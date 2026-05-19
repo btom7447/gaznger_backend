@@ -12,6 +12,7 @@ import app from "./app";
 import { connectDB } from "./config/db";
 import { initSocket } from "./socket";
 import { startOrderWatchdog } from "./jobs/orderWatchdog";
+import { startScheduledOrdersJob } from "./jobs/scheduledOrders";
 
 // Hard requirements — server cannot boot without these. The rest of
 // the integrations (Cloudinary, Firebase, Resend) degrade gracefully
@@ -38,6 +39,17 @@ const PROD_REQUIRED_ENV_VARS = [
   "WA_PHONE_NUMBER_ID",
 ];
 
+/**
+ * Hard kill-switch date for the prod dev-OTP soft-launch bypass.
+ * After this date the server REFUSES to boot when
+ * ALLOW_DEV_OTP_IN_PROD=true in production. Buys us a known cliff
+ * the flag can't outlive — closes SECURITY A1.
+ *
+ * Override via DEV_OTP_DEADLINE=YYYY-MM-DD only for genuine
+ * extension cases (write a follow-up decision doc when you do).
+ */
+const DEFAULT_DEV_OTP_DEADLINE = "2026-06-30";
+
 function validateEnv() {
   const missing = REQUIRED_ENV_VARS.filter((key) => !process.env[key]);
   const allowDevOtpInProd = process.env.ALLOW_DEV_OTP_IN_PROD === "true";
@@ -52,14 +64,37 @@ function validateEnv() {
       `Missing required environment variables: ${missing.join(", ")}`
     );
   }
+
+  // SECURITY A1 — hard cliff on the prod dev-OTP bypass. If the
+  // operator hasn't replaced ALLOW_DEV_OTP_IN_PROD with real WA
+  // creds by the deadline, refuse to boot. Failing closed is the
+  // only safe default for an "accept 123456 for any phone" gate.
+  if (process.env.NODE_ENV === "production" && allowDevOtpInProd) {
+    const deadlineStr =
+      process.env.DEV_OTP_DEADLINE ?? DEFAULT_DEV_OTP_DEADLINE;
+    const deadline = new Date(deadlineStr + "T23:59:59Z");
+    if (Number.isNaN(deadline.getTime())) {
+      throw new Error(
+        `DEV_OTP_DEADLINE is set but not a valid YYYY-MM-DD: ${deadlineStr}`,
+      );
+    }
+    if (Date.now() > deadline.getTime()) {
+      throw new Error(
+        `ALLOW_DEV_OTP_IN_PROD is still true past the hard deadline ${deadlineStr}. ` +
+          `Refusing to boot: replace ALLOW_DEV_OTP_IN_PROD with WA_ACCESS_TOKEN + WA_PHONE_NUMBER_ID, ` +
+          `or extend DEV_OTP_DEADLINE with a written decision in docs/decisions/.`,
+      );
+    }
+  }
+
   // Loud warn whenever the dev-OTP bypass is live — dev OR prod soft-launch.
   if (!process.env.WA_ACCESS_TOKEN || !process.env.WA_PHONE_NUMBER_ID) {
     const banner =
       process.env.NODE_ENV === "production" && allowDevOtpInProd
         ? "[startup] ⚠⚠⚠ PRODUCTION DEV-OTP BYPASS ACTIVE — ALLOW_DEV_OTP_IN_PROD=true. " +
-          "Code 123456 is being accepted as a valid OTP for every signup/login. " +
-          "Unset ALLOW_DEV_OTP_IN_PROD the moment WA_ACCESS_TOKEN + WA_PHONE_NUMBER_ID are configured. " +
-          "This is a soft-launch escape hatch, NOT a long-term setting."
+          `Code 123456 is being accepted as a valid OTP for every signup/login. ` +
+          `Hard cliff: ${process.env.DEV_OTP_DEADLINE ?? DEFAULT_DEV_OTP_DEADLINE} — server REFUSES TO BOOT past this date. ` +
+          "Replace ALLOW_DEV_OTP_IN_PROD with WA_ACCESS_TOKEN + WA_PHONE_NUMBER_ID ASAP."
         : "[startup] WA_ACCESS_TOKEN/WA_PHONE_NUMBER_ID not set — dev OTP mode active. Fixed code 123456 will be accepted. This is a development-only bypass.";
     console.warn(banner);
   }
@@ -74,6 +109,7 @@ const startServer = async () => {
   const server = http.createServer(app);
   initSocket(server);
   startOrderWatchdog();
+  startScheduledOrdersJob();
 
   server.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
