@@ -50,6 +50,22 @@ const router = Router();
  */
 
 /**
+ * SEC-P1 (audit run 5): hash refresh tokens at rest with SHA-256.
+ * Refresh tokens are high-entropy random strings (256 bits via
+ * signRefreshToken), so a plain digest is sufficient — no salt
+ * needed (cf. password storage where bcrypt is required). A DB
+ * read of the RefreshToken collection no longer yields plaintext
+ * session credentials.
+ *
+ * Migration note: existing plaintext rows from prior versions become
+ * effectively invalid on first /refresh-token or /logout — the
+ * hashed lookup won't match the stored plaintext. Affected users
+ * re-login once; no data migration job needed.
+ */
+const hashToken = (token: string): string =>
+  crypto.createHash("sha256").update(token).digest("hex");
+
+/**
  * Persist a refresh token with optional device metadata. The metadata
  * powers the Active Sessions screen — without it, every row reads as
  * "Unknown device". Callers should pass `req` so we can sniff the UA
@@ -64,7 +80,9 @@ const saveRefreshToken = async (
   expiresAt.setDate(expiresAt.getDate() + 7);
   await RefreshToken.create({
     user: userId,
-    token,
+    // SEC-P1 (audit run 5): store the SHA-256 digest, never the raw
+    // token. Lookups in /refresh-token + /logout hash before query.
+    token: hashToken(token),
     expiresAt,
     userAgent: meta?.userAgent,
     device: meta?.device,
@@ -1027,7 +1045,11 @@ router.post("/refresh-token", async (req, res) => {
     if (!payload)
       return res.status(401).json({ message: "Invalid refresh token" });
 
-    const storedToken = await RefreshToken.findOneAndDelete({ token: refreshToken });
+    // SEC-P1 (audit run 5): lookup by digest — stored tokens are
+    // SHA-256 hashed (see hashToken).
+    const storedToken = await RefreshToken.findOneAndDelete({
+      token: hashToken(refreshToken),
+    });
     if (!storedToken) {
       // SECURITY (audit A.7): the JWT verified but the DB row is
       // gone. That means this refresh token has already been

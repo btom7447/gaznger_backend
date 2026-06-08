@@ -25,6 +25,7 @@ import { listBanks, resolveBankAccount } from "../utils/paystack";
 import { handleWithdrawRequest } from "../utils/withdraw";
 import { moneyLimiter } from "../middleware/moneyLimiter";
 import { idempotencyKey } from "../middleware/idempotency";
+import { toObjectId } from "../utils/objectId";
 
 const router = Router();
 
@@ -1032,6 +1033,10 @@ router.patch("/orders/:id/assign", requireAuth, requireVerifiedVendor, async (re
   try {
     const { riderId } = req.body as { riderId?: string };
     if (!riderId) return res.status(400).json({ message: "riderId required" });
+    // SEC-P2 (audit A1): reject malformed riderId with 400 rather than
+    // letting CastError become a 500.
+    const riderOid = toObjectId(riderId);
+    if (!riderOid) return res.status(400).json({ message: "Invalid riderId" });
 
     const stations = await GasStation.find({ vendorId: req.userId })
       .select("_id")
@@ -1068,7 +1073,7 @@ router.patch("/orders/:id/assign", requireAuth, requireVerifiedVendor, async (re
     });
 
     order.status = "assigned";
-    order.riderId = new mongoose.Types.ObjectId(riderId);
+    order.riderId = riderOid;
     order.riderAssignedAt = new Date();
     await bumpAndSaveOrder(order);
 
@@ -1126,6 +1131,10 @@ router.patch(
     try {
       const { riderId } = req.body as { riderId?: string };
       if (!riderId) return res.status(400).json({ message: "riderId required" });
+      // SEC-P2 (audit A1): reject malformed riderId with 400 rather than
+      // letting CastError become a 500.
+      const riderOid = toObjectId(riderId);
+      if (!riderOid) return res.status(400).json({ message: "Invalid riderId" });
 
       const stations = await GasStation.find({ vendorId: req.userId })
         .select("_id")
@@ -1166,7 +1175,7 @@ router.patch(
       });
 
       const previousRiderId = order.riderId?.toString();
-      order.riderId = new mongoose.Types.ObjectId(riderId);
+      order.riderId = riderOid;
       order.riderAssignedAt = new Date();
       // Status stays "assigned" — reassign before pickup; downstream
       // events flip status as the new rider progresses.
@@ -1665,7 +1674,10 @@ router.post("/verification/submit", requireAuth, requireVendor, async (req, res)
 });
 
 // ===================== PAYSTACK BANK LIST (VENDOR) =====================
-router.get("/banks", requireAuth, async (_req, res) => {
+// SEC-P1 (audit run 5): require vendor role so authenticated customers can't enumerate
+// Paystack bank metadata / burn API quota. TODO: add 30/hour throttle once an
+// uploadLimiter-style primitive exists for Paystack proxy routes.
+router.get("/banks", requireAuth, requireVendor, async (_req, res) => {
   try {
     const banks = await listBanks();
     res.json({ banks });
@@ -1675,7 +1687,10 @@ router.get("/banks", requireAuth, async (_req, res) => {
 });
 
 // ===================== PAYSTACK RESOLVE BANK ACCOUNT (VENDOR) =====================
-router.get("/bank/resolve", requireAuth, async (req, res) => {
+// SEC-P1 (audit run 5): require vendor role so authenticated customers can't resolve
+// arbitrary Nigerian account-holder names / burn Paystack quota. TODO: add 30/hour
+// throttle once an uploadLimiter-style primitive exists for Paystack proxy routes.
+router.get("/bank/resolve", requireAuth, requireVendor, async (req, res) => {
   try {
     const { account_number, bank_code } = req.query as Record<string, string>;
     if (!account_number || !bank_code) {

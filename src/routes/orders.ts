@@ -672,13 +672,24 @@ router.patch("/:orderId/status", requireAuth, validate(updateOrderStatusSchema),
     const { status } = req.body;
 
     const order = await Order.findById(req.params.orderId);
-    if (!order) return res.status(404).json({ message: "Order not found" });
-
-    // Resolve caller role + ownership before mutating anything.
+    // SEC-P2 (audit run 6): collapsed the prior 404 "Order not found"
+    // branch into the same 403 used for ownership failures below. The
+    // differentiated 404/403 let non-owners enumerate which orderIds
+    // exist on the platform. Admins still get to operate on any order;
+    // for everyone else, "doesn't exist" and "not yours" are
+    // indistinguishable from the wire.
     const caller = await User.findById(req.userId).select("role").lean();
     if (!caller) return res.status(401).json({ message: "Unauthorized" });
 
     const role = caller.role as Role;
+    if (!order) {
+      // Admins see the truthful 404 so the admin dashboard can render
+      // a sensible "Order missing" state. All other roles get 403.
+      return role === "admin"
+        ? res.status(404).json({ message: "Order not found" })
+        : res.status(403).json({ message: "Forbidden" });
+    }
+
     const prevStatus = order.status;
 
     // Ownership gates per role:
@@ -767,7 +778,12 @@ router.patch("/:orderId/status", requireAuth, validate(updateOrderStatusSchema),
 });
 
 // ===================== CANCEL ORDER =====================
-router.patch("/:orderId/cancel", requireAuth, async (req, res) => {
+// SEC-P2 (audit run 6): customer-only gate. Previously requireAuth-only,
+// which let any authenticated role hit the route. The actual ownership
+// gate lives in the findOneAndUpdate filter below, but a vendor/rider
+// landing here exercises the differentiated error branch and learns
+// about orders that aren't theirs.
+router.patch("/:orderId/cancel", requireAuth, requireCustomer, async (req, res) => {
   try {
     const reason =
       typeof req.body?.reason === "string"
@@ -796,15 +812,23 @@ router.patch("/:orderId/cancel", requireAuth, async (req, res) => {
       { new: true }
     );
     if (!order) {
-      // Differentiate "not yours" from "wrong status" by re-fetching
-      // for accurate error messages. Cheap second query, only on the
-      // rare error path.
-      const exists = await Order.findById(req.params.orderId)
-        .select("user status riderId")
+      // SEC-P2 (audit run 6): collapsed previous differentiated 404/403/
+      // 400 responses (including the "A rider has already been assigned"
+      // string) into a single uniform shape BEFORE any role-discriminating
+      // read. The earlier branch leaked existence + assignment state to
+      // non-owners who could probe arbitrary orderIds. We still need to
+      // know whether the order is the caller's own (so a legitimate
+      // customer hitting a too-late state sees the actionable message),
+      // so the re-fetch is gated on ownership FIRST — anything else
+      // returns a uniform 403 with no information about why.
+      const exists = await Order.findOne({
+        _id: req.params.orderId,
+        user: req.userId,
+      })
+        .select("status riderId")
         .lean();
-      if (!exists) return res.status(404).json({ message: "Order not found" });
-      if (String(exists.user) !== req.userId)
-        return res.status(403).json({ message: "Forbidden" });
+      if (!exists) return res.status(403).json({ message: "Forbidden" });
+      // Order is the caller's — safe to surface the actionable reason.
       if (exists.riderId) {
         return res.status(400).json({
           message:

@@ -52,6 +52,25 @@ export async function handleWithdrawRequest(
     if (!Number.isFinite(amountNum) || amountNum <= 0) {
       return res.status(400).json({ message: "Invalid withdrawal amount" });
     }
+    // SEC-P2 (audit run 6): Paystack transfers are denominated in whole
+    // Naira (we multiply by 100 to kobo). Fractional Naira would be
+    // silently rounded by the multiplication, opening a 1-kobo
+    // round-trip exploit and ledger drift. Require integer NGN.
+    if (!Number.isInteger(amountNum)) {
+      return res.status(400).json({
+        message: "Withdrawal amount must be a whole number of Naira",
+      });
+    }
+    // SEC-P2 (audit run 6): upper cap on withdrawal amount. Catches
+    // typos and limits blast radius if upstream balance checks were
+    // ever bypassed. Optional-chained off PlatformConfig; ₦500,000
+    // default.
+    const maxWithdraw = (cfg as any).maxWithdrawNgn ?? 500_000;
+    if (amountNum > maxWithdraw) {
+      return res.status(400).json({
+        message: `Maximum withdrawal is ₦${maxWithdraw.toLocaleString()}`,
+      });
+    }
 
     const user = await User.findById(req.userId);
     if (!user) return res.status(404).json({ message: "User not found" });

@@ -300,6 +300,23 @@ export function emitToUser(userId: string, event: string, data: unknown): void {
 }
 
 /**
+ * SEC-P2 (audit run 6): force-disconnect every live socket belonging
+ * to a user. The `accountStatusCache` is positive-only and the JWT-
+ * gate runs at connect time — so a user who is suspended mid-session
+ * keeps their existing socket (and delivery-room membership) until the
+ * client reconnects. Call this from the admin suspend path so they are
+ * kicked immediately and forced to re-handshake (which then fails the
+ * isAccountAllowed check).
+ *
+ * Returns silently if io hasn't been initialised yet (e.g. test runs).
+ */
+export function disconnectUserSockets(userId: string): void {
+  if (!io) return;
+  io.in(Rooms.user(userId)).disconnectSockets(true);
+  slog("disc", { uid: userId, room: Rooms.user(userId) });
+}
+
+/**
  * Emit an event to every connected admin.
  *
  * P1-3 (audit run 1): admin-web pre-fix had ZERO socket subscriptions

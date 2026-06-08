@@ -5,7 +5,12 @@ import { redactSensitive } from "../utils/redact";
 export function validate(schema: ZodSchema) {
   return (req: Request, res: Response, next: NextFunction) => {
     try {
-      schema.parse(req.body);
+      // SEC-P2 (audit A1): use the Zod-parsed result so coercion +
+      // defaults reach the route handler. Previously the parsed value
+      // was discarded and raw req.body flowed into Mongoose, leaving
+      // strict-mode as the only line of defence against unknown keys
+      // (e.g. address.ts spreads req.body into Address.create).
+      req.body = schema.parse(req.body);
       next();
     } catch (err) {
       if (err instanceof ZodError) {

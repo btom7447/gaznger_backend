@@ -8,7 +8,7 @@ import RiderProfile from "../models/RiderProfile";
 import Earning from "../models/Earning";
 import Delivery from "../models/Delivery";
 import { adminVerificationDecisionSchema } from "../validators/auth.validators";
-import { emitToUser } from "../socket";
+import { disconnectUserSockets, emitToUser } from "../socket";
 import { notifyUser } from "../utils/notify";
 import { writeAudit } from "../utils/audit";
 import { safeRegexSearch } from "../utils/safeRegex";
@@ -613,6 +613,13 @@ router.patch("/users/:id/account-status", async (req, res) => {
       // request. Pre-fix the 15-min access window meant a suspended
       // user could keep authenticating until their token expired.
       await bumpTokenVersion(String(user._id));
+      // SEC-P2 (audit run 6): the socket accountStatusCache is
+      // positive-only with a 60s TTL, but it's only consulted at
+      // connect time. An already-connected suspended user retains
+      // their socket + delivery-room membership until they reconnect.
+      // Force-disconnect now so the client re-handshakes and fails
+      // the isAccountAllowed gate.
+      disconnectUserSockets(String(user._id));
       // P1-6 (audit run 5): pair the socket with a push so a
       // backgrounded user actually sees the suspension. Pre-fix this
       // route emitted socket-only — suspended users with the app

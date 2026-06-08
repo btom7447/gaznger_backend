@@ -433,6 +433,16 @@ router.post("/topup/initialize", requireAuth, moneyLimiter, idempotencyKey(), as
       return res.status(400).json({
         message: `Minimum top-up is ₦${cfg.minChargeNgn.toLocaleString()}`,
       });
+    // SEC-P2 (audit run 6): upper cap on top-up amount. Without this
+    // a hostile/buggy client could initialize a Paystack charge for an
+    // absurd amount and credit the wallet on verify. Optional-chained
+    // off PlatformConfig so admins can raise the ceiling without a
+    // schema migration; defaults to ₦500,000.
+    const maxTopup = (cfg as any).maxTopupNgn ?? 500_000;
+    if (amountNum > maxTopup)
+      return res.status(400).json({
+        message: `Maximum top-up is ₦${maxTopup.toLocaleString()}`,
+      });
 
     const user = await User.findById(req.userId);
     if (!user) return res.status(404).json({ message: "User not found" });

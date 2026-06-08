@@ -2,7 +2,7 @@ import { Router } from "express";
 import mongoose from "mongoose";
 import multer from "multer";
 import cloudinary from "../utils/cloudinary";
-import { requireAuth, requireRider } from "../middleware/auth";
+import { requireAuth, requireRider, requireCustomer } from "../middleware/auth";
 import User from "../models/User";
 import RiderProfile from "../models/RiderProfile";
 import Delivery from "../models/Delivery";
@@ -1156,7 +1156,10 @@ router.get("/stats", requireAuth, requireRider, async (req, res) => {
 });
 
 // ===================== PAYSTACK BANK LIST =====================
-router.get("/banks", requireAuth, async (_req, res) => {
+// SEC-P1 (audit run 5): require rider role so authenticated customers can't enumerate
+// Paystack bank metadata / burn API quota. TODO: add 30/hour throttle once an
+// uploadLimiter-style primitive exists for Paystack proxy routes.
+router.get("/banks", requireAuth, requireRider, async (_req, res) => {
   try {
     const banks = await listBanks();
     res.json({ banks });
@@ -1166,7 +1169,10 @@ router.get("/banks", requireAuth, async (_req, res) => {
 });
 
 // ===================== PAYSTACK RESOLVE BANK ACCOUNT =====================
-router.get("/bank/resolve", requireAuth, async (req, res) => {
+// SEC-P1 (audit run 5): require rider role so authenticated customers can't resolve
+// arbitrary Nigerian account-holder names / burn Paystack quota. TODO: add 30/hour
+// throttle once an uploadLimiter-style primitive exists for Paystack proxy routes.
+router.get("/bank/resolve", requireAuth, requireRider, async (req, res) => {
   try {
     const { account_number, bank_code } = req.query as Record<string, string>;
     if (!account_number || !bank_code) {
@@ -1323,16 +1329,30 @@ router.get("/ratings", requireAuth, requireRider, async (req, res) => {
 });
 
 // ===================== RATE A RIDER (by customer, after delivery) =====================
-router.post("/rate/:riderId", requireAuth, async (req, res) => {
+// SEC-P2 (audit run 6): customer-only gate + verify rider matches the
+// order's assigned rider. Previously any authenticated user (including
+// a rider or vendor) could POST to this endpoint, and even a legitimate
+// customer could 1-star ANY rider by pairing their own order's id with
+// a different riderId in the URL. We now require requireCustomer,
+// mandate body.orderId (already validated above), and assert the order
+// was actually delivered by req.params.riderId.
+router.post("/rate/:riderId", requireAuth, requireCustomer, async (req, res) => {
   try {
     const { orderId, score } = req.body;
     if (!orderId || !score || score < 1 || score > 5) {
       return res.status(400).json({ message: "orderId and score (1–5) are required" });
     }
 
-    // Verify the customer placed this order
+    // Verify the customer placed this order AND it was delivered by
+    // the rider being rated. Collapsed into a single Forbidden so a
+    // probing client can't differentiate "not your order" from
+    // "wrong rider for this order".
     const order = await Order.findById(orderId).lean();
-    if (!order || order.user.toString() !== req.userId) {
+    if (
+      !order ||
+      order.user.toString() !== req.userId ||
+      order.riderId?.toString() !== req.params.riderId
+    ) {
       return res.status(403).json({ message: "Forbidden" });
     }
     if (order.status !== "delivered") {

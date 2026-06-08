@@ -12,6 +12,7 @@ import BulkDispute from "../models/BulkDispute";
 import { emitToUser } from "../socket";
 import { notifyUser } from "../utils/notify";
 import { getCommissionRate } from "../utils/platformConfig";
+import { toObjectId } from "../utils/objectId";
 
 /**
  * Vendor bulk-purchase routes — backs the v6 Supplies screens:
@@ -82,7 +83,11 @@ router.get("/plants", requireAuth, requireVendor, async (req, res) => {
     const filter: Record<string, unknown> = { isApproved: true, isActive: true };
     if (state) filter.state = state;
     if (fuelTypeId) {
-      filter["products.fuel"] = new mongoose.Types.ObjectId(fuelTypeId);
+      // SEC-P2 (audit A1): reject malformed fuelTypeId with 400 rather
+      // than letting CastError become a 500.
+      const fuelOid = toObjectId(fuelTypeId);
+      if (!fuelOid) return res.status(400).json({ message: "Invalid fuelTypeId" });
+      filter["products.fuel"] = fuelOid;
       filter["products.available"] = true;
     }
 

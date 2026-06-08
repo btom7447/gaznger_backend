@@ -172,8 +172,14 @@ router.patch("/config", async (req, res) => {
 /**
  * POST /api/admin/users/:id/activate
  * Body: { reason? }
+ *
+ * SEC-P2 (audit run 6): idempotencyKey() for parity with sibling
+ * /disputes/:id/{resolve,reject} and the refund/retry routes below.
+ * Without it, a double-clicked Activate writes two AuditLog rows + two
+ * "Account Activated" pushes (status flip itself is idempotent in
+ * effect since the second write sets the same value).
  */
-router.post("/users/:id/activate", async (req, res) => {
+router.post("/users/:id/activate", idempotencyKey(), async (req, res) => {
   try {
     const user = await User.findById(req.params.id);
     if (!user) return res.status(404).json({ message: "User not found" });
@@ -205,8 +211,10 @@ router.post("/users/:id/activate", async (req, res) => {
 /**
  * POST /api/admin/users/:id/suspend
  * Body: { reason }
+ *
+ * SEC-P2 (audit run 6): idempotencyKey() parity — see /activate above.
  */
-router.post("/users/:id/suspend", async (req, res) => {
+router.post("/users/:id/suspend", idempotencyKey(), async (req, res) => {
   try {
     if (!req.body?.reason)
       return res.status(400).json({ message: "reason is required" });
@@ -242,8 +250,10 @@ router.post("/users/:id/suspend", async (req, res) => {
  * Verifies vendor or rider KYC. Vendor → User.vendorVerification.status,
  * Rider → RiderProfile.verificationStatus + isVerified.
  * Body: { kind: "vendor" | "rider", note? }
+ *
+ * SEC-P2 (audit run 6): idempotencyKey() parity — see /activate above.
  */
-router.post("/users/:id/verify", async (req, res) => {
+router.post("/users/:id/verify", idempotencyKey(), async (req, res) => {
   try {
     const { kind, note } = req.body ?? {};
     if (kind !== "vendor" && kind !== "rider")
@@ -328,8 +338,10 @@ router.post("/users/:id/verify", async (req, res) => {
 /**
  * POST /api/admin/users/:id/reject
  * Body: { kind: "vendor" | "rider", reason }
+ *
+ * SEC-P2 (audit run 6): idempotencyKey() parity — see /activate above.
  */
-router.post("/users/:id/reject", async (req, res) => {
+router.post("/users/:id/reject", idempotencyKey(), async (req, res) => {
   try {
     const { kind, reason } = req.body ?? {};
     if (kind !== "vendor" && kind !== "rider")
@@ -399,8 +411,10 @@ router.post("/users/:id/reject", async (req, res) => {
 /**
  * POST /api/admin/users/:id/withdrawal-hold
  * Body: { active: boolean, reason? }
+ *
+ * SEC-P2 (audit run 6): idempotencyKey() parity — see /activate above.
  */
-router.post("/users/:id/withdrawal-hold", async (req, res) => {
+router.post("/users/:id/withdrawal-hold", idempotencyKey(), async (req, res) => {
   try {
     const { active, reason } = req.body ?? {};
     if (typeof active !== "boolean")
@@ -452,8 +466,12 @@ router.post("/users/:id/withdrawal-hold", async (req, res) => {
  * POST /api/admin/users/:id/message
  * Body: { title, message }
  * Sends a one-off in-app notification + push.
+ *
+ * SEC-P2 (audit run 6): idempotencyKey() parity — see /activate above.
+ * Especially important here since the only effect IS a notification +
+ * audit row; a retried request without dedupe spams the user.
  */
-router.post("/users/:id/message", async (req, res) => {
+router.post("/users/:id/message", idempotencyKey(), async (req, res) => {
   try {
     const { title, message } = req.body ?? {};
     if (!title || !message)

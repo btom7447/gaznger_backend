@@ -9,6 +9,7 @@ import GasStation from "../models/Station";
 import RiderProfile from "../models/RiderProfile";
 import { emitToUser } from "../socket";
 import { notifyUser } from "../utils/notify";
+import { toObjectId } from "../utils/objectId";
 
 const router = Router();
 
@@ -228,6 +229,20 @@ router.post("/", requireAuth, async (req: any, res) => {
         .status(400)
         .json({ message: "peerUserId and peerRole required" });
     }
+    // SEC-P2 (audit A1): reject malformed peerUserId / orderRef / bulkRef
+    // with 400 rather than letting CastError become a 500.
+    const peerOid = toObjectId(peerUserId);
+    if (!peerOid) return res.status(400).json({ message: "Invalid peerUserId" });
+    const orderRefOid = orderRef ? toObjectId(orderRef) : undefined;
+    if (orderRef && !orderRefOid)
+      return res.status(400).json({ message: "Invalid orderRef" });
+    const bulkRefOid = bulkRef ? toObjectId(bulkRef) : undefined;
+    if (bulkRef && !bulkRefOid)
+      return res.status(400).json({ message: "Invalid bulkRef" });
+    // After the guards above `*Oid` is either an ObjectId or undefined —
+    // narrow null out of the union so Mongoose's create() signature is happy.
+    const orderRefOidSafe = orderRefOid ?? undefined;
+    const bulkRefOidSafe = bulkRefOid ?? undefined;
 
     const check = await canChat(
       meId,
@@ -251,13 +266,13 @@ router.post("/", requireAuth, async (req: any, res) => {
       participants: [
         { user: new mongoose.Types.ObjectId(meId), role: meRoleVal, unread: 0 },
         {
-          user: new mongoose.Types.ObjectId(peerUserId),
+          user: peerOid,
           role: peerRole,
           unread: 0,
         },
       ],
-      orderRef: orderRef ? new mongoose.Types.ObjectId(orderRef) : undefined,
-      bulkRef: bulkRef ? new mongoose.Types.ObjectId(bulkRef) : undefined,
+      orderRef: orderRefOidSafe,
+      bulkRef: bulkRefOidSafe,
     });
     res.status(201).json({ chat });
   } catch (err) {

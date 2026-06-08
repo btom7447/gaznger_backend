@@ -11,6 +11,7 @@ import GasStation from "../models/Station";
 import FuelPlantOrder from "../models/FuelPlantOrder";
 import { getOrCreateUserWallet } from "../utils/wallet";
 import { resolveBankAccount } from "../utils/paystack";
+import { toObjectId } from "../utils/objectId";
 
 /**
  * Vendor Phase-6 finance endpoints. The customer/rider wallet routes
@@ -463,7 +464,11 @@ router.get("/banks/saved", requireAuth, requireVendor, async (req, res) => {
     const { stationId } = req.query as { stationId?: string };
     const q: Record<string, unknown> = { user: req.userId };
     if (stationId) {
-      q.station = new mongoose.Types.ObjectId(stationId);
+      // SEC-P2 (audit A1): reject malformed stationId with 400 rather
+      // than letting CastError become a 500.
+      const stationOid = toObjectId(stationId);
+      if (!stationOid) return res.status(400).json({ message: "Invalid stationId" });
+      q.station = stationOid;
     }
     const accounts = await BankAccount.find(q)
       .sort({ isPrimary: -1, createdAt: -1 })

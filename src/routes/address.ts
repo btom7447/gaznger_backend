@@ -1,10 +1,10 @@
-import mongoose from "mongoose";
 import { Router } from "express";
 import User from "../models/User";
 import Address from "../models/Address";
 import { requireAuth } from "../middleware/auth";
 import { validate } from "../middleware/validate";
 import { createAddressSchema, updateAddressSchema } from "../validators/address.validators";
+import { toObjectId } from "../utils/objectId";
 
 const router = Router();
 
@@ -100,7 +100,10 @@ router.patch("/default/:addressId", requireAuth, async (req, res) => {
     const user = await User.findById(req.userId);
     if (!user) return res.status(404).json({ message: "User not found" });
 
-    const addressId = new mongoose.Types.ObjectId(req.params.addressId as string);
+    // SEC-P2 (audit A1): reject bad addressId with 400 rather than the
+    // 500 a CastError would surface.
+    const addressId = toObjectId(req.params.addressId);
+    if (!addressId) return res.status(400).json({ message: "Invalid addressId" });
 
     if (!user.addressBook.some((id) => id.equals(addressId)))
       return res.status(400).json({ message: "Address does not belong to user" });
