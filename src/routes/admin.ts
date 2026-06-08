@@ -65,7 +65,12 @@ router.get("/stats", async (_req, res) => {
         settled: earnings.settled ?? 0,
       },
       riders: { active: activeRiders },
-      stations: { total: stationCount },
+      // P2-MF (audit run 4): flatten to a plain number to match the
+      // admin-web `StatsResponse.stations: number` shape. Pre-fix
+      // the server returned `{ total: stationCount }` which would
+      // have rendered as "[object Object]" / NaN if the dashboard
+      // ever displayed it (currently unrendered, but a foot-gun).
+      stations: stationCount,
     });
   } catch (err) {
     res.status(500).json({ message: "Failed to fetch stats" });

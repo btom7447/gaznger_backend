@@ -198,11 +198,20 @@ router.post("/verify", requireAuth, moneyLimiter, idempotencyKey(), async (req, 
     });
     await saveCardOnUser(order.user.toString(), data.authorization);
 
-    if (order.paymentStatus !== "paid") {
-      order.paymentStatus = "paid";
-      order.status = "confirmed";
-      await order.save();
-
+    // SEC-P2 (audit run 6): atomic flip. Pre-fix this and the webhook
+    // charge.success handler both did `if !== "paid" { ... save() }`;
+    // concurrent /verify + webhook both passed the guard and fired
+    // two "Payment Successful" pushes. findOneAndUpdate with a
+    // guard-in-filter resolves the race — only one writer wins, the
+    // loser sees `flipped == null` and skips the side effects.
+    const flipped = await Order.findOneAndUpdate(
+      { _id: order._id, paymentStatus: { $ne: "paid" } },
+      { $set: { paymentStatus: "paid", status: "confirmed" } },
+      { new: true },
+    );
+    if (flipped) {
+      order.paymentStatus = flipped.paymentStatus;
+      order.status = flipped.status;
       await notifyUser(
         req.userId!,
         "payment",
@@ -645,11 +654,15 @@ router.post("/webhook", async (req, res) => {
             });
             await saveCardOnUser(order.user.toString(), data.authorization);
 
-            if (order.paymentStatus !== "paid") {
-              order.paymentStatus = "paid";
-              order.status = "confirmed";
-              await order.save();
-
+            // SEC-P2 (audit run 6): atomic flip — see the verify
+            // handler above for the rationale. Without this, a
+            // concurrent /verify + webhook both fire the push.
+            const flipped = await Order.findOneAndUpdate(
+              { _id: order._id, paymentStatus: { $ne: "paid" } },
+              { $set: { paymentStatus: "paid", status: "confirmed" } },
+              { new: true },
+            );
+            if (flipped) {
               await notifyUser(
                 order.user.toString(),
                 "payment",
@@ -658,8 +671,8 @@ router.post("/webhook", async (req, res) => {
               );
               emitToUser(order.user.toString(), "order:update", {
                 orderId: order._id.toString(),
-                status: order.status,
-                paymentStatus: order.paymentStatus,
+                status: flipped.status,
+                paymentStatus: flipped.paymentStatus,
               });
             }
           }

@@ -1096,9 +1096,10 @@ router.post("/refresh-token", async (req, res) => {
 // ===================== LOGOUT =====================
 router.post("/logout", async (req, res) => {
   try {
-    const { refreshToken, allDevices } = req.body as {
+    const { refreshToken, allDevices, deviceToken } = req.body as {
       refreshToken?: string;
       allDevices?: boolean;
+      deviceToken?: string;
     };
     if (!refreshToken)
       return res.status(400).json({ message: "Refresh token required" });
@@ -1116,12 +1117,34 @@ router.post("/logout", async (req, res) => {
       await RefreshToken.deleteMany({ user: userId });
       await bumpTokenVersion(userId);
     } else {
-      await RefreshToken.findOneAndDelete({ token: refreshToken });
+      // SEC-P1 (audit run 5): lookup by SHA-256 digest — refresh
+      // tokens are stored hashed (see saveRefreshToken). Pre-fix
+      // this queried by plaintext, so logout silently never found
+      // the matching row and the token persisted in DB until TTL
+      // expiry, defeating the whole logout flow post-hashing.
+      await RefreshToken.findOneAndDelete({ token: hashToken(refreshToken) });
       // SEC-P1: single-device logout also bumps so the matching
       // 15-min access JWT is rejected immediately. (Acceptable
       // collateral: other devices have to refresh once.)
       if (userId) await bumpTokenVersion(userId);
     }
+
+    // SEC-P2 (audit run 6): strip the device's push token on logout
+    // so a stolen access token can't continue phishing pushes to
+    // the victim's device. Mobile is expected to send either
+    // `body.deviceToken` or the `X-Device-Push-Token` header.
+    const pushTokenToRemove =
+      deviceToken ??
+      (req.get("x-device-push-token") as string | undefined);
+    if (pushTokenToRemove && userId) {
+      await User.updateOne(
+        { _id: userId },
+        { $pull: { deviceTokens: pushTokenToRemove } },
+      ).catch(() => {
+        /* best-effort */
+      });
+    }
+
     res.json({ message: "Logged out successfully" });
   } catch (err) {
     res.status(500).json({ message: "Internal server error" });

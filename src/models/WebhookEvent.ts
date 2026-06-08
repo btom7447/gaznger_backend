@@ -38,5 +38,15 @@ const WebhookEventSchema: Schema<IWebhookEvent> = new Schema(
 
 WebhookEventSchema.index({ source: 1, eventId: 1 }, { unique: true });
 WebhookEventSchema.index({ createdAt: -1 });
+// SEC-P2 (audit run 6): TTL on raw webhook payloads. Pre-fix every
+// Paystack event (containing authorization_code, last4, bin, brand,
+// exp_month, exp_year, customer email) accumulated indefinitely —
+// any DB leak exposed the full payment history. 90 days is long
+// enough for incident replay; older events can be re-fetched from
+// Paystack directly if absolutely needed.
+WebhookEventSchema.index(
+  { createdAt: 1 },
+  { expireAfterSeconds: 90 * 24 * 60 * 60 },
+);
 
 export default mongoose.model<IWebhookEvent>("WebhookEvent", WebhookEventSchema);

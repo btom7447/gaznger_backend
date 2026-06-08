@@ -1,17 +1,21 @@
-import rateLimit, { ipKeyGenerator } from "express-rate-limit";
+import rateLimit from "express-rate-limit";
 
 /**
  * Tighter rate limiter for money-handling endpoints. Stops card-testing
- * and brute-force withdrawal probing. Keyed by user when authenticated,
- * IP otherwise.
+ * and brute-force withdrawal probing. Keyed by authenticated userId.
  *
  * 20 req/min should never be hit in normal operation — a single
  * checkout costs ~3 calls (initialize + verify + maybe redeem).
  *
- * NOTE: Custom keyGenerators that fall back to the request IP must run
- * the IP through `ipKeyGenerator` so IPv6 addresses get normalised by
- * subnet — otherwise IPv6 callers can bypass the limit by varying the
- * trailing 64 bits. Triggers ERR_ERL_KEY_GEN_IPV6 in v8+ if missed.
+ * SEC-P2 (audit run 6): pre-fix the keyGenerator fell back to
+ * `ipKeyGenerator(req.ip ?? "anon")` when `req.userId` was missing.
+ * Every caller is post-requireAuth today so the fallback was dead
+ * code, but a foot-gun: a future "money" route mounted before
+ * requireAuth would collapse every limiter bucket to the literal
+ * string "anon" or to the proxy edge IP. Fail loudly instead —
+ * Express converts the throw into a 500 at the misconfigured
+ * route, which surfaces the bug at first request rather than
+ * silently treating every caller as one bucket.
  */
 export const moneyLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -19,6 +23,11 @@ export const moneyLimiter = rateLimit({
   message: { message: "Too many payment requests. Please wait a moment." },
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req, res) =>
-    (req as any).userId ?? ipKeyGenerator(req.ip ?? "anon"),
+  keyGenerator: (req, _res) => {
+    const userId = (req as any).userId as string | undefined;
+    if (userId) return userId;
+    throw new Error(
+      "moneyLimiter requires req.userId — ensure requireAuth runs first",
+    );
+  },
 });
