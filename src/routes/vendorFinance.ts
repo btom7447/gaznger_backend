@@ -11,6 +11,8 @@ import GasStation from "../models/Station";
 import FuelPlantOrder from "../models/FuelPlantOrder";
 import { getOrCreateUserWallet } from "../utils/wallet";
 import { resolveBankAccount } from "../utils/paystack";
+import { notifyUser } from "../utils/notify";
+import { requirePinStepUp } from "../utils/pinStepUp";
 import { toObjectId } from "../utils/objectId";
 
 /**
@@ -502,6 +504,12 @@ router.post("/banks/saved", requireAuth, requireVendor, async (req, res) => {
       });
     }
 
+    // SEC-P1 (audit run 5): PIN step-up before adding a payout
+    // destination. A stolen access token without the PIN can no
+    // longer redirect withdrawals to an attacker-owned bank.
+    const stepUp = await requirePinStepUp(req, res);
+    if (stepUp) return;
+
     // Confirm the station belongs to this vendor.
     const GasStation = (await import("../models/Station")).default;
     const station = await GasStation.findOne({
@@ -561,6 +569,17 @@ router.post("/banks/saved", requireAuth, requireVendor, async (req, res) => {
       isPrimary: stationCount === 0,
       bvnVerified: false,
     });
+
+    // SEC-P1: cross-device notify so legitimate other sessions see
+    // the change. If the actor wasn't the user, the legit user gets
+    // a push they can react to ("if this wasn't you, contact support").
+    await notifyUser(
+      req.userId!,
+      "account",
+      "Bank account added",
+      `A new bank account (${accountName}) was added to your profile. If this wasn't you, contact support immediately.`,
+    ).catch(() => {});
+
     res.status(201).json({ account });
   } catch (err) {
     console.error("[vendor/banks/saved POST]", err);
@@ -575,6 +594,11 @@ router.patch(
   requireVendor,
   async (req, res) => {
     try {
+      // SEC-P1: PIN step-up — flipping primary on an attacker-added
+      // bank is the same blast radius as adding one.
+      const stepUp = await requirePinStepUp(req, res);
+      if (stepUp) return;
+
       const idStr = Array.isArray(req.params.id)
         ? req.params.id[0]
         : (req.params.id as string);
@@ -601,6 +625,17 @@ router.patch(
       });
       target.isPrimary = true;
       await target.save();
+
+      // SEC-P1: cross-device notify so legit other sessions see the
+      // primary change. Money flowing to a different account is the
+      // sort of thing the legit user wants to confirm.
+      await notifyUser(
+        req.userId!,
+        "account",
+        "Primary payout bank changed",
+        `Your primary payout bank was changed to ${target.bankName} (${target.accountNumber.slice(-4)}). If this wasn't you, contact support immediately.`,
+      ).catch(() => {});
+
       res.json({ account: target });
     } catch (err) {
       res.status(500).json({ message: "Failed to set primary" });

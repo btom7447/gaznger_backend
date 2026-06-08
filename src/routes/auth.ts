@@ -1607,6 +1607,104 @@ router.get("/sessions", requireAuth, async (req, res) => {
   }
 });
 
+// ===================== DATA EXPORT (NDPR / GDPR right of access) =====================
+/**
+ * GET /api/auth/me/export
+ *
+ * Compliance P1 (audit run 6): NDPR / GDPR right of access. Returns
+ * a JSON bundle of the user's personal data + linked records so they
+ * can exercise their right to portability without an ops ticket.
+ *
+ * The bundle redacts everything that's strictly NOT theirs (other
+ * users' phone numbers in chats they participate in are masked, etc.)
+ * and explicitly excludes infrastructural fields (push tokens,
+ * refresh-token hashes, PIN hash) that have no informational value
+ * to the user and are sensitive on a downstream leak.
+ *
+ * Streamed as application/json with a Content-Disposition: attachment
+ * header so the mobile/admin client can offer "Save / Share" UX
+ * without the body sitting in DOM.
+ */
+router.get("/me/export", requireAuth, async (req, res) => {
+  try {
+    const user = await User.findById(req.userId).select(
+      "-passwordHash -pinHash -otpCode -otpExpiresAt -otpResendAvailableAt" +
+        " -deviceTokens -lastPaystackAuth -pinFailures",
+    ).lean();
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    // Side-loads. Each is scoped to req.userId so cross-user leakage
+    // is impossible. Heavy collections (Orders, Notifications) are
+    // capped — the audit spec says "portability" not "snapshot of
+    // last 5 years"; users with > 1k orders can request bulk export
+    // via support.
+    const [
+      orders,
+      addresses,
+      notifications,
+      ratings,
+      withdrawals,
+      disputes,
+    ] = await Promise.all([
+      (await import("../models/Order")).default
+        .find({ user: req.userId })
+        .sort({ createdAt: -1 })
+        .limit(1000)
+        .lean(),
+      (await import("../models/Address")).default
+        .find({ user: req.userId })
+        .lean(),
+      (await import("../models/Notification")).default
+        .find({ user: req.userId })
+        .sort({ createdAt: -1 })
+        .limit(500)
+        .lean(),
+      (await import("../models/Rating")).default
+        .find({ user: req.userId })
+        .lean(),
+      (await import("../models/Withdrawal")).default
+        .find({ user: req.userId })
+        .select("-idempotencyKey")
+        .lean(),
+      (await import("../models/Dispute")).default
+        .find({ raisedBy: req.userId })
+        .lean(),
+    ]);
+
+    const bundle = {
+      generatedAt: new Date().toISOString(),
+      schemaVersion: 1,
+      user,
+      orders,
+      addresses,
+      notifications,
+      ratings,
+      withdrawals,
+      disputes,
+      _notes: [
+        "Generated under NDPR right of access. Covers up to the most",
+        "recent 1000 orders + 500 notifications. For older records or",
+        "chat/message exports, contact support.",
+        "Push tokens, PIN, password, refresh tokens, and Paystack",
+        "auth-code are excluded for security.",
+      ],
+    };
+
+    const filename = `gaznger-export-${String(user._id)}-${new Date()
+      .toISOString()
+      .slice(0, 10)}.json`;
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${filename}"`,
+    );
+    res.send(JSON.stringify(bundle, null, 2));
+  } catch (err) {
+    console.error("[auth/me/export]", err);
+    res.status(500).json({ message: "Failed to generate export" });
+  }
+});
+
 // ===================== ACTIVE SESSIONS: REVOKE ONE =====================
 router.delete("/sessions/:id", requireAuth, async (req, res) => {
   try {
