@@ -45,7 +45,38 @@ const SENSITIVE_KEYS = new Set([
   "apikey",
   "authorization",
   "authorizationcode",
+  "authorization_code",
+  // SEC-P1 (audit run 5): the original allowlist covered explicitly
+  // sensitive keys but missed PII that ends up in request bodies +
+  // log lines. A log dump of failed-login attempts ended up being
+  // a "registered phone list correlated with login activity" — a
+  // classic PII exposure. Adding phone/email here closes that vector
+  // wherever redactSensitive is called.
+  "phone",
+  "phonenumber",
+  "email",
+  "emailaddress",
+  // PCI scope creep — saved-card fingerprint shouldn't appear in logs.
+  "signature",
+  // Push targets — log leak of FCM tokens enables phishing pushes.
+  "devicetokens",
+  "devicetoken",
+  "fcmtoken",
+  "expopushtoken",
 ]);
+
+/**
+ * Mask a phone number for log/error lines that genuinely need a
+ * caller identity but shouldn't expose the whole number. Returns
+ * "+234*****1234" style — last 4 digits visible, everything else
+ * obscured. Empty input → "[no-phone]".
+ */
+export function maskPhone(raw: string | null | undefined): string {
+  if (!raw) return "[no-phone]";
+  const digits = raw.replace(/[^\d+]/g, "");
+  if (digits.length <= 4) return "*****";
+  return `${digits.slice(0, 4)}*****${digits.slice(-4)}`;
+}
 
 const REDACTED = "[REDACTED]";
 const MAX_DEPTH = 16;

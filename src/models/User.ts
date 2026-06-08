@@ -20,6 +20,17 @@ export interface IUser extends Document {
   addressBook: mongoose.Types.ObjectId[];
   points: number;
   deviceTokens: string[];
+  /**
+   * SEC-P1 (audit run 5): monotonic version embedded in every
+   * access JWT at sign-time and compared against the cached value
+   * in `requireAuth`. Bumped on logout, refresh-token-reuse
+   * detection, account suspension, and account deletion so a stale
+   * access token (15-min TTL post-revoke) is rejected immediately
+   * instead of continuing to authorize requests until the next
+   * refresh. Default 0; users created before this field exists
+   * get 0 implicitly via the schema default.
+   */
+  tokenVersion: number;
   createdAt: Date;
   updatedAt: Date;
 
@@ -217,6 +228,8 @@ const UserSchema: Schema<IUser> = new Schema(
     defaultAddress: { type: Schema.Types.ObjectId, ref: "Address" },
     points: { type: Number, default: 0 },
     deviceTokens: { type: [String], default: [] },
+    // SEC-P1: see IUser.tokenVersion above for why.
+    tokenVersion: { type: Number, default: 0 },
 
     phoneVerified: { type: Boolean, default: false },
 

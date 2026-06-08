@@ -535,13 +535,44 @@ router.post("/webhook", async (req, res) => {
       .createHmac("sha512", secret)
       .update(rawBody)
       .digest("hex");
-    if (hash !== signature)
+    // SEC-P1 (audit run 5): non-constant-time string `!==` short-
+    // circuits on the first mismatching byte, letting an attacker
+    // use response-latency to reconstruct the expected HMAC byte by
+    // byte (forge `charge.success` events for arbitrary wallet
+    // credits). crypto.timingSafeEqual requires both buffers to be
+    // the same length — guard that explicitly so a malformed header
+    // doesn't crash with a RangeError.
+    if (!signature || typeof signature !== "string") {
+      return res.status(401).json({ message: "Missing signature" });
+    }
+    const hashBuf = Buffer.from(hash, "hex");
+    let sigBuf: Buffer;
+    try {
+      sigBuf = Buffer.from(signature, "hex");
+    } catch {
       return res.status(401).json({ message: "Invalid signature" });
+    }
+    if (
+      hashBuf.length !== sigBuf.length ||
+      !crypto.timingSafeEqual(hashBuf, sigBuf)
+    ) {
+      return res.status(401).json({ message: "Invalid signature" });
+    }
 
     const payload = JSON.parse(rawBody.toString());
     const { event, data } = payload;
+    // SEC-P2 (audit run 5): pre-fix the eventId fallback minted a
+    // fresh uuidv4() when both data.id and data.reference were
+    // missing — broke the WebhookEvent {source,eventId} unique-index
+    // dedup so every replay re-fired notifyUser + emitToUser.
+    // Money side was safe (Transaction-level keys are stable) but
+    // duplicate notifications could spam users. Use sha256 of the
+    // raw body as the dedup key when no stable id is present.
     const eventId =
-      data?.id?.toString() ?? `${event}:${data?.reference ?? uuidv4()}`;
+      data?.id?.toString() ??
+      (data?.reference
+        ? `${event}:${data.reference}`
+        : `${event}:sha256:${crypto.createHash("sha256").update(rawBody).digest("hex").slice(0, 32)}`);
 
     // Insert log row first; unique index dedupes redeliveries.
     let logEntry;

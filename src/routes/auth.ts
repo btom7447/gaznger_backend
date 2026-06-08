@@ -13,6 +13,7 @@ import { validate } from "../middleware/validate";
 import { idempotencyKey } from "../middleware/idempotency";
 import { withIdempotency, PRE_AUTH_TTL_MS } from "../utils/idempotencyCache";
 import { getPlatformConfig } from "../utils/platformConfig";
+import { bumpTokenVersion } from "../utils/tokenVersion";
 import { DEV_FIXED_OTP, isDevSmsMode, sendOtpSms } from "../utils/sms";
 import {
   assertNotLocked,
@@ -583,7 +584,12 @@ router.post(
       }
 
       const userIdStr = (user._id as { toString(): string }).toString();
-      const accessToken = signAccessToken({ id: userIdStr });
+      // SEC-P1: embed tokenVersion so requireAuth can reject stale
+      // tokens after logout/suspend/role-change.
+      const accessToken = signAccessToken({
+        id: userIdStr,
+        v: (user as any).tokenVersion ?? 0,
+      });
       const refreshToken = signRefreshToken({ id: userIdStr });
       await saveRefreshToken(userIdStr, refreshToken, sessionMeta(req));
 
@@ -720,7 +726,11 @@ router.post("/login", validate(phoneLoginSchema), async (req, res) => {
     }
 
     const userIdStr = (user._id as { toString(): string }).toString();
-    const accessToken = signAccessToken({ id: userIdStr });
+    // SEC-P1: embed tokenVersion so requireAuth can reject stale tokens.
+    const accessToken = signAccessToken({
+      id: userIdStr,
+      v: (user as any).tokenVersion ?? 0,
+    });
     const refreshToken = signRefreshToken({ id: userIdStr });
     await saveRefreshToken(userIdStr, refreshToken, sessionMeta(req));
 
@@ -896,7 +906,16 @@ router.post(
       await tokenDoc.deleteOne();
 
       const userIdStr = (user._id as { toString(): string }).toString();
-      const accessToken = signAccessToken({ id: userIdStr });
+      // SEC-P1: forgot-pin/reset implicitly revokes prior sessions
+      // (PIN change == credential change), so bump tokenVersion BEFORE
+      // signing so the new JWT has the fresh value AND any stale
+      // tokens are rejected immediately.
+      user.tokenVersion = ((user as any).tokenVersion ?? 0) + 1;
+      await user.save();
+      const accessToken = signAccessToken({
+        id: userIdStr,
+        v: (user as any).tokenVersion,
+      });
       const refreshToken = signRefreshToken({ id: userIdStr });
       await saveRefreshToken(userIdStr, refreshToken, sessionMeta(req));
 
@@ -1019,6 +1038,12 @@ router.post("/refresh-token", async (req, res) => {
       // re-authenticate. This trades "user gets logged out" for
       // "session theft is detected and contained".
       await RefreshToken.deleteMany({ user: payload.id });
+      // SEC-P1: bump tokenVersion so any in-flight access JWT for
+      // this user immediately fails the cached-version check in
+      // requireAuth. Pre-fix, reuse-detection deleted refresh tokens
+      // but the 15-min access window continued to authorize the
+      // attacker's pre-detection requests.
+      await bumpTokenVersion(payload.id);
       console.warn(
         `[auth] refresh-token reuse detected for user ${payload.id} — all sessions revoked`
       );
@@ -1028,7 +1053,14 @@ router.post("/refresh-token", async (req, res) => {
       });
     }
 
-    const accessToken = signAccessToken({ id: payload.id });
+    // SEC-P1: pull current tokenVersion to embed in the new JWT.
+    const userRow = await User.findById(payload.id)
+      .select("tokenVersion")
+      .lean();
+    const accessToken = signAccessToken({
+      id: payload.id,
+      v: (userRow as any)?.tokenVersion ?? 0,
+    });
     const newRefreshToken = signRefreshToken({ id: payload.id });
     await saveRefreshToken(payload.id, newRefreshToken, sessionMeta(req));
 
@@ -1042,11 +1074,32 @@ router.post("/refresh-token", async (req, res) => {
 // ===================== LOGOUT =====================
 router.post("/logout", async (req, res) => {
   try {
-    const { refreshToken } = req.body;
+    const { refreshToken, allDevices } = req.body as {
+      refreshToken?: string;
+      allDevices?: boolean;
+    };
     if (!refreshToken)
       return res.status(400).json({ message: "Refresh token required" });
 
-    await RefreshToken.findOneAndDelete({ token: refreshToken });
+    // SEC-P1: peek at the refresh token to grab the userId BEFORE
+    // deleting — we need it to bump tokenVersion. If the token's
+    // invalid we still proceed to delete (no-op) so a malformed
+    // logout request doesn't 500 the client.
+    const peek = verifyRefreshToken(refreshToken);
+    const userId = peek?.id;
+
+    if (allDevices && userId) {
+      // Nuke every refresh token for the user + bump version so
+      // every in-flight access token also dies.
+      await RefreshToken.deleteMany({ user: userId });
+      await bumpTokenVersion(userId);
+    } else {
+      await RefreshToken.findOneAndDelete({ token: refreshToken });
+      // SEC-P1: single-device logout also bumps so the matching
+      // 15-min access JWT is rejected immediately. (Acceptable
+      // collateral: other devices have to refresh once.)
+      if (userId) await bumpTokenVersion(userId);
+    }
     res.json({ message: "Logged out successfully" });
   } catch (err) {
     res.status(500).json({ message: "Internal server error" });

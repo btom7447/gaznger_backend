@@ -12,6 +12,7 @@ import { emitToUser } from "../socket";
 import { notifyUser } from "../utils/notify";
 import { writeAudit } from "../utils/audit";
 import { safeRegexSearch } from "../utils/safeRegex";
+import { bumpTokenVersion } from "../utils/tokenVersion";
 
 const router = Router();
 
@@ -187,6 +188,11 @@ router.patch("/users/:id/role", async (req, res) => {
       reason,
       ip: req.ip,
     });
+
+    // SEC-P1: bump tokenVersion so the user's next request forces a
+    // re-login. The new role + UI gates kick in immediately instead
+    // of waiting up to 15 min for the access token to expire.
+    await bumpTokenVersion(String(user._id));
 
     res.json({ message: "Role updated", user });
   } catch (err) {
@@ -602,6 +608,11 @@ router.patch("/users/:id/account-status", async (req, res) => {
       emitToUser(String(user._id), "account:suspended", {
         reason,
       });
+      // SEC-P1: bump tokenVersion so any in-flight access JWT for
+      // the suspended user is rejected by requireAuth on the next
+      // request. Pre-fix the 15-min access window meant a suspended
+      // user could keep authenticating until their token expired.
+      await bumpTokenVersion(String(user._id));
       // P1-6 (audit run 5): pair the socket with a push so a
       // backgrounded user actually sees the suspension. Pre-fix this
       // route emitted socket-only — suspended users with the app

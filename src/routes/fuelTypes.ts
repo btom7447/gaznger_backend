@@ -2,7 +2,7 @@ import { Router, Request, Response } from "express";
 import multer from "multer";
 import cloudinary from "../utils/cloudinary";
 import FuelType from "../models/FuelType";
-import { requireAuth } from "../middleware/auth";
+import { requireAuth, requireAdmin } from "../middleware/auth";
 
 const router = Router();
 
@@ -31,8 +31,14 @@ router.get("/", async (_req: Request, res: Response) => {
   }
 });
 
-// CREATE a new fuel type (admin — requires auth)
-router.post("/", requireAuth, upload.single("image"), async (req: Request, res: Response) => {
+// CREATE a new fuel type — admin only.
+// SEC-P1 (audit run 5): pre-fix the comment said "admin — requires
+// auth" but only requireAuth was enforced, so any authenticated user
+// (including a fresh customer signup) could create FuelType rows +
+// upload arbitrary images to the shared Cloudinary folder, polluting
+// the catalog read by orders.ts and fuelPrices.ts. Now requireAdmin
+// per the comment's original intent.
+router.post("/", requireAuth, requireAdmin, upload.single("image"), async (req: Request, res: Response) => {
   try {
     const { name, unit } = req.body;
 

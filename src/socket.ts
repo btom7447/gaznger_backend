@@ -1,9 +1,9 @@
 import { Server } from "socket.io";
 import { Server as HttpServer } from "http";
-import jwt from "jsonwebtoken";
 import Delivery from "./models/Delivery";
 import User from "./models/User";
 import { ACTIVE_DELIVERY_STATUSES, Rooms } from "./_shared";
+import { verifyToken } from "./utils/jwt";
 import {
   computeRoute,
   routeTargetForStatus,
@@ -124,14 +124,22 @@ export function initSocket(httpServer: HttpServer): Server {
     const token = socket.handshake.auth?.token as string | undefined;
     if (!token) return next(new Error("unauthorized"));
     try {
-      // The JWT payload is `{ id }` — that's what utils/jwt.ts signs
-      // (see `signAccessToken({ id: userIdStr })` at every call site).
-      // Reading `payload.userId` produced `user:undefined` rooms and
-      // broke every per-user push: verification:status,
-      // account:suspended, future customer order:update events all
-      // emit to `user:<id>` which had zero members.
-      const payload = jwt.verify(token, process.env.JWT_SECRET!) as
-        | { id?: string; userId?: string };
+      // SEC-P1 (audit run 5): use the shared verifyToken() helper
+      // instead of raw jwt.verify. The helper enforces issuer
+      // ('gaznger-api') + audience ('gaznger-mobile') checks and
+      // honors the JWT_SECRET_NEXT rotation-window fallback. Pre-fix
+      // the inline `jwt.verify(token, process.env.JWT_SECRET!)`
+      // bypassed BOTH:
+      //   - issuer/audience: a token minted by another Gaznger
+      //     service with the same secret but different audience
+      //     would be accepted by the socket but not by the REST API.
+      //   - rotation window: every active client gets kicked 15min
+      //     early during a secret rotation because the socket only
+      //     knows the old secret.
+      const payload = verifyToken(token) as
+        | { id?: string; userId?: string }
+        | null;
+      if (!payload) return next(new Error("invalid token"));
       const userId = payload.id ?? payload.userId;
       if (!userId) return next(new Error("invalid token"));
 

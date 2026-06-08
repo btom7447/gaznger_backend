@@ -19,6 +19,19 @@ import {
 import { parsePagination } from "../utils/pagination";
 import { notifyUser } from "../utils/notify";
 import { getPlatformConfig } from "../utils/platformConfig";
+
+/**
+ * P1-MF-2 (audit run 4): derive the `product` field the customer
+ * mobile expects on every order response. The Order schema has no
+ * persisted `product` field (it's a client-side concept driven by
+ * fuel.name), but the customer's interface declares it and branches
+ * UI on `o.product === "lpg"`. Centralized here so REST + active-
+ * order + socket payloads stay in sync.
+ */
+function orderProductFromFuel(fuelName?: string | null): "liquid" | "lpg" {
+  if (!fuelName) return "liquid";
+  return /^(lpg|gas|cooking gas)$/i.test(fuelName.trim()) ? "lpg" : "liquid";
+}
 import { emitToUser, emitToDelivery } from "../socket";
 import { haversineDistance, calcDeliveryFee } from "../utils/haversine";
 import { computeDeliveryFee } from "../utils/deliveryFee";
@@ -409,8 +422,18 @@ router.get("/", requireAuth, async (req, res) => {
       Order.countDocuments(filter),
     ]);
 
+    // P1-MF-2 (audit run 4): derive `product` from fuel.name so the
+    // customer history + active-order hook can branch LPG vs liquid
+    // copy correctly. Pre-fix the field was perpetually undefined →
+    // every LPG order rendered with liquid copy (flame icon, "X L
+    // Petrol" string).
+    const enriched = orders.map((o: any) => ({
+      ...o,
+      product: orderProductFromFuel(o.fuel?.name),
+    }));
+
     res.json({
-      data: orders,
+      data: enriched,
       total,
       page: pageNum,
       totalPages: Math.ceil(total / limitNum),
@@ -480,7 +503,13 @@ router.get("/:orderId", requireAuth, async (req, res) => {
       }
     }
 
-    res.json({ ...order, riderProfile });
+    // P1-MF-2: enrich with derived `product` so LPG vs liquid copy
+    // branches correctly on the detail screen too.
+    res.json({
+      ...order,
+      product: orderProductFromFuel((order as any).fuel?.name),
+      riderProfile,
+    });
   } catch (err) {
     console.error("[orders/:orderId]", err);
     res.status(500).json({ message: "Failed to fetch order" });

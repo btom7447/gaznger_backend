@@ -81,6 +81,8 @@ export async function sendOtpSms(phone: string, code: string): Promise<void> {
     // code from their terminal even if they want to use the real one
     // they "sent". 123456 is also accepted in verify either way.
     // eslint-disable-next-line no-console
+    // Dev-only — full phone visible to make local debugging easier.
+    // Never reaches prod because isDevSmsMode() is false there.
     console.log(
       `[otp:dev] → ${phone} OTP ${code} (fixed dev code: ${DEV_FIXED_OTP})`
     );
@@ -144,11 +146,18 @@ export async function sendOtpSms(phone: string, code: string): Promise<void> {
       parsed?.error?.message ??
       parsed?.error?.error_data?.details ??
       `HTTP ${res.status}`;
+    // SEC-P1 (audit run 5): mask the phone in log lines —
+    // pre-fix every failed-OTP attempt printed the full +234xxx
+    // number, so a log dump correlated phone-numbers with auth
+    // activity (classic PII exposure).
+    const { maskPhone } = await import("./redact");
     // eslint-disable-next-line no-console
     console.error(
-      `[otp:whatsapp] send failed for ${phone}: ${detail}`,
+      `[otp:whatsapp] send failed for ${maskPhone(phone)}: ${detail}`,
       parsed?.error ?? ""
     );
-    throw new Error(`WhatsApp send failed: ${detail}`);
+    // SEC-P2: also redact the SMS provider error so the 502 body
+    // surfaced to the caller doesn't leak WhatsApp Graph internals.
+    throw new Error("Couldn't send code. Try again.");
   }
 }
