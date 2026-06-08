@@ -144,6 +144,34 @@ router.get("/me", requireAuth, async (req, res) => {
  * Disputed order detail. Caller must be the raiser (or admin — admin
  * uses the admin route family for their queue view).
  */
+/**
+ * P1-MF-8 (audit run 4): GET /api/disputes/for-order/:orderId
+ *
+ * Lookup helper for the customer order-detail screen. Returns the
+ * dispute associated with this order (or 404 if none), scoped to
+ * the caller. Lets the mobile render a "Dispute refund" card with
+ * the same refundStatus/refundAmount/refundDestination fields the
+ * P0-MF-1 customer refund card surfaces for the order itself.
+ *
+ * Mounted ABOVE the /:id catch-all so "for-order" doesn't get
+ * parsed as an ObjectId.
+ */
+router.get("/for-order/:orderId", requireAuth, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.orderId))
+      return res.status(400).json({ message: "Invalid order id" });
+
+    const dispute = await Dispute.findOne({ order: req.params.orderId }).lean();
+    if (!dispute) return res.status(404).json({ message: "No dispute" });
+    if (dispute.raisedBy.toString() !== req.userId)
+      return res.status(403).json({ message: "Forbidden" });
+    res.json(dispute);
+  } catch (err) {
+    console.error("[disputes/for-order]", err);
+    res.status(500).json({ message: "Failed to fetch dispute" });
+  }
+});
+
 router.get("/:id", requireAuth, async (req, res) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id))
