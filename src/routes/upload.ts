@@ -2,6 +2,7 @@ import { Router } from "express";
 import multer from "multer";
 import cloudinary from "../utils/cloudinary";
 import { requireAuth } from "../middleware/auth";
+import { uploadImageLimiter, uploadMediaLimiter } from "../middleware/moneyLimiter";
 
 const router = Router();
 
@@ -95,7 +96,12 @@ function verifyMediaMagicBytes(
   return null;
 }
 
-router.post("/image", requireAuth, upload.single("image"), async (req, res) => {
+// SEC-P1 (audit run 5): per-user uploadImageLimiter (30/10min) capping
+// Cloudinary $-bleed + the OOM risk from 100 concurrent 50MB multer
+// buffers. Mounted between requireAuth (so it can key on req.userId)
+// and multer (so an over-limit request short-circuits before any
+// bytes are buffered).
+router.post("/image", requireAuth, uploadImageLimiter, upload.single("image"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: "No file uploaded" });
 
@@ -162,9 +168,12 @@ const chatUpload = multer({
   },
 });
 
+// SEC-P1: per-user uploadMediaLimiter (10/10min) — tighter than the
+// image limiter because each media upload is up to 50MB.
 router.post(
   "/media",
   requireAuth,
+  uploadMediaLimiter,
   chatUpload.single("media"),
   async (req: any, res) => {
     try {

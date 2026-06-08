@@ -138,6 +138,44 @@ const authLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+/**
+ * SEC-P1 (audit run 5): per-phone authLimiter, keyed by req.body.phone.
+ *
+ * The base authLimiter is per-IP and protects against a single IP
+ * brute-forcing many accounts. It does NOT protect against a single
+ * ACCOUNT being brute-forced from a botnet (different IP per attempt).
+ * Per-account PIN lockout exists at utils/pinLockout.ts but cycles
+ * after 15 min — exhausting a 4-digit PIN keyspace takes ~21 days at
+ * 480 guesses/day, slow but not impossible.
+ *
+ * This layer caps PIN attempts per phone number at 20/hour regardless
+ * of source IP, closing the botnet vector. The per-account lockout
+ * still triggers first under normal abuse; this is the belt to its
+ * suspenders.
+ *
+ * Falls back to the IP if `phone` isn't in the body (so /signup
+ * without a phone — which shouldn't happen given the schema — still
+ * gets the global cap).
+ */
+const phoneAuthLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: isDev ? 1000 : 20,
+  message: {
+    message:
+      "Too many login attempts on this phone number. Try again in an hour.",
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req, _res) => {
+    const phone = (req.body as { phone?: string })?.phone;
+    if (typeof phone === "string" && phone.length > 0) return `phone:${phone}`;
+    // Fallback to IP via express-rate-limit's built-in normalizer to
+    // avoid the IPv6-bypass class of bug. Imported lazily so the
+    // module's primary export is still the keyGenerator function.
+    return `ip:${req.ip ?? "anon"}`;
+  },
+});
+
 const otpLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   // OTP flows fire 2-3 calls per signup attempt (check-phone, send-otp,
@@ -184,8 +222,14 @@ app.use("/auth/check-phone", otpLimiter);
 app.use("/auth/send-otp", otpLimiter);
 app.use("/auth/verify-otp", otpLimiter);
 app.use("/auth/forgot-pin", otpLimiter);
-app.use("/auth/signup", authLimiter);
-app.use("/auth/login", authLimiter);
+// SEC-P1: stack BOTH the global per-IP authLimiter AND the per-phone
+// limiter on signup + login. The per-IP one blocks one-IP-bruteforces;
+// the per-phone one blocks distributed (botnet) attacks on a single
+// account.
+app.use("/auth/signup", authLimiter, phoneAuthLimiter);
+app.use("/auth/login", authLimiter, phoneAuthLimiter);
+// Forgot-pin/start also takes phone — apply the same per-phone cap.
+app.use("/auth/forgot-pin/start", phoneAuthLimiter);
 app.use("/auth", apiLimiter, authRoutes);
 app.use("/api/config", apiLimiter, configRoutes);
 app.use("/api/fuel-types", apiLimiter, fuelTypeRoutes);
