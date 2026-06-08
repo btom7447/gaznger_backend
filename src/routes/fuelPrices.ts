@@ -20,6 +20,7 @@
 import { Router } from "express";
 import GasStation from "../models/Station";
 import FuelType from "../models/FuelType";
+import { latLngSchema } from "../validators/latLng";
 
 const router = Router();
 
@@ -43,9 +44,16 @@ const FUEL_DISPLAY: Record<string, { id: string; label: string }> = {
 
 router.get("/", async (req, res) => {
   try {
-    const lat = Number(req.query.lat);
-    const lng = Number(req.query.lng);
-    const haveCoords = Number.isFinite(lat) && Number.isFinite(lng);
+    // P2 (audit run 4): validate via shared latLngSchema — `Number()`
+    // alone let NaN/Infinity and out-of-range coords through into the
+    // bounding-box filter.
+    const coords = latLngSchema.safeParse({
+      lat: Number(req.query.lat),
+      lng: Number(req.query.lng),
+    });
+    const haveCoords = coords.success;
+    const lat = haveCoords ? coords.data.lat : NaN;
+    const lng = haveCoords ? coords.data.lng : NaN;
 
     // Cache key — round coords to 1dp (~11km) so nearby callers
     // share a hit. National median falls under the same key when

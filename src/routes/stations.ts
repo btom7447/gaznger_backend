@@ -6,6 +6,7 @@ import cloudinary from "../utils/cloudinary";
 import { requireAuth, requireAdmin } from "../middleware/auth";
 import { parsePagination } from "../utils/pagination";
 import { haversineDistance } from "../utils/haversine";
+import { latLngSchema } from "../validators/latLng";
 
 const router = Router();
 
@@ -59,15 +60,24 @@ router.get("/", async (req, res) => {
     }
 
     if (lat && lng && radius) {
-      const latNum = parseFloat(lat as string);
-      const lngNum = parseFloat(lng as string);
+      // P2 (audit run 4): validate via shared latLngSchema so NaN/
+      // Infinity / out-of-range coords don't poison the bounding-box
+      // filter. parseFloat alone returned NaN silently.
+      const coords = latLngSchema.safeParse({
+        lat: parseFloat(lat as string),
+        lng: parseFloat(lng as string),
+      });
       const r = parseFloat(radius as string);
+      if (coords.success && Number.isFinite(r)) {
+        const latNum = coords.data.lat;
+        const lngNum = coords.data.lng;
 
-      const latDiff = r / 111;
-      const lngDiff = r / (111 * Math.cos((latNum * Math.PI) / 180));
+        const latDiff = r / 111;
+        const lngDiff = r / (111 * Math.cos((latNum * Math.PI) / 180));
 
-      filter["location.lat"] = { $gte: latNum - latDiff, $lte: latNum + latDiff };
-      filter["location.lng"] = { $gte: lngNum - lngDiff, $lte: lngNum + lngDiff };
+        filter["location.lat"] = { $gte: latNum - latDiff, $lte: latNum + latDiff };
+        filter["location.lng"] = { $gte: lngNum - lngDiff, $lte: lngNum + lngDiff };
+      }
     }
 
     const { page: pageNum, limit: limitNum, skip } = parsePagination(req.query as Record<string, unknown>);

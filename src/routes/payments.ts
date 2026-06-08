@@ -204,9 +204,22 @@ router.post("/verify", requireAuth, moneyLimiter, idempotencyKey(), async (req, 
     // two "Payment Successful" pushes. findOneAndUpdate with a
     // guard-in-filter resolves the race — only one writer wins, the
     // loser sees `flipped == null` and skips the side effects.
+    //
+    // P1-MF-2 (audit run 4): also persist paymentMethod on the flip.
+    // /initialize handles new-card AND bank-transfer (hosted page);
+    // map Paystack's `data.channel` to the Order enum so the receipt
+    // PDF can render the correct label without guessing.
+    const verifyMethod: "card" | "transfer" =
+      data.channel === "bank_transfer" ? "transfer" : "card";
     const flipped = await Order.findOneAndUpdate(
       { _id: order._id, paymentStatus: { $ne: "paid" } },
-      { $set: { paymentStatus: "paid", status: "confirmed" } },
+      {
+        $set: {
+          paymentStatus: "paid",
+          status: "confirmed",
+          paymentMethod: verifyMethod,
+        },
+      },
       { new: true },
     );
     if (flipped) {
@@ -279,6 +292,8 @@ router.post("/charge-saved", requireAuth, moneyLimiter, idempotencyKey({ enforce
     order.paymentRef = reference;
     order.paymentStatus = "paid";
     order.status = "confirmed";
+    // P1-MF-2 (audit run 4): saved-card flow → "saved-card".
+    order.paymentMethod = "saved-card";
     await order.save();
 
     await postOrderChargeToEscrow({
@@ -393,6 +408,8 @@ router.post("/pay-with-wallet", requireAuth, moneyLimiter, idempotencyKey({ enfo
     order.paymentRef = reference;
     order.paymentStatus = "paid";
     order.status = "confirmed";
+    // P1-MF-2 (audit run 4): wallet-pay flow → "wallet".
+    order.paymentMethod = "wallet";
     await order.save();
 
     await notifyUser(
@@ -657,9 +674,21 @@ router.post("/webhook", async (req, res) => {
             // SEC-P2 (audit run 6): atomic flip — see the verify
             // handler above for the rationale. Without this, a
             // concurrent /verify + webhook both fire the push.
+            //
+            // P1-MF-2 (audit run 4): persist paymentMethod from the
+            // Paystack channel so a webhook-first finalize (user closed
+            // the app before /verify) still records the method.
+            const webhookMethod: "card" | "transfer" =
+              data.channel === "bank_transfer" ? "transfer" : "card";
             const flipped = await Order.findOneAndUpdate(
               { _id: order._id, paymentStatus: { $ne: "paid" } },
-              { $set: { paymentStatus: "paid", status: "confirmed" } },
+              {
+                $set: {
+                  paymentStatus: "paid",
+                  status: "confirmed",
+                  paymentMethod: webhookMethod,
+                },
+              },
               { new: true },
             );
             if (flipped) {
@@ -884,6 +913,10 @@ router.post(
       }
       order.paymentStatus = "paid";
       order.paymentRef = `dev-mark-paid:${Date.now()}`;
+      // P1-MF-2 (audit run 4): dev shortcut is the bank-transfer
+      // Continue path — record it as "transfer" so receipts render
+      // consistently in dev.
+      order.paymentMethod = "transfer";
       if (order.status === "pending") {
         order.status = "confirmed";
       }

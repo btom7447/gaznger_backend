@@ -31,6 +31,7 @@ import {
   ACTIVE_DELIVERY_STATUSES,
   DROPPABLE_DELIVERY_STATUSES,
 } from "../_shared";
+import { latLngSchema } from "../validators/latLng";
 
 const router = Router();
 
@@ -226,10 +227,16 @@ router.patch("/availability", requireAuth, requireRider, async (req, res) => {
 // ===================== UPDATE CURRENT LOCATION =====================
 router.patch("/location", requireAuth, requireRider, async (req, res) => {
   try {
-    const { lat, lng } = req.body;
-    if (typeof lat !== "number" || typeof lng !== "number") {
+    // P2 (audit run 4): reject NaN/Infinity + out-of-range coords via
+    // shared latLngSchema before they reach the Mongo write.
+    const parsed = latLngSchema.safeParse({
+      lat: req.body?.lat,
+      lng: req.body?.lng,
+    });
+    if (!parsed.success) {
       return res.status(400).json({ message: "lat and lng (numbers) are required" });
     }
+    const { lat, lng } = parsed.data;
     await RiderProfile.findOneAndUpdate(
       { user: req.userId },
       { currentLocation: { lat, lng } }

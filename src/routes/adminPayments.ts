@@ -1,4 +1,5 @@
 import { Router } from "express";
+import crypto from "crypto";
 import mongoose from "mongoose";
 import { requireAuth, requireAdmin } from "../middleware/auth";
 import User from "../models/User";
@@ -1296,7 +1297,11 @@ router.post(
       }
 
       const platformRevenue = await getOrCreateSystemWallet("platform-revenue");
-      const retrySuffix = Date.now().toString(36);
+      // P2 (audit run 4): use a UUID instead of `Date.now().toString(36)`.
+      // Two retries inside the same JS millisecond produced the same
+      // suffix, which made the idempotency keys collide and the
+      // Paystack reference non-unique.
+      const retrySuffix = crypto.randomUUID();
       if (fee > 0) {
         await postTransfer({
           from: userWallet,

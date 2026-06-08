@@ -98,6 +98,11 @@ export async function verifyPayment(reference: string) {
     status: string;
     reference: string;
     amount: number;
+    // Top-level `channel` on the Paystack transaction object — used by
+    // /verify to map the payment method (card vs bank_transfer) onto
+    // the Order enum for receipt rendering. Distinct from the
+    // `authorization.channel` field on saved-card metadata.
+    channel?: string;
     metadata: Record<string, any>;
     customer?: { email?: string };
     authorization?: PaystackAuthorization;

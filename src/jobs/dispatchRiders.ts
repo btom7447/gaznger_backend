@@ -1,8 +1,10 @@
 import Order from "../models/Order";
 import Delivery from "../models/Delivery";
 import RiderProfile from "../models/RiderProfile";
+import User from "../models/User";
 import { haversineDistance, calcDeliveryFee } from "../utils/haversine";
 import { notifyUser } from "../utils/notify";
+import { sendPushNotification } from "../utils/push";
 import { emitToUser } from "../socket";
 
 const RIDERS_PER_BROADCAST = 3;
@@ -205,12 +207,29 @@ export async function dispatchRiders(): Promise<void> {
         customerArea,
       };
       emitToUser(riderId, "dispatch:offer", offerPayload);
-      notifyUser(
-        riderId,
-        "dispatch",
-        "New Delivery Request",
-        "A new delivery near you is available. Open the app to accept.",
-      ).catch(() => {});
+      // P2 (audit run 4): a dispatch offer is ephemeral — it lives for
+      // ~15s and then either gets accepted, expires, or another rider
+      // takes it. Persisting a Notification row meant the rider inbox
+      // filled with stale "A new delivery near you is available" lines
+      // long after the offer was gone. Notification has no expiresAt
+      // field to TTL them out, so drop the persistent write entirely.
+      // Keep the socket emit (above) for the in-app modal and a
+      // best-effort push so the rider can act when the app is closed.
+      (async () => {
+        try {
+          const u = await User.findById(riderId).select("deviceTokens").lean();
+          const tokens: string[] = (u as any)?.deviceTokens ?? [];
+          if (tokens.length) {
+            await sendPushNotification(
+              tokens,
+              "New Delivery Request",
+              "A new delivery near you is available. Open the app to accept.",
+            );
+          }
+        } catch {
+          // Push failure must never break dispatch
+        }
+      })();
 
       dispatchedCount++;
     }

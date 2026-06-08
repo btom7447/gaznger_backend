@@ -126,6 +126,15 @@ router.post("/", requireAuth, requireCustomer, idempotencyKey(), validate(create
       returnSwapAt,
       scheduledAt,
       note,
+      // P1-MF-2 (audit run 4): optional at create time — the order is
+      // still `unpaid` until /payments/* runs. Persisted here only when
+      // the client pre-declares the method (e.g. "wallet"); the payment
+      // handlers also write it on the paymentStatus="paid" flip.
+      // NB: createOrderSchema currently strips unknown keys, so until
+      // the validator is taught about `paymentMethod` the create-time
+      // persistence is a no-op; the payment-handler flip is the
+      // primary writer.
+      paymentMethod,
     } = req.body;
 
     // USE_CASES C-5 / decision D3 — validate scheduledAt window.
@@ -249,6 +258,16 @@ router.post("/", requireAuth, requireCustomer, idempotencyKey(), validate(create
       note: note?.trim() || undefined,
       returnSwapAt: returnSwapAt ? new Date(returnSwapAt) : undefined,
       scheduledAt: scheduledAtDate,
+      // P1-MF-2 (audit run 4): only persist when the client sent a
+      // valid enum value; the Mongoose enum validator will reject
+      // anything else. Payment handlers re-set this on the paid flip.
+      paymentMethod:
+        paymentMethod === "wallet" ||
+        paymentMethod === "card" ||
+        paymentMethod === "transfer" ||
+        paymentMethod === "saved-card"
+          ? paymentMethod
+          : undefined,
     };
 
     if (fuel.name === "Gas") {
@@ -1278,10 +1297,11 @@ router.get("/:orderId/receipt.pdf", requireAuth, async (req, res) => {
       fuel?.name ?? ""
     }`.trim();
 
-    // paymentMethodLabel mirrors the mobile helper so the receipt
-    // says the same thing the in-app receipt did.
+    // P1-MF-2 (audit run 4): pre-fix this used a `(order as any).paymentMethodId`
+    // cast — the field was never on the Order schema. Now reads the
+    // persisted `paymentMethod` enum cleanly via the typed doc.
     const paymentMethodLabel = labelForPaymentMethod(
-      (order as any).paymentMethodId,
+      order.paymentMethod,
       (customer as any)?.lastPaystackAuth
     );
 
@@ -1324,13 +1344,27 @@ router.get("/:orderId/receipt.pdf", requireAuth, async (req, res) => {
   }
 });
 
-/** Mirror of mobile's lib/paymentLabel.ts so the PDF reads the same. */
+/**
+ * Mirror of mobile's lib/paymentLabel.ts so the PDF reads the same.
+ *
+ * P1-MF-2 (audit run 4): accepts the Order.paymentMethod enum
+ * ("wallet" | "card" | "transfer" | "saved-card"). The mobile helper
+ * still uses its own legacy ids ("card-saved" / "card-new" / etc) but
+ * the server doesn't have to — once persisted on the Order, the value
+ * is authoritative.
+ *
+ * @deprecated P2 (audit run 4): the Order shape returned by GETs no
+ * longer ships derived fields like `timeline` or `eta` (the mobile
+ * interfaces declare them optional and synthesise them client-side).
+ * For any new derived response field, follow the existing helper
+ * pattern (see `orderProductFromFuel` above) rather than persisting it.
+ */
 function labelForPaymentMethod(
-  paymentMethodId: string | undefined,
+  paymentMethod: string | undefined,
   lastPaystackAuth: { last4?: string; brand?: string } | undefined
 ): string {
-  if (!paymentMethodId) return "Card";
-  if (paymentMethodId === "card-saved") {
+  if (!paymentMethod) return "Card";
+  if (paymentMethod === "saved-card") {
     const last4 = lastPaystackAuth?.last4;
     const brand = lastPaystackAuth?.brand;
     if (last4) {
@@ -1347,9 +1381,9 @@ function labelForPaymentMethod(
     }
     return "Saved card";
   }
-  if (paymentMethodId === "card-new") return "Card";
-  if (paymentMethodId === "wallet") return "Gaznger wallet";
-  if (paymentMethodId === "transfer") return "Bank transfer";
+  if (paymentMethod === "card") return "Card";
+  if (paymentMethod === "wallet") return "Gaznger wallet";
+  if (paymentMethod === "transfer") return "Bank transfer";
   return "Card";
 }
 

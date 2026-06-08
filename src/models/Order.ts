@@ -31,6 +31,15 @@ export interface IOrder extends Document {
     | "dispensing";
   deliveryAddress: mongoose.Types.ObjectId;
   paymentStatus: "unpaid" | "paid" | "refunded";
+  /**
+   * P1-MF-2 (audit run 4): how the order was paid for. Populated by
+   * the payment handlers (/payments/verify, /payments/charge-saved,
+   * /payments/pay-with-wallet, and the webhook charge.success path)
+   * the moment paymentStatus flips to "paid". Read by the receipt
+   * PDF route and any admin reporting that needs to split card vs
+   * wallet vs transfer flow.
+   */
+  paymentMethod?: "wallet" | "card" | "transfer" | "saved-card";
   paymentRef?: string;
   cancellationReason?: string;
   /**
@@ -191,6 +200,11 @@ const OrderSchema: Schema = new Schema(
       type: String,
       enum: ["unpaid", "paid", "refunded"],
       default: "unpaid",
+    },
+    // P1-MF-2 (audit run 4): see IOrder.paymentMethod above.
+    paymentMethod: {
+      type: String,
+      enum: ["wallet", "card", "transfer", "saved-card"],
     },
     paymentRef: { type: String },
     refundStatus: {

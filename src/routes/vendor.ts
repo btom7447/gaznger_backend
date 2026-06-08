@@ -1101,12 +1101,27 @@ router.patch("/orders/:id/assign", requireAuth, requireVerifiedVendor, async (re
       deliveryId: delivery._id,
       orderId: order._id,
     });
-    notifyUser(
-      riderId,
-      "dispatch",
-      "New delivery assigned",
-      "Open the app to start the trip.",
-    ).catch(() => {});
+    // P2 (audit run 4): same reasoning as dispatchRiders.ts — a manual
+    // vendor assign offer is ephemeral and shouldn't leave a stale
+    // "New delivery assigned" row in the rider inbox. Notification has
+    // no expiresAt to TTL out, so drop the persistent write. Keep the
+    // socket emit (above) and best-effort push.
+    (async () => {
+      try {
+        const u = await User.findById(riderId).select("deviceTokens").lean();
+        const tokens: string[] = (u as any)?.deviceTokens ?? [];
+        if (tokens.length) {
+          const { sendPushNotification } = await import("../utils/push");
+          await sendPushNotification(
+            tokens,
+            "New delivery assigned",
+            "Open the app to start the trip.",
+          );
+        }
+      } catch {
+        // Push failure must never break assign
+      }
+    })();
 
     res.json({ order, delivery });
   } catch (err) {
