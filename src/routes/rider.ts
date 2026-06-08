@@ -11,6 +11,7 @@ import Earning from "../models/Earning";
 import Rating from "../models/Rating";
 import GasStation from "../models/Station";
 import { notifyUser } from "../utils/notify";
+import { requirePinStepUp } from "../utils/pinStepUp";
 import {
   emitToUser,
   emitRouteUpdateForDelivery,
@@ -1216,6 +1217,16 @@ router.patch("/profile", requireAuth, requireRider, async (req, res) => {
       nationalIdUrl, driversLicenseUrl, vehiclePapersUrl, vehicleImageUrl, plateImageUrl,
       bankAccount, profileImage,
     } = req.body;
+
+    // SEC-P1 (audit run 5): same blast radius as vendorFinance bank
+    // ops — bankAccount change here re-routes the rider's withdrawals.
+    // PIN step-up gate. Only enforced when bankAccount is being changed;
+    // a vehicle-only PATCH stays one-shot.
+    if (bankAccount) {
+      const stepUp = await requirePinStepUp(req, res);
+      if (stepUp) return;
+    }
+
     const profileFields: Record<string, unknown> = {};
     let kycChanged = false;
 
@@ -1258,6 +1269,17 @@ router.patch("/profile", requireAuth, requireRider, async (req, res) => {
       RiderProfile.findOne({ user: req.userId }).lean(),
       User.findById(req.userId).select("displayName email phone profileImage").lean(),
     ]);
+
+    // SEC-P1: cross-device notify on bank-account change so legit
+    // other sessions see "if this wasn't you, contact support".
+    if (bankAccount && bankAccount.accountNumber) {
+      await notifyUser(
+        req.userId!,
+        "account",
+        "Payout bank changed",
+        `Your payout bank was updated to ${bankAccount.bankName} (${String(bankAccount.accountNumber).slice(-4)}). If this wasn't you, contact support immediately.`,
+      ).catch(() => {});
+    }
 
     res.json({ message: "Profile updated", profile: { ...updatedProfile, user: updatedUser } });
   } catch (err) {
