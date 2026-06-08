@@ -34,6 +34,12 @@ export interface IPlatformConfig extends Document {
   paymentsEnabled: boolean;
   /** Toggle: any in-app withdrawals enabled. */
   withdrawalsEnabled: boolean;
+  /** Toggle: customers can place new orders. Off → POST /api/orders returns 503. */
+  orderPlacementEnabled: boolean;
+  /** Toggle: dispatcher fans out broadcast offers. Off → orders sit at `confirmed` until a vendor manually assigns. */
+  dispatchEnabled: boolean;
+  /** Toggle: any new signups allowed. Off → /auth/signup returns 503. */
+  signupsEnabled: boolean;
 
   /**
    * Minimum mobile-app native version still allowed. Compared against
@@ -52,6 +58,12 @@ export interface IPlatformConfig extends Document {
    */
   maintenanceMode: boolean;
   maintenanceExpectedBackAt?: Date;
+  /**
+   * Free-form reason rendered on the mobile maintenance screen alongside
+   * the ETA. e.g. "We're upgrading payments. Try again in 2 hours."
+   * Empty falls back to a generic copy in the mobile client.
+   */
+  maintenanceReason?: string;
 
   /**
    * Per-role customer-support config. Drives the shared SupportHub
@@ -117,10 +129,14 @@ const PlatformConfigSchema: Schema<IPlatformConfig> = new Schema(
 
     paymentsEnabled: { type: Boolean, default: true },
     withdrawalsEnabled: { type: Boolean, default: true },
+    orderPlacementEnabled: { type: Boolean, default: true },
+    dispatchEnabled: { type: Boolean, default: true },
+    signupsEnabled: { type: Boolean, default: true },
 
     minMobileVersion: { type: String, default: "" },
     maintenanceMode: { type: Boolean, default: false },
     maintenanceExpectedBackAt: { type: Date },
+    maintenanceReason: { type: String, default: "" },
 
     support: {
       customer: { type: SupportBlockSchema, default: () => ({}) },

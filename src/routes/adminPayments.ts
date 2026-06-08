@@ -13,9 +13,18 @@ import {
   getPlatformConfig,
 } from "../utils/platformConfig";
 import { refundOrderToWallet, settleOrderEarnings } from "../utils/earningsUtils";
-import { refundTransaction } from "../utils/paystack";
+import {
+  refundTransaction,
+  createTransferRecipient,
+  initiateTransfer,
+} from "../utils/paystack";
+import {
+  getOrCreateUserWallet,
+  getOrCreateSystemWallet,
+  postTransfer,
+} from "../utils/wallet";
 import { notifyUser } from "../utils/notify";
-import { emitToUser } from "../socket";
+import { emitToUser, emitToAdmins } from "../socket";
 import { parsePagination } from "../utils/pagination";
 import { idempotencyKey } from "../middleware/idempotency";
 
@@ -78,6 +87,14 @@ router.patch("/config", async (req, res) => {
       "withdrawalFeeNgn",
       "paymentsEnabled",
       "withdrawalsEnabled",
+      "orderPlacementEnabled",
+      "dispatchEnabled",
+      "signupsEnabled",
+      "minMobileVersion",
+      "maintenanceMode",
+      "maintenanceExpectedBackAt",
+      "maintenanceReason",
+      "support",
     ] as const;
 
     const updates: Record<string, unknown> = {};
@@ -86,6 +103,27 @@ router.patch("/config", async (req, res) => {
     }
     if (Object.keys(updates).length === 0)
       return res.status(400).json({ message: "No editable fields supplied" });
+
+    // Concurrent-edit detection. Client passes `expectedUpdatedAt` from
+    // the last GET; if the server's `updatedAt` is newer, another admin
+    // has saved in between. Returning 409 instead of silently
+    // overwriting prevents the lost-write scenario from the audit.
+    const expected = req.body?.expectedUpdatedAt as string | undefined;
+    if (expected) {
+      const current = await PlatformConfig.findOne({ key: "main" })
+        .select("updatedAt")
+        .lean();
+      if (
+        current?.updatedAt &&
+        new Date(current.updatedAt).getTime() !== new Date(expected).getTime()
+      ) {
+        return res.status(409).json({
+          message:
+            "Another admin saved changes since you loaded this page. Reload to see the latest values, then re-apply your edits.",
+          currentUpdatedAt: current.updatedAt,
+        });
+      }
+    }
 
     // Light validation — commissions in [0, 0.5], windows positive.
     if (
@@ -225,6 +263,15 @@ router.post("/users/:id/verify", async (req, res) => {
         reviewedAt: new Date(),
         note,
       } as any;
+      // CRITICAL: also set the unified User.verificationStatus field
+      // that `postAuthPathFor` reads. Without this, the vendor's
+      // RiderProfile/vendorVerification flips but the mobile auth
+      // router still treats them as unverified and sends them back to
+      // the verification screen after login.
+      user.verificationStatus = "approved";
+      user.verificationReason = note;
+      user.verificationReviewedAt = new Date();
+      user.verificationReviewedBy = req.userId as never;
       await user.save();
       after = { status: user.vendorVerification?.status };
     } else {
@@ -236,8 +283,23 @@ router.post("/users/:id/verify", async (req, res) => {
       profile.isVerified = true;
       profile.verificationNote = note;
       await profile.save();
+      // Same fix as the vendor branch — propagate to the unified User
+      // field so the mobile auth router sends the rider to /(rider)/(queue)
+      // instead of /(auth)/verification/pending on next login.
+      user.verificationStatus = "approved";
+      user.verificationReason = note;
+      user.verificationReviewedAt = new Date();
+      user.verificationReviewedBy = req.userId as never;
+      await user.save();
       after = { status: profile.verificationStatus };
     }
+
+    // Push the status change to the user's socket room so the mobile
+    // pending-lobby flips in real-time if they're sitting on it.
+    emitToUser(String(user._id), "verification:status", {
+      status: "approved",
+      reason: note,
+    });
 
     await writeAudit({
       actor: req.userId!,
@@ -284,6 +346,13 @@ router.post("/users/:id/reject", async (req, res) => {
         reviewedAt: new Date(),
         note: reason,
       } as any;
+      // Mirror the rejection onto User.verificationStatus so the
+      // mobile auth router treats them as rejected (routes to the
+      // verification screen with the reason visible).
+      user.verificationStatus = "rejected";
+      user.verificationReason = reason;
+      user.verificationReviewedAt = new Date();
+      user.verificationReviewedBy = req.userId as never;
       await user.save();
     } else {
       const profile = await RiderProfile.findOne({ user: user._id });
@@ -293,7 +362,18 @@ router.post("/users/:id/reject", async (req, res) => {
       profile.isVerified = false;
       profile.verificationNote = reason;
       await profile.save();
+      // Same mirror on the rider branch.
+      user.verificationStatus = "rejected";
+      user.verificationReason = reason;
+      user.verificationReviewedAt = new Date();
+      user.verificationReviewedBy = req.userId as never;
+      await user.save();
     }
+
+    emitToUser(String(user._id), "verification:status", {
+      status: "rejected",
+      reason,
+    });
 
     await writeAudit({
       actor: req.userId!,
@@ -436,10 +516,16 @@ router.post(
         });
 
       const amount = Number(req.body?.amount ?? order.totalPrice);
-      if (amount <= 0 || amount > order.totalPrice)
+      // SECURITY P0 (audit run 5): Number("abc") → NaN; both
+      // amount <= 0 and amount > total comparisons against NaN return
+      // false, so the guard passes. NaN then flows into
+      // refundOrderToWallet and Math.round(amount*100) for Paystack,
+      // corrupting the wallet ledger with NaN balances or generating
+      // invalid Paystack requests. isFinite filters NaN + Infinity.
+      if (!Number.isFinite(amount) || amount <= 0 || amount > order.totalPrice)
         return res
           .status(400)
-          .json({ message: "amount must be > 0 and ≤ order total" });
+          .json({ message: "amount must be a finite number > 0 and ≤ order total" });
 
       if (destination === "wallet") {
         await refundOrderToWallet({
@@ -448,6 +534,8 @@ router.post(
           reason,
           adminId: req.userId,
         });
+        // Wallet refunds settle instantly — no Paystack webhook to wait on.
+        order.refundStatus = "succeeded";
       } else {
         // Card refund — Paystack async. Mark Order optimistically; webhook
         // (refund.processed) will reconcile on success or revert on fail.
@@ -461,11 +549,18 @@ router.post(
           customer_note: reason,
           merchant_note: `Refund by admin ${req.userId}`,
         });
+        // Stays "pending" until refund.processed / refund.failed webhook
+        // flips it. Admin sees a Retry button when this sits > 10 min.
+        order.refundStatus = "pending";
       }
 
       order.paymentStatus = "refunded";
       order.cancellationReason = `Refund: ${reason}`;
       order.status = "cancelled";
+      order.refundAmount = amount;
+      order.refundDestination = destination;
+      order.refundInitiatedAt = new Date();
+      order.refundFailReason = undefined;
       await order.save();
 
       await writeAudit({
@@ -558,6 +653,7 @@ router.post("/disputes/:id/resolve", idempotencyKey(), async (req, res) => {
         .status(400)
         .json({ message: "Only open disputes can be resolved" });
 
+    let disputeRefundStatus: "pending" | "succeeded" | undefined;
     if (refundAmount > 0) {
       const order = await Order.findById(dispute.order);
       if (!order) return res.status(404).json({ message: "Order not found" });
@@ -568,6 +664,7 @@ router.post("/disputes/:id/resolve", idempotencyKey(), async (req, res) => {
           reason: resolution,
           adminId: req.userId,
         });
+        disputeRefundStatus = "succeeded";
       } else {
         if (!order.paymentRef)
           return res
@@ -579,6 +676,7 @@ router.post("/disputes/:id/resolve", idempotencyKey(), async (req, res) => {
           customer_note: resolution,
           merchant_note: `Dispute ${dispute._id}`,
         });
+        disputeRefundStatus = "pending";
       }
     }
 
@@ -587,6 +685,12 @@ router.post("/disputes/:id/resolve", idempotencyKey(), async (req, res) => {
     dispute.resolvedAt = new Date();
     dispute.resolution = resolution;
     dispute.refundAmount = refundAmount;
+    if (refundAmount > 0) {
+      dispute.refundDestination = refundDestination;
+      dispute.refundStatus = disputeRefundStatus;
+      dispute.refundInitiatedAt = new Date();
+      dispute.refundFailReason = undefined;
+    }
     await dispute.save();
 
     // Now that the dispute is closed, settle the order earnings.
@@ -623,7 +727,10 @@ router.post("/disputes/:id/resolve", idempotencyKey(), async (req, res) => {
  * Body: { resolution }
  * No refund — settles order normally.
  */
-router.post("/disputes/:id/reject", async (req, res) => {
+// SEC-P2 (audit run 5): sibling /resolve has idempotencyKey() — reject
+// pre-fix didn't, so a double-click wrote two AuditLog rows + two
+// notifications. Adds parity.
+router.post("/disputes/:id/reject", idempotencyKey(), async (req, res) => {
   try {
     const { resolution } = req.body ?? {};
     if (!resolution)
@@ -803,5 +910,461 @@ router.get("/audit-log", async (req, res) => {
     res.status(500).json({ message: "Failed to load audit log" });
   }
 });
+
+/* ──────────────────── REFUND RETRY (orders + disputes) ──────────────────── */
+
+/**
+ * POST /api/admin/orders/:id/refund-retry
+ *
+ * Re-fires a stuck card refund. The original refund left the Order in
+ * `refundStatus="pending"` (or "failed") if the Paystack webhook never
+ * landed. This endpoint re-calls Paystack with the original amount +
+ * destination and resets `refundInitiatedAt` so the "stuck N minutes"
+ * badge restarts. Audit-logged.
+ */
+router.post(
+  "/orders/:id/refund-retry",
+  idempotencyKey({ enforce: true }),
+  async (req, res) => {
+    try {
+      const order = await Order.findById(req.params.id);
+      if (!order) return res.status(404).json({ message: "Order not found" });
+      if (order.refundStatus === "succeeded")
+        return res.status(409).json({ message: "Refund already succeeded" });
+      if (!order.refundDestination || order.refundDestination === "wallet")
+        return res
+          .status(400)
+          .json({ message: "Only card refunds can be retried" });
+      if (!order.paymentRef)
+        return res
+          .status(400)
+          .json({ message: "Order has no payment reference" });
+      const amount = Number(order.refundAmount ?? order.totalPrice);
+      if (!amount || amount <= 0)
+        return res.status(400).json({ message: "No refund amount on order" });
+
+      await refundTransaction({
+        transaction: order.paymentRef,
+        amount: Math.round(amount * 100),
+        customer_note: `Retry: ${order.cancellationReason ?? "refund"}`,
+        merchant_note: `Refund retry by admin ${req.userId}`,
+      });
+
+      order.refundStatus = "pending";
+      order.refundInitiatedAt = new Date();
+      order.refundFailReason = undefined;
+      await order.save();
+
+      await writeAudit({
+        actor: req.userId!,
+        action: "order.refund-retry",
+        targetKind: "Order",
+        target: order._id.toString(),
+        after: { amount, destination: order.refundDestination },
+        ip: req.ip,
+      });
+
+      res.json({ message: "Refund retried", order });
+    } catch (err) {
+      console.error("[admin/orders/refund-retry]", err);
+      res.status(500).json({ message: "Failed to retry refund" });
+    }
+  }
+);
+
+/**
+ * POST /api/admin/disputes/:id/refund-retry
+ *
+ * Mirror of /orders/:id/refund-retry for disputes — re-fires a stuck
+ * dispute-resolution refund.
+ */
+router.post(
+  "/disputes/:id/refund-retry",
+  idempotencyKey({ enforce: true }),
+  async (req, res) => {
+    try {
+      const dispute = await Dispute.findById(req.params.id);
+      if (!dispute) return res.status(404).json({ message: "Not found" });
+      if (dispute.refundStatus === "succeeded")
+        return res.status(409).json({ message: "Refund already succeeded" });
+      if (!dispute.refundDestination || dispute.refundDestination === "wallet")
+        return res
+          .status(400)
+          .json({ message: "Only card refunds can be retried" });
+      const amount = Number(dispute.refundAmount ?? 0);
+      if (!amount || amount <= 0)
+        return res
+          .status(400)
+          .json({ message: "No refund amount on dispute" });
+
+      const order = await Order.findById(dispute.order);
+      if (!order?.paymentRef)
+        return res
+          .status(400)
+          .json({ message: "Underlying order has no Paystack ref" });
+
+      await refundTransaction({
+        transaction: order.paymentRef,
+        amount: Math.round(amount * 100),
+        customer_note: `Retry dispute ${dispute._id}`,
+        merchant_note: `Dispute refund retry by admin ${req.userId}`,
+      });
+
+      dispute.refundStatus = "pending";
+      dispute.refundInitiatedAt = new Date();
+      dispute.refundFailReason = undefined;
+      await dispute.save();
+
+      await writeAudit({
+        actor: req.userId!,
+        action: "dispute.refund-retry",
+        targetKind: "Dispute",
+        target: dispute._id.toString(),
+        after: { amount },
+        ip: req.ip,
+      });
+
+      res.json({ message: "Refund retried", dispute });
+    } catch (err) {
+      console.error("[admin/disputes/refund-retry]", err);
+      res.status(500).json({ message: "Failed to retry refund" });
+    }
+  }
+);
+
+/* ──────────────────── WITHDRAWAL ADMIN ACTIONS ──────────────────── */
+
+/**
+ * GET /api/admin/withdrawals/:id
+ * Detail view: withdrawal + populated user + the ledger Transactions
+ * that share this withdrawal's _id (debit, fee, optional reversal).
+ */
+router.get("/withdrawals/:id", async (req, res) => {
+  try {
+    const Transaction = (await import("../models/Transaction")).default;
+    const withdrawal = await Withdrawal.findById(req.params.id)
+      .populate({ path: "user", select: "displayName email phone role" })
+      .lean();
+    if (!withdrawal)
+      return res.status(404).json({ message: "Withdrawal not found" });
+    const transactions = await Transaction.find({ withdrawal: withdrawal._id })
+      .sort({ createdAt: 1 })
+      .lean();
+    res.json({ withdrawal, transactions });
+  } catch (err) {
+    console.error("[admin/withdrawals/detail]", err);
+    res.status(500).json({ message: "Failed to load withdrawal detail" });
+  }
+});
+
+/**
+ * POST /api/admin/withdrawals/:id/approve
+ *
+ * Bypass the withdrawal-hold timer + initiate Paystack transfer
+ * immediately. Only valid for `pending` rows whose initial Paystack
+ * call was skipped (no bankCode) or held. The user's wallet was already
+ * debited at request time, so this is purely the Paystack push.
+ */
+router.post(
+  "/withdrawals/:id/approve",
+  idempotencyKey({ enforce: true }),
+  async (req, res) => {
+    try {
+      const withdrawal = await Withdrawal.findById(req.params.id);
+      if (!withdrawal)
+        return res.status(404).json({ message: "Withdrawal not found" });
+      if (withdrawal.status !== "pending")
+        return res
+          .status(409)
+          .json({ message: `Only pending withdrawals can be approved (status=${withdrawal.status})` });
+
+      const bank = withdrawal.bankAccount;
+      if (!bank?.bankCode)
+        return res
+          .status(400)
+          .json({ message: "Withdrawal bank account has no bankCode" });
+
+      const recipient = await createTransferRecipient({
+        name: bank.accountName,
+        account_number: bank.accountNumber,
+        bank_code: bank.bankCode,
+      });
+      const transfer = await initiateTransfer({
+        amount: withdrawal.amount * 100,
+        recipient: recipient.recipient_code,
+        reason: `Gaznger ${withdrawal.role} payout (admin-approved)`,
+        reference: `${withdrawal.role}-${withdrawal._id.toString().slice(-12)}-${Date.now().toString(36)}`,
+      });
+
+      withdrawal.status = "processing";
+      withdrawal.paystackTransferCode = transfer.transfer_code;
+      withdrawal.paystackRecipientCode = recipient.recipient_code;
+      await withdrawal.save();
+
+      await writeAudit({
+        actor: req.userId!,
+        action: "withdrawal.approve" as any,
+        targetKind: "Withdrawal",
+        target: withdrawal._id.toString(),
+        after: {
+          status: "processing",
+          paystackTransferCode: transfer.transfer_code,
+        },
+        ip: req.ip,
+      });
+
+      await notifyUser(
+        withdrawal.user.toString(),
+        "payment",
+        "Payout approved",
+        `Your ₦${withdrawal.amount.toLocaleString("en-NG")} withdrawal is on the way.`
+      );
+      emitToUser(withdrawal.user.toString(), "withdrawal:status", {
+        withdrawalId: withdrawal._id,
+        status: "processing",
+      });
+      // P1-3: keep ops dashboards in sync with money state changes.
+      emitToAdmins("withdrawal:status", {
+        withdrawalId: String(withdrawal._id),
+        status: "processing",
+        userId: String(withdrawal.user),
+      });
+
+      res.json({ message: "Withdrawal approved", withdrawal });
+    } catch (err) {
+      console.error("[admin/withdrawals/approve]", err);
+      res.status(502).json({
+        message: "Paystack rejected the transfer. Try again or reject + re-issue.",
+      });
+    }
+  }
+);
+
+/**
+ * POST /api/admin/withdrawals/:id/reject
+ * Body: { reason }
+ *
+ * Cancel a pending withdrawal. Reverses the wallet debit + fee debit
+ * that were posted at request time. Sets status="rejected". User is
+ * notified.
+ */
+router.post(
+  "/withdrawals/:id/reject",
+  idempotencyKey({ enforce: true }),
+  async (req, res) => {
+    try {
+      const { reason } = req.body ?? {};
+      if (!reason)
+        return res.status(400).json({ message: "reason is required" });
+      const withdrawal = await Withdrawal.findById(req.params.id);
+      if (!withdrawal)
+        return res.status(404).json({ message: "Withdrawal not found" });
+      if (withdrawal.status !== "pending")
+        return res
+          .status(409)
+          .json({ message: `Only pending withdrawals can be rejected (status=${withdrawal.status})` });
+
+      const userWallet = await getOrCreateUserWallet(withdrawal.user.toString());
+      const platformRevenue = await getOrCreateSystemWallet("platform-revenue");
+      const cfg = await getPlatformConfig();
+      const fee = cfg.withdrawalFeeNgn;
+
+      // Reverse the payout debit.
+      await postTransfer({
+        from: platformRevenue,
+        to: userWallet,
+        amount: withdrawal.amount,
+        state: "available",
+        kinds: ["platform_commission_credit", "withdraw_reversal_credit"],
+        description: `Reverse rejected withdrawal ${withdrawal._id}`,
+        opts: {
+          idempotencyKey: `withdrawal:${withdrawal._id}:reject-reverse`,
+          withdrawal: withdrawal._id as any,
+        },
+      });
+      if (fee > 0) {
+        await postTransfer({
+          from: platformRevenue,
+          to: userWallet,
+          amount: fee,
+          state: "available",
+          kinds: ["platform_commission_credit", "withdraw_reversal_credit"],
+          description: `Reverse fee for rejected withdrawal ${withdrawal._id}`,
+          opts: {
+            idempotencyKey: `withdrawal:${withdrawal._id}:reject-reverse-fee`,
+            withdrawal: withdrawal._id as any,
+          },
+        });
+      }
+
+      withdrawal.status = "rejected";
+      withdrawal.note = reason;
+      await withdrawal.save();
+
+      await writeAudit({
+        actor: req.userId!,
+        action: "withdrawal.reject" as any,
+        targetKind: "Withdrawal",
+        target: withdrawal._id.toString(),
+        after: { status: "rejected" },
+        reason,
+        ip: req.ip,
+      });
+
+      const fresh = await getOrCreateUserWallet(withdrawal.user.toString());
+      emitToUser(withdrawal.user.toString(), "wallet:update", {
+        available: fresh.available,
+        pending: fresh.pending,
+      });
+      emitToUser(withdrawal.user.toString(), "withdrawal:status", {
+        withdrawalId: withdrawal._id,
+        status: "rejected",
+      });
+      emitToAdmins("withdrawal:status", {
+        withdrawalId: String(withdrawal._id),
+        status: "rejected",
+        userId: String(withdrawal.user),
+      });
+      await notifyUser(
+        withdrawal.user.toString(),
+        "payment",
+        "Payout rejected",
+        `Your ₦${withdrawal.amount.toLocaleString("en-NG")} payout was reversed: ${reason}`
+      );
+
+      res.json({ message: "Withdrawal rejected", withdrawal });
+    } catch (err) {
+      console.error("[admin/withdrawals/reject]", err);
+      res.status(500).json({ message: "Failed to reject withdrawal" });
+    }
+  }
+);
+
+/**
+ * POST /api/admin/withdrawals/:id/retry
+ *
+ * Re-fire Paystack transfer on a `failed` Withdrawal. The original
+ * failure path in `handleWithdrawRequest` already reversed the wallet
+ * debits — admin needs to re-debit then re-initiate. We use a fresh
+ * idempotency-key suffix so the original failure leg doesn't dedupe.
+ */
+router.post(
+  "/withdrawals/:id/retry",
+  idempotencyKey({ enforce: true }),
+  async (req, res) => {
+    try {
+      const withdrawal = await Withdrawal.findById(req.params.id);
+      if (!withdrawal)
+        return res.status(404).json({ message: "Withdrawal not found" });
+      if (withdrawal.status !== "failed")
+        return res
+          .status(409)
+          .json({ message: `Only failed withdrawals can be retried (status=${withdrawal.status})` });
+
+      const bank = withdrawal.bankAccount;
+      if (!bank?.bankCode)
+        return res
+          .status(400)
+          .json({ message: "Withdrawal bank account has no bankCode" });
+
+      const userWallet = await getOrCreateUserWallet(withdrawal.user.toString());
+      const cfg = await getPlatformConfig();
+      const fee = cfg.withdrawalFeeNgn;
+      const totalDebit = withdrawal.amount + fee;
+      if (userWallet.available < totalDebit) {
+        return res.status(409).json({
+          message: `Insufficient wallet balance (₦${userWallet.available.toLocaleString("en-NG")}) to re-debit ₦${totalDebit.toLocaleString("en-NG")}`,
+        });
+      }
+
+      const platformRevenue = await getOrCreateSystemWallet("platform-revenue");
+      const retrySuffix = Date.now().toString(36);
+      if (fee > 0) {
+        await postTransfer({
+          from: userWallet,
+          to: platformRevenue,
+          amount: fee,
+          state: "available",
+          kinds: ["withdraw_fee_debit", "platform_commission_credit"],
+          description: `Retry fee for ${withdrawal._id}`,
+          opts: {
+            idempotencyKey: `withdrawal:${withdrawal._id}:retry-fee:${retrySuffix}`,
+            withdrawal: withdrawal._id as any,
+          },
+        });
+      }
+      await postTransfer({
+        from: userWallet,
+        to: platformRevenue,
+        amount: withdrawal.amount,
+        state: "available",
+        kinds: ["withdraw_debit", "platform_commission_credit"],
+        description: `Retry payout to ${bank.accountNumber}`,
+        opts: {
+          idempotencyKey: `withdrawal:${withdrawal._id}:retry-payout:${retrySuffix}`,
+          withdrawal: withdrawal._id as any,
+        },
+      });
+
+      const recipient = await createTransferRecipient({
+        name: bank.accountName,
+        account_number: bank.accountNumber,
+        bank_code: bank.bankCode,
+      });
+      const transfer = await initiateTransfer({
+        amount: withdrawal.amount * 100,
+        recipient: recipient.recipient_code,
+        reason: `Gaznger ${withdrawal.role} payout (retry)`,
+        reference: `${withdrawal.role}-${withdrawal._id.toString().slice(-12)}-${retrySuffix}`,
+      });
+
+      withdrawal.status = "processing";
+      withdrawal.paystackTransferCode = transfer.transfer_code;
+      withdrawal.paystackRecipientCode = recipient.recipient_code;
+      withdrawal.note = undefined;
+      await withdrawal.save();
+
+      await writeAudit({
+        actor: req.userId!,
+        action: "withdrawal.retry",
+        targetKind: "Withdrawal",
+        target: withdrawal._id.toString(),
+        after: { status: "processing" },
+        ip: req.ip,
+      });
+
+      const fresh = await getOrCreateUserWallet(withdrawal.user.toString());
+      emitToUser(withdrawal.user.toString(), "wallet:update", {
+        available: fresh.available,
+        pending: fresh.pending,
+      });
+      emitToUser(withdrawal.user.toString(), "withdrawal:status", {
+        withdrawalId: withdrawal._id,
+        status: "processing",
+      });
+      emitToAdmins("withdrawal:status", {
+        withdrawalId: String(withdrawal._id),
+        status: "processing",
+        userId: String(withdrawal.user),
+      });
+      // SEC-P1 (audit run 5): withdrawal retry was the only flow that
+      // didn't notifyUser. Pair it now.
+      await notifyUser(
+        withdrawal.user.toString(),
+        "payment",
+        "Payout retried",
+        `Your ₦${withdrawal.amount.toLocaleString("en-NG")} payout has been re-attempted.`,
+      ).catch(() => {});
+
+      res.json({ message: "Withdrawal retried", withdrawal });
+    } catch (err) {
+      console.error("[admin/withdrawals/retry]", err);
+      res.status(502).json({
+        message:
+          "Paystack rejected the transfer again. Reverse and re-issue manually.",
+      });
+    }
+  }
+);
 
 export default router;

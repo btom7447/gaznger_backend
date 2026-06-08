@@ -17,12 +17,25 @@ const RIDERS_PER_BROADCAST = 3;
  *  2. Find nearest available riders within radius → create Delivery records → set expiry.
  */
 export async function dispatchRiders(): Promise<void> {
+  // P1-MF-7 (audit run 4): respect the dispatchEnabled kill switch.
+  // Pre-fix this flag was admin-toggleable but the cron ignored it —
+  // admin could intend "pause new dispatch while we investigate"
+  // and orders would keep getting broadcast. Confirmed orders stay
+  // confirmed; the next tick after the flag flips back to true
+  // resumes normally.
+  const { getCommissionRate, getPlatformConfig } = await import(
+    "../utils/platformConfig"
+  );
+  const cfg = await getPlatformConfig();
+  if ((cfg as any).dispatchEnabled === false) {
+    return;
+  }
+
   const maxRounds = Number(process.env.RIDER_DISPATCH_MAX_ROUNDS) || 3;
   const radiusKm = Number(process.env.RIDER_DISPATCH_RADIUS_KM) || 10;
   const timeoutSec = Number(process.env.RIDER_DISPATCH_TIMEOUT_SECONDS) || 180;
   // Rider commission now sourced from PlatformConfig — env stays as a
   // pure fallback for first boot before the singleton exists.
-  const { getCommissionRate } = await import("../utils/platformConfig");
   const platformDeliveryRate = await getCommissionRate("rider"); // 0.05 default
   const platformDeliveryComm = platformDeliveryRate * 100;
 
@@ -63,6 +76,9 @@ export async function dispatchRiders(): Promise<void> {
   }
 
   // ── Step 2: Dispatch confirmed orders that don't yet have an expiry set ──
+  // `deliveryAddress` is populated so the v7 RiderDispatchModal can show
+  // the customer's city (e.g. "Ikate · Lekki") instead of the "Nearby
+  // area" fallback (brief §4.1 — `customerArea` field).
   const ordersToDispatch = await Order.find({
     status: "confirmed",
     riderId: null,
@@ -70,6 +86,8 @@ export async function dispatchRiders(): Promise<void> {
     dispatchAttempt: { $lt: maxRounds },
   })
     .populate("station")
+    .populate({ path: "deliveryAddress", select: "city state street" })
+    .populate({ path: "fuel", select: "name unit" })
     .lean();
 
   for (const order of ordersToDispatch) {
@@ -78,9 +96,17 @@ export async function dispatchRiders(): Promise<void> {
 
     if (!stationCoords?.lat || !stationCoords?.lng) continue;
 
-    // Find all available riders that have reported a location
+    // Find all available + verified riders that have reported a
+    // location. Unverified riders are excluded from broadcast — the
+    // brief's hard rule "verification gates every CTA" means an
+    // unverified rider can't be matched to a delivery even if their
+    // local availability flag is on (server is the source of truth).
     const availableRiders = await RiderProfile.find({
       isAvailable: true,
+      $or: [
+        { verificationStatus: "verified" },
+        { isVerified: true },
+      ],
     }).lean();
 
     const ridersWithLocation = availableRiders.filter(
@@ -144,18 +170,41 @@ export async function dispatchRiders(): Promise<void> {
         platformEarnings,
       });
 
-      // Instant socket ping first, then background push notification
+      // Instant socket ping first, then background push notification.
+      //
+      // Broadcast offers fire `dispatch:offer` exclusively — the v7
+      // RiderDispatchModal listens for this name and the payload
+      // carries `dispatchExpiresAt` so the rider client can drive the
+      // 15s countdown ring without a follow-up GET.
+      //
+      // Manual vendor assigns (vendor.ts /assign and /reassign) emit
+      // `delivery:dispatch` directly to the rider — they don't go
+      // through this job. The v7 Queue disambiguates the two events:
+      // `dispatch:offer` opens the modal; `delivery:dispatch` opens
+      // the active-delivery card with an "Assigned by vendor" pill
+      // (brief §5B).
       const riderId = candidate.user.toString();
-      emitToUser(riderId, "delivery:dispatch", {
+      const deliveryAddress = (order as any).deliveryAddress;
+      const customerArea = deliveryAddress
+        ? [deliveryAddress.city, deliveryAddress.state]
+            .filter(Boolean)
+            .join(" · ")
+        : null;
+      const fuel = (order as any).fuel;
+      const offerPayload = {
         deliveryId: delivery._id,
         orderId: order._id,
+        stationId: order.station,
         stationName: station?.name,
         stationAddress: station?.address,
-        fuelName: (order as any).fuel?.name,
+        fuelName: fuel?.name,
         quantity: order.quantity,
-        unit: (order as any).unit,
+        unit: fuel?.unit,
         riderEarnings,
-      });
+        dispatchExpiresAt: expiry,
+        customerArea,
+      };
+      emitToUser(riderId, "dispatch:offer", offerPayload);
       notifyUser(
         riderId,
         "dispatch",

@@ -6,6 +6,7 @@ import rateLimit from "express-rate-limit";
 import { v4 as uuidv4 } from "uuid";
 
 import authRoutes from "./routes/auth";
+import configRoutes from "./routes/config";
 import fuelTypeRoutes from "./routes/fuelTypes";
 import fuelPricesRoutes from "./routes/fuelPrices";
 import stationRoutes from "./routes/stations";
@@ -32,6 +33,14 @@ import { errorHandler } from "./middleware/errorHandler";
 import { edgeStateGate } from "./middleware/edgeState";
 
 const app = express();
+
+// Trust proxy hops — required so express-rate-limit + req.ip use the real
+// client IP, not the Railway/Cloudflare edge. Without this, every IP-keyed
+// limiter collapses to the proxy IP and becomes a single global bucket
+// (a single attacker can lock out every legitimate user).
+// SECURITY P0 (audit run 5): TRUST_PROXY_HOPS defaults to 1 for Railway;
+// set to 2 if Cloudflare is added in front.
+app.set("trust proxy", Number(process.env.TRUST_PROXY_HOPS ?? 1));
 
 // Security headers
 app.use(helmet());
@@ -178,6 +187,7 @@ app.use("/auth/forgot-pin", otpLimiter);
 app.use("/auth/signup", authLimiter);
 app.use("/auth/login", authLimiter);
 app.use("/auth", apiLimiter, authRoutes);
+app.use("/api/config", apiLimiter, configRoutes);
 app.use("/api/fuel-types", apiLimiter, fuelTypeRoutes);
 app.use("/api/fuel-prices", apiLimiter, fuelPricesRoutes);
 app.use("/api/stations", apiLimiter, stationRoutes);

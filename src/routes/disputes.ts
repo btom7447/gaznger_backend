@@ -4,7 +4,7 @@ import Dispute from "../models/Dispute";
 import Order from "../models/Order";
 import { requireAuth } from "../middleware/auth";
 import { notifyUser } from "../utils/notify";
-import { emitToUser } from "../socket";
+import { emitToUser, emitToAdmins } from "../socket";
 import { parsePagination } from "../utils/pagination";
 
 const router = Router();
@@ -48,11 +48,18 @@ router.post("/", requireAuth, async (req, res) => {
       status: "open",
     });
 
-    // Notify admin team — for now, just emit a socket; admin dashboard
-    // wires up its own listener.
+    // P1-3 (audit run 1): fan out to the admin broadcast room so the
+    // disputes queue refetches in real time.
     emitToUser(req.userId!, "dispute:opened", {
       disputeId: dispute._id,
       orderId: order._id,
+    });
+    emitToAdmins("dispute:opened", {
+      disputeId: String(dispute._id),
+      orderId: String(order._id),
+      raisedBy: req.userId,
+      reason,
+      createdAt: dispute.createdAt,
     });
 
     await notifyUser(
@@ -61,6 +68,38 @@ router.post("/", requireAuth, async (req, res) => {
       "Dispute Opened",
       "We've received your report. The team will review it shortly."
     );
+
+    // P1-6 (audit run 5): pre-fix, only the OPENER received any
+    // notification. The dispute opponent (rider + the station's
+    // vendor) got nothing — they'd silently lose escrow release
+    // and only learn about the dispute from a support ticket. Now
+    // both opponents are pushed + socket-notified.
+    const opponentIds = new Set<string>();
+    if (order.riderId) opponentIds.add(String(order.riderId));
+    if (order.station) {
+      try {
+        const station = await (await import("../models/Station")).default
+          .findById(order.station)
+          .select("vendorId")
+          .lean();
+        if (station?.vendorId) opponentIds.add(String(station.vendorId));
+      } catch {
+        /* best-effort */
+      }
+    }
+    for (const opponentId of opponentIds) {
+      emitToUser(opponentId, "dispute:opened", {
+        disputeId: String(dispute._id),
+        orderId: String(order._id),
+        role: "opponent",
+      });
+      await notifyUser(
+        opponentId,
+        "order",
+        "Order disputed",
+        "A customer raised an issue on one of your deliveries. Check the order details.",
+      ).catch(() => {});
+    }
 
     res.status(201).json(dispute);
   } catch (err) {

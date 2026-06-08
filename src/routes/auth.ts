@@ -11,7 +11,8 @@ import { signAccessToken, signRefreshToken, verifyRefreshToken } from "../utils/
 import { requireAuth } from "../middleware/auth";
 import { validate } from "../middleware/validate";
 import { idempotencyKey } from "../middleware/idempotency";
-import { withIdempotency } from "../utils/idempotencyCache";
+import { withIdempotency, PRE_AUTH_TTL_MS } from "../utils/idempotencyCache";
+import { getPlatformConfig } from "../utils/platformConfig";
 import { DEV_FIXED_OTP, isDevSmsMode, sendOtpSms } from "../utils/sms";
 import {
   assertNotLocked,
@@ -152,6 +153,15 @@ function publicUser(user: import("../models/User").IUser) {
   delete obj.pinHash;
   delete obj.otpCode;
   delete obj.otpExpiresAt;
+  // SECURITY P0 (audit run 5): strip device push tokens + Paystack
+  // saved-card auth fields. Mobile fetches these via /auth/me which
+  // already excludes them; signup/login/forgot-pin responses leaked
+  // the full saved-card authorizationCode (anyone with it can debit
+  // the card via Paystack /charge_authorization) and the FCM device
+  // token list (phishing-push target). signature/expMonth/expYear are
+  // also stripped — cross-merchant card fingerprint scope.
+  delete obj.deviceTokens;
+  delete obj.lastPaystackAuth;
   return {
     ...obj,
     hasPin: Boolean(user.pinHash),
@@ -216,9 +226,9 @@ router.post(
   idempotencyKey(),
   validate(sendOtpSchema),
   async (req, res) => {
+    const { phone } = req.body as { phone: string };
     await withIdempotency(req, res, async () => {
-      const { phone, purpose } = req.body as {
-        phone: string;
+      const { purpose } = req.body as {
         purpose: "signup" | "login" | "recovery";
       };
 
@@ -290,7 +300,7 @@ router.post(
           resendAvailableAt: resendAvailableAt.toISOString(),
         },
       };
-    });
+    }, { bindTo: phone, ttlMs: PRE_AUTH_TTL_MS });
   }
 );
 
@@ -382,15 +392,30 @@ router.post(
   idempotencyKey(),
   validate(signupSchema),
   async (req, res) => {
+    const { verificationToken } = req.body as { verificationToken: string };
     await withIdempotency(req, res, async () => {
-      const { verificationToken, role, pin, profile } = req.body as {
-        verificationToken: string;
+      const { role, pin, profile } = req.body as {
         role: "customer" | "rider" | "vendor";
         pin: string;
         biometricPreference?: string;
         profile: Record<string, unknown>;
       };
       const { deviceId, label } = deviceFromReq(req);
+
+      // P1-MF-7 (audit run 4): enforce signupsEnabled kill switch.
+      // Pre-fix the flag was admin-toggleable but nothing enforced
+      // it — admins could expect signups to pause and they wouldn't.
+      const cfg = await getPlatformConfig();
+      if ((cfg as any).signupsEnabled === false) {
+        return {
+          statusCode: 503,
+          body: {
+            code: "signups_disabled",
+            message:
+              "Signups are temporarily paused. Try again in a few minutes.",
+          },
+        };
+      }
 
       const tokenDoc = await VerificationToken.findOne({
         token: verificationToken,
@@ -509,12 +534,22 @@ router.post(
             // Map the mobile's product slugs (petrol, diesel, kerosene,
             // lpg) to FuelType ObjectIds. Missing fuels are skipped —
             // vendor can edit later.
-            const fuelDocs = products?.length
+            // SEC-P1 (audit run 5): pre-fix `products.join("|")` was
+            // interpolated raw into a $regex. A malicious signup body
+            // like `{products: ['(a+)+$|^(a+)+', 'x']}` triggered
+            // catastrophic backtracking against the FuelType
+            // collection — endpoint is public + rate-limited 30/15min
+            // (which per P0.5 was effectively global pre-trust-proxy).
+            // Now: each entry must be a short alpha-only slug, and we
+            // use $in instead of $regex to remove the alternation
+            // entirely.
+            const SAFE_PRODUCT = /^[a-zA-Z]{2,16}$/;
+            const safeProducts = (products ?? []).filter(
+              (p): p is string => typeof p === "string" && SAFE_PRODUCT.test(p),
+            );
+            const fuelDocs = safeProducts.length
               ? await FuelType.find({
-                  name: {
-                    $regex: `^(${products.join("|")})$`,
-                    $options: "i",
-                  },
+                  name: { $in: safeProducts.map((p) => new RegExp(`^${p}$`, "i")) },
                 })
                   .select("_id")
                   .lean()
@@ -563,7 +598,7 @@ router.post(
           refreshToken,
         },
       };
-    });
+    }, { bindTo: verificationToken, ttlMs: PRE_AUTH_TTL_MS });
   }
 );
 
@@ -706,8 +741,8 @@ router.post(
   idempotencyKey(),
   validate(forgotPinStartSchema),
   async (req, res) => {
+    const { phone } = req.body as { phone: string };
     await withIdempotency(req, res, async () => {
-      const { phone } = req.body as { phone: string };
       const user = await User.findOne({ phone });
       if (!user) {
         return {
@@ -755,7 +790,7 @@ router.post(
           resendAvailableAt: resendAvailableAt.toISOString(),
         },
       };
-    });
+    }, { bindTo: phone, ttlMs: PRE_AUTH_TTL_MS });
   }
 );
 
@@ -827,11 +862,9 @@ router.post(
   idempotencyKey(),
   validate(forgotPinResetSchema),
   async (req, res) => {
+    const { resetToken } = req.body as { resetToken: string };
     await withIdempotency(req, res, async () => {
-      const { resetToken, newPin } = req.body as {
-        resetToken: string;
-        newPin: string;
-      };
+      const { newPin } = req.body as { newPin: string };
       const { deviceId, label } = deviceFromReq(req);
 
       const tokenDoc = await VerificationToken.findOne({
@@ -875,7 +908,7 @@ router.post(
           refreshToken,
         },
       };
-    });
+    }, { bindTo: resetToken, ttlMs: PRE_AUTH_TTL_MS });
   }
 );
 
@@ -912,7 +945,22 @@ router.patch(
       ];
 
       user.verificationDocs = merged;
-      if (!user.verificationStatus) user.verificationStatus = "pending";
+      // Never downgrade an "approved" account to "pending" on a doc
+      // re-upload. The admin team owns approval/rejection state; a
+      // rider re-submitting docs after admin approval shouldn't lose
+      // their badge. If they need re-review, admin explicitly flips
+      // them back to "pending" via PATCH /admin/users/:id/verification.
+      // Set to "pending" only when status is currently unset OR was
+      // previously rejected (re-submission resets the queue).
+      if (
+        !user.verificationStatus ||
+        user.verificationStatus === "rejected"
+      ) {
+        user.verificationStatus = "pending";
+        user.verificationReason = undefined;
+        user.verificationReviewedAt = undefined;
+        user.verificationReviewedBy = undefined;
+      }
       await user.save();
 
       return res.json({

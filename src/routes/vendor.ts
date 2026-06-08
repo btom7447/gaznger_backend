@@ -28,6 +28,49 @@ import { idempotencyKey } from "../middleware/idempotency";
 
 const router = Router();
 
+/**
+ * Vendor-side status normalizer.
+ *
+ * SYNC P0-1 (audit run 1): the vendor app's `OrderStatus` union is 7
+ * values (new | confirmed | assigned | in-transit | awaiting_confirmation
+ * | delivered | cancelled). The server stores 12 (adds pending +
+ * granular v3: at_plant, refilling, returning, arrived, dispensing) and
+ * pre-fix raw-passed `o.status`. `STATUS_LABEL[granular]` returned
+ * undefined → blank badge text + tone. Worse, server emits "pending"
+ * for fresh orders (never "new"), so the vendor's "New" filter showed
+ * blank pills on every order.
+ *
+ * Collapse granular → coarse before responding. Mobile keeps its
+ * existing 7-state mental model; new states fall into the appropriate
+ * bucket so badges render correctly.
+ */
+function normalizeForVendor(status: string): string {
+  switch (status) {
+    case "pending":
+    case "draft":
+    case "pending_payment":
+      return "new";
+    case "at_plant":
+    case "refilling":
+    case "returning":
+    case "in_transit":
+      return "in-transit";
+    case "arrived":
+    case "dispensing":
+      return "awaiting_confirmation";
+    case "cancelled_by_customer":
+    case "cancelled_by_vendor":
+    case "cancelled_by_rider":
+    case "failed_payment":
+      return "cancelled";
+    case "rated":
+    case "closed":
+      return "delivered";
+    default:
+      return status;
+  }
+}
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 },
@@ -487,13 +530,15 @@ router.get("/today", requireAuth, requireVendor, async (req, res) => {
     }
 
     // Map nextOrder + queue into a slim shape the mobile renders directly.
+    // SYNC P0-1: collapse granular v3 statuses → vendor's 7-state union
+    // via normalizeForVendor (top of file).
     const orderToPreview = (o: any) => ({
       id: String(o._id),
       customer: o.user?.displayName ?? "Customer",
       fuel: o.fuel?.name ?? "Fuel",
       qty: `${o.quantity ?? 0} ${o.fuel?.unit ?? ""}`.trim(),
       price: `₦${Number(o.totalPrice ?? 0).toLocaleString("en-NG")}`,
-      status: o.status,
+      status: normalizeForVendor(o.status),
       etaMin: null,
       addr: o.station?.name ?? null,
     });
@@ -698,7 +743,11 @@ router.get("/orders", requireAuth, requireVendor, async (req, res) => {
         qty: qtyUnit,
         price: `₦${Number(o.totalPrice ?? 0).toLocaleString("en-NG")}`,
         priceKobo: o.totalPrice ?? 0,
-        status: o.status,
+        // SYNC P0-1: normalize granular v3 → vendor's 7-state union
+        // so OrderRow's STATUS_LABEL/STATUS_TONE lookups don't return
+        // undefined for at_plant / refilling / returning / arrived /
+        // dispensing / pending.
+        status: normalizeForVendor(o.status),
         addr,
         riderId: o.riderId ? String(o.riderId) : null,
         createdAt: o.createdAt,
@@ -750,8 +799,15 @@ router.get("/orders/:id", requireAuth, requireVendor, async (req, res) => {
 
     if (!order) return res.status(404).json({ message: "Order not found" });
 
-    // Side-load rider plate + rating when assigned.
-    let riderProfile: { plate?: string; rating?: number } | null = null;
+    // Side-load rider plate + rating + home station when assigned.
+    // `homeStationId` drives the "Freelance rider" tag on the order
+    // detail screen (vendor patch 3) — present when the assigned
+    // rider's home station != this order's station.
+    let riderProfile: {
+      plate?: string;
+      rating?: number;
+      homeStationId?: string | null;
+    } | null = null;
     if (order.riderId) {
       const RiderProfile = (await import("../models/RiderProfile")).default;
       const rp = await RiderProfile.findOne({
@@ -760,9 +816,15 @@ router.get("/orders/:id", requireAuth, requireVendor, async (req, res) => {
             ? (order.riderId as any)._id
             : order.riderId,
       })
-        .select("vehiclePlate rating")
+        .select("vehiclePlate rating homeStation")
         .lean();
-      if (rp) riderProfile = { plate: rp.vehiclePlate, rating: rp.rating };
+      if (rp) {
+        riderProfile = {
+          plate: rp.vehiclePlate,
+          rating: rp.rating,
+          homeStationId: rp.homeStation ? String(rp.homeStation) : null,
+        };
+      }
     }
 
     res.json({ ...order, riderProfile });
@@ -835,7 +897,7 @@ router.get("/riders", requireAuth, requireVendor, async (req, res) => {
         .select("displayName phone profileImage")
         .lean(),
       RiderProfile.find({ user: { $in: riderIds } })
-        .select("user isAvailable vehiclePlate rating currentLocation")
+        .select("user isAvailable vehiclePlate rating currentLocation homeStation")
         .lean(),
       Order.distinct("riderId", {
         station: { $in: scopedStationIds },
@@ -917,6 +979,10 @@ router.get("/riders", requireAuth, requireVendor, async (req, res) => {
         trips: tripsById.get(id) ?? 0,
         distanceKm,
         status,
+        // homeStationId lets the vendor UI show the "Affiliated" pill on
+        // riders whose home station is this vendor's, vs the silent
+        // freelance default. See `patches-vendor-affiliation-v7.jsx`.
+        homeStationId: p?.homeStation ? String(p.homeStation) : null,
       };
     });
 
@@ -1321,12 +1387,22 @@ router.patch("/station/fuels", requireAuth, requireVendor, async (req, res) => {
       const fuelEntry = station.fuels.find(
         (f: any) => f.fuel._id?.toString() === fuelId || f.fuel.toString() === fuelId,
       );
+      const fuelName = (fuelEntry as any)?.fuel?.name as string | undefined;
       emitStockAlert(req.userId!, {
         stationId: String(station._id),
         stationName: station.name,
-        fuel: (fuelEntry as any)?.fuel?.name,
+        fuel: fuelName,
         kind: "unavailable",
       });
+      // P1-6 (audit run 5): pair the socket with a push so the vendor
+      // gets the alert even with the app closed. Stock-outs lose
+      // money every minute they go unnoticed.
+      await notifyUser(
+        req.userId!,
+        "alert",
+        "Stock alert",
+        `${fuelName ?? "A fuel"} is now out of stock at ${station.name}. Customers can't order it.`,
+      ).catch(() => {});
     }
 
     res.json({ message: "Fuel updated", fuels: station.fuels });
@@ -1652,6 +1728,16 @@ router.get("/withdraw/preview", requireAuth, requireVendor, async (req, res) => 
 });
 
 // ===================== SUBSCRIBE TO PARTNER BADGE =====================
+// SECURITY P0 (audit run 5): pre-fix, this endpoint set
+// `partnerBadge.active=true` directly with no payment. The flag drives
+// partner prioritization in stations.ts:264-267 (auto-pick), so any
+// vendor could gain free competitive ranking against paying partners.
+//
+// Locked-down state: the endpoint now records the intent (plan +
+// requestedAt) but DOES NOT flip `active`. Real Paystack subscription
+// init + webhook-driven activation is tracked separately. Until that
+// lands, the badge stays inactive — no revenue-bearing privilege
+// escalation is possible.
 router.post("/partner-badge/subscribe", requireAuth, requireVendor, async (req, res) => {
   try {
     const { plan } = req.body;
@@ -1660,17 +1746,28 @@ router.post("/partner-badge/subscribe", requireAuth, requireVendor, async (req, 
       return res.status(400).json({ message: "plan must be monthly, quarterly, or annual" });
     }
 
+    // Record the request but DO NOT activate. The Paystack subscription
+    // init + `charge.success` webhook handler that flips `active=true`
+    // is the next P1 to wire (locked design in
+    // memory/project_paystack_escrow_design.md). Until then, the
+    // endpoint is a no-op for activation — anything else is a footgun
+    // that lets vendors steal partner ranking from paying partners.
     await User.findByIdAndUpdate(req.userId, {
       $set: {
         "partnerBadge.plan": plan,
-        "partnerBadge.active": true,
-        "partnerBadge.subscribedAt": new Date(),
+        "partnerBadge.requestedAt": new Date(),
       },
     });
 
-    res.json({ message: "Partner badge subscription activated", plan });
+    return res.status(202).json({
+      message:
+        "Partner badge subscription requested. Payment flow ships in v3 — your request is recorded but the badge will not activate until Paystack confirms the payment.",
+      plan,
+      status: "pending_payment_flow",
+    });
   } catch (err) {
-    res.status(500).json({ message: "Failed to activate partner badge" });
+    console.error("[vendor/partner-badge/subscribe]", err);
+    res.status(500).json({ message: "Failed to record partner badge request" });
   }
 });
 

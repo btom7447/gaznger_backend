@@ -8,6 +8,7 @@ import User from "../models/User";
 import GasStation from "../models/Station";
 import RiderProfile from "../models/RiderProfile";
 import { emitToUser } from "../socket";
+import { notifyUser } from "../utils/notify";
 
 const router = Router();
 
@@ -418,11 +419,24 @@ router.post("/:id/messages", requireAuth, async (req: any, res) => {
     await chat.save();
 
     // Emit to every participant (including sender, for multi-device).
+    // P1-6 (audit run 5): pair the socket emit with a push for
+    // NON-sender participants so a backgrounded recipient gets a
+    // lock-screen notification. The sender already knows they sent
+    // it (multi-device dedupe is what the socket relay handles).
     for (const p of (chat as any).participants) {
-      emitToUser(String(p.user), "chat:message", {
+      const participantId = String(p.user);
+      emitToUser(participantId, "chat:message", {
         chatId: String(chat._id),
         message: msg,
       });
+      if (participantId !== meId) {
+        await notifyUser(
+          participantId,
+          "message",
+          "New message",
+          preview,
+        ).catch(() => {});
+      }
     }
     res.status(201).json({ message: msg });
   } catch (err) {

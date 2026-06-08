@@ -9,6 +9,9 @@ import Earning from "../models/Earning";
 import Delivery from "../models/Delivery";
 import { adminVerificationDecisionSchema } from "../validators/auth.validators";
 import { emitToUser } from "../socket";
+import { notifyUser } from "../utils/notify";
+import { writeAudit } from "../utils/audit";
+import { safeRegexSearch } from "../utils/safeRegex";
 
 const router = Router();
 
@@ -78,10 +81,15 @@ router.get("/users", async (req, res) => {
 
     const filter: Record<string, unknown> = {};
     if (role) filter.role = role;
-    if (search) {
+    // SEC-P1 (audit run 5): raw user input into $regex was a ReDoS +
+    // regex-injection vector — `?search=(.*a){25}` triggered
+    // catastrophic backtracking across the entire User collection.
+    // safeRegexSearch length-caps + escapes the input.
+    const searchPattern = safeRegexSearch(search);
+    if (searchPattern) {
       filter.$or = [
-        { displayName: { $regex: search, $options: "i" } },
-        { email: { $regex: search, $options: "i" } },
+        { displayName: { $regex: searchPattern, $options: "i" } },
+        { email: { $regex: searchPattern, $options: "i" } },
       ];
     }
 
@@ -95,6 +103,29 @@ router.get("/users", async (req, res) => {
       User.countDocuments(filter),
     ]);
 
+    // Riders need a KYC pill on the table; vendors already carry
+    // `vendorVerification` inline on the User doc but riders carry it
+    // on RiderProfile. Batch-fetch the matching RiderProfiles and
+    // attach a `riderVerificationStatus` field per rider row so the
+    // admin table can render both pills uniformly without N+1 queries.
+    const riderIds = users
+      .filter((u) => u.role === "rider")
+      .map((u) => u._id);
+    if (riderIds.length > 0) {
+      const profiles = await RiderProfile.find({ user: { $in: riderIds } })
+        .select("user verificationStatus isVerified")
+        .lean();
+      const byUser = new Map(profiles.map((p) => [String(p.user), p]));
+      for (const u of users as any[]) {
+        if (u.role === "rider") {
+          const p = byUser.get(String(u._id));
+          u.riderVerificationStatus =
+            p?.verificationStatus ??
+            (p?.isVerified ? "verified" : "pending");
+        }
+      }
+    }
+
     res.json({ users, total, page: pageNum, pages: Math.ceil(total / limitNum) });
   } catch (err) {
     res.status(500).json({ message: "Failed to fetch users" });
@@ -102,24 +133,64 @@ router.get("/users", async (req, res) => {
 });
 
 // ===================== UPDATE USER ROLE =====================
+// SECURITY P0 (audit run 5): this route mints admins. Pre-fix it
+// wrote no AuditLog row — a compromised admin token could promote
+// arbitrary users to admin and the change would be invisible to ops
+// forensics. Now requires `reason`, writes audit (before/after diff),
+// and explicitly refuses to promote to "admin" via this endpoint —
+// admin promotion needs a dedicated co-sign / PIN step-up path that
+// hasn't shipped yet, so we fail closed.
 router.patch("/users/:id/role", async (req, res) => {
   try {
-    const { role } = req.body;
-    const validRoles = ["customer", "vendor", "rider", "admin"];
-    if (!validRoles.includes(role)) {
-      return res.status(400).json({ message: "Invalid role" });
+    const { role, reason } = req.body as { role?: string; reason?: string };
+    const validRoles = ["customer", "vendor", "rider"];
+    if (!role || !validRoles.includes(role)) {
+      return res.status(400).json({
+        message:
+          "Invalid role. Allowed: customer, vendor, rider. Admin promotion " +
+          "requires the dedicated /users/:id/promote-to-admin endpoint (not yet shipped).",
+      });
+    }
+    if (!reason || reason.trim().length < 4) {
+      return res.status(400).json({
+        message: "reason is required (min 4 chars) for any role change",
+      });
+    }
+
+    const before = await User.findById(req.params.id).select("role").lean();
+    if (!before) return res.status(404).json({ message: "User not found" });
+    if (before.role === "admin") {
+      return res.status(403).json({
+        message:
+          "Cannot demote an existing admin via this endpoint. Use a dedicated /demote-admin flow with co-sign.",
+      });
+    }
+    if (before.role === role) {
+      return res.status(409).json({ message: `User is already a ${role}` });
     }
 
     const user = await User.findByIdAndUpdate(
       req.params.id,
       { role },
       { new: true }
-    ).select("-passwordHash -otpCode -otpExpiresAt");
+    ).select("-passwordHash -pinHash -otpCode -otpExpiresAt -deviceTokens -lastPaystackAuth");
 
     if (!user) return res.status(404).json({ message: "User not found" });
 
+    await writeAudit({
+      actor: req.userId!,
+      action: "user.role_change",
+      targetKind: "User",
+      target: String(user._id),
+      before: { role: before.role },
+      after: { role: user.role },
+      reason,
+      ip: req.ip,
+    });
+
     res.json({ message: "Role updated", user });
   } catch (err) {
+    console.error("[admin/users/role]", err);
     res.status(500).json({ message: "Failed to update role" });
   }
 });
@@ -213,6 +284,11 @@ router.get("/orders", async (req, res) => {
         .populate("user", "displayName email")
         .populate("fuel", "name unit")
         .populate("station", "name state")
+        // Populate the assigned rider so the admin table can show
+        // "who is delivering this" without a follow-up GET. Refund
+        // status fields ride along automatically because they're part
+        // of the Order schema (no select-exclude needed).
+        .populate("riderId", "displayName phone profileImage")
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limitNum)
@@ -275,6 +351,126 @@ router.patch("/riders/:id/verify", async (req, res) => {
   }
 });
 
+// ===================== FORCE RIDER OFFLINE =====================
+/**
+ * POST /api/admin/riders/:userId/force-offline { reason?, note? }
+ *
+ * Admin-driven hard offline. Flips `RiderProfile.isAvailable: false`
+ * and pushes `rider:force-offline` to the rider's socket room so the
+ * v7 mobile build can route to the dedicated force-offline screen
+ * (brief §5A — the rider needs to see why the Go-online switch
+ * stopped working). Note that `:userId` is the User id, not the
+ * RiderProfile id — matches the rest of the rider socket addressing.
+ *
+ * `reason` is plumbed straight into the mobile screen's variant
+ * selector: "location" / "background" / "admin" (default).
+ * `note` is shown to the rider verbatim — keep it short.
+ */
+router.post("/riders/:userId/force-offline", async (req, res) => {
+  try {
+    const { reason, note } = req.body as { reason?: string; note?: string };
+    const safeReason =
+      reason === "location" || reason === "background" || reason === "admin"
+        ? reason
+        : "admin";
+
+    const profile = await RiderProfile.findOneAndUpdate(
+      { user: req.params.userId },
+      { isAvailable: false },
+      { new: true },
+    );
+    if (!profile) {
+      return res.status(404).json({ message: "Rider profile not found" });
+    }
+
+    // Push to the rider's socket room so the (rider)/_layout listener
+    // routes to the force-offline screen with the correct variant.
+    emitToUser(req.params.userId as string, "rider:force-offline", {
+      reason: safeReason,
+      note: note ?? null,
+    });
+
+    // P1-6 (audit run 5): pair the socket emit with a push so a rider
+    // on the move with the app backgrounded actually sees the alert
+    // (OS-level lock-screen notification). Without this, every
+    // backgrounded rider misses the force-offline event entirely.
+    await notifyUser(
+      req.params.userId as string,
+      "account",
+      "You've been taken offline",
+      note?.trim() || "Admin has paused your account. Open the app for details.",
+    ).catch(() => {});
+
+    // P1: audit log this privileged action — earnings-capacity change.
+    await writeAudit({
+      actor: req.userId!,
+      action: "rider.force_offline",
+      targetKind: "User",
+      target: req.params.userId as string,
+      after: { isAvailable: false, reason: safeReason, note: note ?? null },
+      reason: note,
+      ip: req.ip,
+    });
+
+    res.json({
+      message: "Rider taken offline",
+      userId: req.params.userId,
+      reason: safeReason,
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to force rider offline" });
+  }
+});
+
+// ===================== FORCE RIDER ONLINE (undo) =====================
+/**
+ * POST /api/admin/riders/:userId/force-online
+ *
+ * Undo for the admin force-offline. Flips `RiderProfile.isAvailable: true`
+ * and emits `rider:force-online` so the rider's app dismisses the
+ * force-offline screen if it's still up. Rider still needs to be
+ * verified + have a current location ping to receive new offers — this
+ * is purely the admin "let them back in" toggle.
+ */
+router.post("/riders/:userId/force-online", async (req, res) => {
+  try {
+    const profile = await RiderProfile.findOneAndUpdate(
+      { user: req.params.userId },
+      { isAvailable: true },
+      { new: true },
+    );
+    if (!profile) {
+      return res.status(404).json({ message: "Rider profile not found" });
+    }
+    emitToUser(req.params.userId as string, "rider:force-online", {
+      at: new Date(),
+    });
+    // P1-6: push parity so a backgrounded rider sees the reinstatement.
+    await notifyUser(
+      req.params.userId as string,
+      "account",
+      "You're back online",
+      "Admin has re-enabled your account. You can accept deliveries again.",
+    ).catch(() => {});
+
+    // P1: audit log mirror of force_offline.
+    await writeAudit({
+      actor: req.userId!,
+      action: "rider.force_online",
+      targetKind: "User",
+      target: req.params.userId as string,
+      after: { isAvailable: true },
+      ip: req.ip,
+    });
+    res.json({
+      message: "Rider re-enabled",
+      userId: req.params.userId,
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to re-enable rider" });
+  }
+});
+
 // ===================== VERIFICATION DECISION (v4) =====================
 /**
  * Approve / reject a rider or vendor's submitted verification. Replaces
@@ -304,7 +500,54 @@ router.patch(
       user.verificationReason = reason;
       user.verificationReviewedAt = new Date();
       user.verificationReviewedBy = req.userId as never;
+
+      // MODEL-FIELDS P0-5 (audit run 4): mirror-write the legacy
+      // per-role fields so existing mobile readers (vendor kyc.tsx
+      // reads `vendorVerification.note`; rider verification-blocker
+      // reads `RiderProfile.verificationNote`) keep working through
+      // the cutover. The canonical field going forward is
+      // `User.verificationReason`; mobile is migrating to read it
+      // directly, but until that ships the v4 endpoint would
+      // produce a "Rejected — no reason" UI on every reject.
+      const vendorVerificationStatus = status === "approved" ? "verified" : "rejected";
+      if (user.role === "vendor") {
+        // Legacy vendorVerification subdoc — populated alongside the
+        // canonical field. `note` is the field the legacy mobile read.
+        user.vendorVerification = {
+          ...(user.vendorVerification ?? {}),
+          status: vendorVerificationStatus,
+          note: reason,
+          reviewedAt: new Date(),
+          reviewedBy: req.userId as never,
+        } as never;
+      }
       await user.save();
+
+      if (user.role === "rider") {
+        // Legacy RiderProfile.verificationNote — populated alongside
+        // the canonical field. RiderProfile.verificationStatus uses
+        // "verified" not "approved".
+        const RiderProfile = (await import("../models/RiderProfile")).default;
+        await RiderProfile.updateOne(
+          { user: user._id },
+          {
+            $set: {
+              verificationStatus: vendorVerificationStatus,
+              verificationNote: reason,
+            },
+          },
+        );
+      }
+
+      await writeAudit({
+        actor: req.userId!,
+        action: status === "approved" ? "user.verify" : "user.reject",
+        targetKind: "User",
+        target: String(user._id),
+        after: { verificationStatus: status, verificationReason: reason },
+        reason,
+        ip: req.ip,
+      });
 
       // Push to the user's socket room — mobile pending-lobby listens.
       emitToUser(String(user._id), "verification:status", {
@@ -318,7 +561,8 @@ router.patch(
         verificationStatus: user.verificationStatus,
         verificationReason: user.verificationReason,
       });
-    } catch {
+    } catch (err) {
+      console.error("[admin/users/verification]", err);
       res.status(500).json({ message: "Failed to update verification" });
     }
   }
@@ -341,6 +585,11 @@ router.patch("/users/:id/account-status", async (req, res) => {
         message: "status must be 'active', 'suspended', or 'pending'",
       });
     }
+    const before = await User.findById(req.params.id)
+      .select("accountStatus")
+      .lean();
+    if (!before) return res.status(404).json({ message: "User not found" });
+
     const user = await User.findByIdAndUpdate(
       req.params.id,
       { $set: { accountStatus: status } },
@@ -353,10 +602,41 @@ router.patch("/users/:id/account-status", async (req, res) => {
       emitToUser(String(user._id), "account:suspended", {
         reason,
       });
+      // P1-6 (audit run 5): pair the socket with a push so a
+      // backgrounded user actually sees the suspension. Pre-fix this
+      // route emitted socket-only — suspended users with the app
+      // closed received nothing.
+      await notifyUser(
+        String(user._id),
+        "account",
+        "Account suspended",
+        reason?.trim() ||
+          "Your account has been suspended. Contact support for details.",
+      ).catch(() => {});
+    } else if (before.accountStatus === "suspended" && status === "active") {
+      await notifyUser(
+        String(user._id),
+        "account",
+        "Account reactivated",
+        "Your account is active again. You can sign back in.",
+      ).catch(() => {});
     }
 
+    // P1: every account-status change is a privileged action.
+    await writeAudit({
+      actor: req.userId!,
+      action: status === "active" ? "user.activate" : "user.deactivate",
+      targetKind: "User",
+      target: String(user._id),
+      before: { accountStatus: before.accountStatus },
+      after: { accountStatus: status },
+      reason,
+      ip: req.ip,
+    });
+
     res.json({ message: `Account ${status}`, user });
-  } catch {
+  } catch (err) {
+    console.error("[admin/users/account-status]", err);
     res.status(500).json({ message: "Failed to update account status" });
   }
 });

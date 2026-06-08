@@ -1,7 +1,11 @@
 import mongoose, { Schema, Document } from "mongoose";
 
 export type EarningRole = "vendor" | "rider";
-export type EarningType = "fuel_sale" | "delivery_fee";
+// `bonus` carries weekly streak rewards, referral payouts, and any
+// non-delivery money the platform credits to a rider/vendor. The
+// rider Earnings screen has a dedicated `Bonuses` filter chip that
+// keys off this discriminator (brief §10 Earnings filter strip).
+export type EarningType = "fuel_sale" | "delivery_fee" | "bonus";
 export type EarningStatus = "pending" | "settled";
 
 export interface IEarning extends Document {
@@ -24,7 +28,11 @@ const EarningSchema: Schema = new Schema(
     order: { type: Schema.Types.ObjectId, ref: "Order", required: true },
     delivery: { type: Schema.Types.ObjectId, ref: "Delivery" },
     amount: { type: Number, required: true },
-    type: { type: String, enum: ["fuel_sale", "delivery_fee"], required: true },
+    type: {
+      type: String,
+      enum: ["fuel_sale", "delivery_fee", "bonus"],
+      required: true,
+    },
     status: { type: String, enum: ["pending", "settled"], default: "pending" },
     settledAt: { type: Date },
   },

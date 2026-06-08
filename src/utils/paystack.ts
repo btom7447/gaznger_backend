@@ -24,7 +24,20 @@ export function paystackSecret(): string {
   if (env !== "production" && process.env.PAYSTACK_SECRET_KEY_TEST) {
     return process.env.PAYSTACK_SECRET_KEY_TEST;
   }
-  return process.env.PAYSTACK_SECRET_KEY ?? "";
+  const fallback = process.env.PAYSTACK_SECRET_KEY;
+  if (!fallback) {
+    // SECURITY P0 (audit run 5): fail loudly instead of returning "".
+    // An empty secret silently breaks Paystack auth AND lets webhook
+    // signature verification compute HMAC with an empty key — an
+    // attacker can replicate the same empty-key HMAC for any body and
+    // forge `charge.success` events to credit arbitrary wallets.
+    throw new Error(
+      "Paystack secret key missing: set PAYSTACK_SECRET_KEY_LIVE (prod), " +
+        "PAYSTACK_SECRET_KEY_TEST (dev), or PAYSTACK_SECRET_KEY (either). " +
+        "Refusing to operate with no key — webhook verification would fail open.",
+    );
+  }
+  return fallback;
 }
 
 function client() {

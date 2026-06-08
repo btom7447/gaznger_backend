@@ -9,7 +9,10 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node dist/index.js",
     "seed": "ts-node src/scripts/seed.ts",
-    "reconcile:status": "ts-node src/scripts/reconcileStatusDuality.ts"
+    "seed:test-rider": "ts-node src/scripts/seedTestRiderOnboarding.ts",
+    "seed:abkon": "ts-node src/scripts/seedAbkonOnboarding.ts",
+    "reconcile:status": "ts-node src/scripts/reconcileStatusDuality.ts",
+    "backfill:verification": "ts-node src/scripts/backfillVerificationStatus.ts"
   },
   "keywords": [],
   "author": "",

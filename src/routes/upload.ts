@@ -51,7 +51,48 @@ function verifyImageMagicBytes(buf: Buffer): boolean {
     buf[11] === 0x50
   )
     return true;
+  // HEIC/HEIF: bytes 4-11 = "ftypheic" / "ftypheix" / "ftypmif1" / "ftypheis"
+  if (buf[4] === 0x66 && buf[5] === 0x74 && buf[6] === 0x79 && buf[7] === 0x70) {
+    const brand = String.fromCharCode(buf[8], buf[9], buf[10], buf[11]);
+    if (brand === "heic" || brand === "heix" || brand === "mif1" || brand === "heis") {
+      return true;
+    }
+  }
   return false;
+}
+
+/**
+ * SEC-P1 (audit run 5): magic-byte verification for chat media. The
+ * /upload/media endpoint pre-fix trusted attacker-controlled MIME
+ * headers only — a renamed .exe/.html with `Content-Type: video/mp4`
+ * sailed through to Cloudinary, served at our trusted domain
+ * (phishing payload hosting + CDN abuse). Now we verify the buffer
+ * matches the claimed kind via magic bytes for every accepted format.
+ */
+function verifyMediaMagicBytes(
+  buf: Buffer,
+  mime: string,
+): "image" | "video" | null {
+  if (buf.length < 12) return null;
+  if (mime.startsWith("image/")) {
+    return verifyImageMagicBytes(buf) ? "image" : null;
+  }
+  if (mime === "video/mp4") {
+    // MP4: bytes 4-7 = "ftyp"
+    if (buf[4] === 0x66 && buf[5] === 0x74 && buf[6] === 0x79 && buf[7] === 0x70) {
+      return "video";
+    }
+  }
+  if (mime === "video/quicktime") {
+    // MOV: bytes 4-7 = "ftyp" + brand "qt  " OR "moov"/"mdat" atoms
+    if (buf[4] === 0x66 && buf[5] === 0x74 && buf[6] === 0x79 && buf[7] === 0x70) {
+      return "video";
+    }
+    if (buf[4] === 0x6d && buf[5] === 0x6f && buf[6] === 0x6f && buf[7] === 0x76) {
+      return "video";
+    }
+  }
+  return null;
 }
 
 router.post("/image", requireAuth, upload.single("image"), async (req, res) => {
@@ -130,12 +171,28 @@ router.post(
       if (!req.file)
         return res.status(400).json({ message: "No file uploaded" });
 
-      const isVideo = req.file.mimetype.startsWith("video/");
+      // SEC-P1: verify the buffer matches the claimed MIME — closes
+      // the "renamed .exe with Content-Type: video/mp4" abuse path.
+      const verified = verifyMediaMagicBytes(
+        req.file.buffer,
+        req.file.mimetype,
+      );
+      if (!verified) {
+        return res.status(400).json({
+          message:
+            "Unsupported media. Files must be JPEG / PNG / WebP / HEIC images or MP4 / QuickTime video.",
+        });
+      }
+
+      const isVideo = verified === "video";
       const userId = req.userId;
       const result = await new Promise<any>((resolve, reject) => {
         const stream = cloudinary.uploader.upload_stream(
           {
-            resource_type: "auto",
+            // SEC-P1: pin resource_type to what the magic-byte check
+            // verified rather than letting Cloudinary auto-detect from
+            // a file we now know matches its declared MIME.
+            resource_type: isVideo ? "video" : "image",
             folder: `users/${userId}/chat`,
             // For videos, request a frame-1 JPG thumbnail eagerly so
             // the grid renders without decoding the video.

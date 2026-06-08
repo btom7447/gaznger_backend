@@ -18,6 +18,7 @@ import {
 } from "../validators/order.validators";
 import { parsePagination } from "../utils/pagination";
 import { notifyUser } from "../utils/notify";
+import { getPlatformConfig } from "../utils/platformConfig";
 import { emitToUser, emitToDelivery } from "../socket";
 import { haversineDistance, calcDeliveryFee } from "../utils/haversine";
 import { computeDeliveryFee } from "../utils/deliveryFee";
@@ -88,6 +89,18 @@ async function awardPoints(
 // clients that don't send it.
 router.post("/", requireAuth, requireCustomer, idempotencyKey(), validate(createOrderSchema), async (req, res) => {
   try {
+    // P1-MF-7 (audit run 4): enforce the orderPlacementEnabled kill
+    // switch server-side. Pre-fix this flag was settable in admin +
+    // displayed but neither client nor server consulted it — admin
+    // could toggle it expecting orders to pause, and nothing happened.
+    const cfg = await getPlatformConfig();
+    if ((cfg as any).orderPlacementEnabled === false) {
+      return res.status(503).json({
+        code: "order_placement_disabled",
+        message:
+          "We're temporarily not accepting new orders. Try again in a few minutes.",
+      });
+    }
     const {
       fuelId,
       fuelTypeId,
@@ -805,9 +818,30 @@ router.patch("/:orderId/cancel", requireAuth, async (req, res) => {
           },
         });
         order.paymentStatus = "refunded";
+        // P0-4 (audit run 4 model-fields): record the refund metadata
+        // so customer mobile can render an honest refund-status card.
+        // Without this, the customer-side flow showed only "refunded"
+        // with no amount / destination / status — and a hardcoded
+        // "lands in your wallet instantly" line that's correct in
+        // this path but was previously also rendered on card-refunds.
+        order.refundStatus = "succeeded";
+        order.refundAmount = order.totalCharged ?? order.totalPrice;
+        order.refundDestination = "wallet";
+        order.refundInitiatedAt = new Date();
         await order.save();
       } catch (err) {
         console.error("[orders/cancel] refund failed:", err);
+        // Record the failure so admin can retry from the refund-status
+        // surface and the customer sees "Refund failed — contact support".
+        try {
+          order.refundStatus = "failed";
+          order.refundFailReason =
+            err instanceof Error ? err.message : "Wallet refund failed";
+          order.refundInitiatedAt = new Date();
+          await order.save();
+        } catch {
+          /* best-effort */
+        }
         // Refund failure shouldn't roll back the cancel — admin
         // can reconcile from logs. The order stays cancelled.
       }

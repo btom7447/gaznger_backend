@@ -148,10 +148,26 @@ export function initSocket(httpServer: HttpServer): Server {
     }
   });
 
-  io.on("connection", (socket) => {
+  io.on("connection", async (socket) => {
     const userId = socket.data.userId as string;
     socket.join(Rooms.user(userId));
     slog("conn", { uid: userId, room: Rooms.user(userId) });
+
+    // P1-3 (audit run 1): auto-join admin sockets to the broadcast
+    // room. We do this from a lazy lookup (one DB read on connect)
+    // rather than embedding role in the JWT — the JWT is short-lived
+    // by design (15 min) and we don't want a role change to wait
+    // for a refresh. Cached for the connection lifetime so a long-
+    // lived admin connection doesn't repeatedly query.
+    try {
+      const user = await User.findById(userId).select("role").lean();
+      if ((user as any)?.role === "admin") {
+        socket.join(Rooms.admin);
+        slog("join", { uid: userId, room: Rooms.admin });
+      }
+    } catch {
+      // non-fatal — role check failures fall back to user-room only.
+    }
 
     // Re-attach this socket to any delivery rooms its user is a
     // member of. Handles the foreground/background reconnect case
@@ -273,6 +289,26 @@ export function emitToUser(userId: string, event: string, data: unknown): void {
   if (!io) return;
   io.to(Rooms.user(userId)).emit(event, data);
   slog("out", { event, room: Rooms.user(userId) });
+}
+
+/**
+ * Emit an event to every connected admin.
+ *
+ * P1-3 (audit run 1): admin-web pre-fix had ZERO socket subscriptions
+ * and the server had no `admin` room. Critical ops events (`dispute:opened`,
+ * `withdrawal:failed`, `reconcile:drift`, new `verification:submitted`)
+ * were emitted to the affected USER's room only — admins were blind
+ * to all of them until the next 15-60s poll on a screen that even
+ * polled (disputes/page.tsx pre-fix never refetched at all).
+ *
+ * Use for any state change that ops must see in real-time. For
+ * user-affecting events (which also need ops visibility), call BOTH
+ * `emitToUser` (for the user) AND `emitToAdmins` (for the room).
+ */
+export function emitToAdmins(event: string, data: unknown): void {
+  if (!io) return;
+  io.to(Rooms.admin).emit(event, data);
+  slog("out", { event, room: Rooms.admin });
 }
 
 /** Emit an event to every socket in a delivery room. */

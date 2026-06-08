@@ -30,6 +30,20 @@ export interface IDispute extends Document {
 
   /** When status="resolved", how much was refunded to the customer (NGN). */
   refundAmount?: number;
+  /** Destination of the refund leg ("wallet" = instant, "card" = async via Paystack). */
+  refundDestination?: "wallet" | "card";
+  /**
+   * Lifecycle of the refund leg specifically (separate from the dispute
+   * `status`). Wallet refunds flip straight to "succeeded"; card refunds
+   * sit at "pending" until the Paystack `refund.processed` (or `.failed`)
+   * webhook arrives. Surfaces a Retry button in the admin UI when the
+   * webhook never lands.
+   */
+  refundStatus?: "pending" | "succeeded" | "failed";
+  /** When the refund leg was initiated (drives a "stuck X minutes" badge). */
+  refundInitiatedAt?: Date;
+  /** Failure reason from Paystack when refundStatus = "failed". */
+  refundFailReason?: string;
 
   createdAt: Date;
   updatedAt: Date;
@@ -63,6 +77,13 @@ const DisputeSchema: Schema<IDispute> = new Schema(
     resolvedAt: { type: Date },
     resolution: { type: String },
     refundAmount: { type: Number },
+    refundDestination: { type: String, enum: ["wallet", "card"] },
+    refundStatus: {
+      type: String,
+      enum: ["pending", "succeeded", "failed"],
+    },
+    refundInitiatedAt: { type: Date },
+    refundFailReason: { type: String },
   },
   { timestamps: true }
 );

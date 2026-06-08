@@ -64,9 +64,15 @@ export async function edgeStateGate(
 
   // Maintenance — global short-circuit.
   if (cfg.maintenanceMode) {
+    // P0 (audit run 4 model-fields): include the operator-set reason
+    // so mobile can render the contextual message admin configured
+    // ("Payments provider degraded — back at 14:00") instead of the
+    // generic hardcoded copy. The whole purpose of the maintenance
+    // kill switch is to communicate WHY during an incident.
     res.status(503).json({
       code: "MAINTENANCE",
-      message: "We're doing scheduled maintenance.",
+      message: cfg.maintenanceReason ?? "We're doing scheduled maintenance.",
+      reason: cfg.maintenanceReason ?? undefined,
       expectedBackAt: cfg.maintenanceExpectedBackAt ?? undefined,
     });
     return;

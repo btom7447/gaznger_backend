@@ -8,6 +8,7 @@ import RiderProfile from "../models/RiderProfile";
 import RiderInvite from "../models/RiderInvite";
 import Tank from "../models/Tank";
 import FuelType from "../models/FuelType";
+import { normalizePhone } from "../utils/phone";
 
 /**
  * Vendor Phase-5 endpoints — team roster, rider invites, tank levels.
@@ -77,7 +78,7 @@ router.get("/team", requireAuth, requireVendor, async (req, res) => {
           .select("displayName phone profileImage")
           .lean(),
         RiderProfile.find({ user: { $in: riderIds } })
-          .select("user isAvailable vehiclePlate rating")
+          .select("user isAvailable vehiclePlate rating homeStation")
           .lean(),
         allStationIds.length
           ? Order.distinct("riderId", {
@@ -145,6 +146,9 @@ router.get("/team", requireAuth, requireVendor, async (req, res) => {
         trips: tripsById.get(id) ?? 0,
         status,
         inviteId: acceptedById.get(id)?._id?.toString() ?? null,
+        // Drives the "Affiliated riders" vs "Recent freelance" split on
+        // the vendor Team screen (patch 2). Null = freelance to this vendor.
+        homeStationId: p?.homeStation ? String(p.homeStation) : null,
       });
     }
     // Accepted invites where the rider hasn't delivered yet.
@@ -256,7 +260,13 @@ router.post("/riders/invite", requireAuth, requireVendor, async (req, res) => {
         .status(403)
         .json({ message: "Station does not belong to this vendor" });
     }
-    const normPhone = phone.startsWith("+") ? phone : `+${phone}`;
+    // Use the shared helper so the rider-side `/invites/pending`
+    // lookup (which also normalizes from `User.phone`) finds a match
+    // regardless of how the rider's phone was stored on signup.
+    const normPhone = normalizePhone(phone);
+    if (!normPhone) {
+      return res.status(400).json({ message: "Valid phone required" });
+    }
 
     // Look up: do we already have a pending invite for this phone?
     let invite = await RiderInvite.findOne({

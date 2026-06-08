@@ -226,7 +226,7 @@ router.get("/transactions/:id", requireAuth, requireVendor, async (req, res) => 
           { path: "user", select: "displayName phone" },
         ],
       })
-      .populate({ path: "withdrawal", select: "amount status bankDetails processedAt" })
+      .populate({ path: "withdrawal", select: "amount status bankAccount processedAt" })
       .lean()) as any;
     if (!tx) return res.status(404).json({ message: "Transaction not found" });
     res.json(tx);
@@ -408,14 +408,19 @@ router.get("/payouts", requireAuth, requireVendor, async (req, res) => {
       Withdrawal.countDocuments(q),
     ]);
 
+    // P1-MF-5 (audit run 4): the schema field is `bankAccount`, not
+    // `bankDetails`. Pre-fix every payout row showed bankName: "—",
+    // accountNumber: null because the populate path was wrong. The
+    // canonical field is `bankAccount` (proven by adminPayments.ts
+    // which has used it correctly for months).
     const payouts = docs.map((w: any) => ({
       id: String(w._id),
       amount: w.amount,
       amountFormatted: `₦${Number(w.amount ?? 0).toLocaleString("en-NG")}`,
       status: w.status,
-      bankName: w.bankDetails?.bankName ?? "—",
-      accountNumber: w.bankDetails?.accountNumber ?? null,
-      accountName: w.bankDetails?.accountName ?? null,
+      bankName: w.bankAccount?.bankName ?? "—",
+      accountNumber: w.bankAccount?.accountNumber ?? null,
+      accountName: w.bankAccount?.accountName ?? null,
       processedAt: w.processedAt ?? null,
       createdAt: w.createdAt,
       note: w.note ?? null,

@@ -33,6 +33,22 @@ export interface IOrder extends Document {
   paymentStatus: "unpaid" | "paid" | "refunded";
   paymentRef?: string;
   cancellationReason?: string;
+  /**
+   * Refund lifecycle (separate from paymentStatus). Wallet refunds
+   * flip straight to "succeeded"; card refunds sit at "pending" until
+   * the Paystack `refund.processed` / `refund.failed` webhook arrives.
+   * The admin UI surfaces a Retry button when refundStatus="failed" or
+   * "pending" for more than ~10 minutes.
+   */
+  refundStatus?: "pending" | "succeeded" | "failed";
+  /** When the refund was initiated. Drives the "stuck N minutes" badge. */
+  refundInitiatedAt?: Date;
+  /** Failure reason from Paystack when refundStatus = "failed". */
+  refundFailReason?: string;
+  /** Refund destination chosen at refund time ("wallet" | "card"). */
+  refundDestination?: "wallet" | "card";
+  /** Refund amount in NGN (may differ from totalPrice on partial refunds). */
+  refundAmount?: number;
   riderId?: mongoose.Types.ObjectId;
   riderAssignedAt?: Date;
   dispatchAttempt: number;
@@ -177,6 +193,14 @@ const OrderSchema: Schema = new Schema(
       default: "unpaid",
     },
     paymentRef: { type: String },
+    refundStatus: {
+      type: String,
+      enum: ["pending", "succeeded", "failed"],
+    },
+    refundInitiatedAt: { type: Date },
+    refundFailReason: { type: String },
+    refundDestination: { type: String, enum: ["wallet", "card"] },
+    refundAmount: { type: Number },
     riderId: { type: Schema.Types.ObjectId, ref: "User" },
     riderAssignedAt: { type: Date },
     dispatchAttempt: { type: Number, default: 0 },
@@ -234,5 +258,14 @@ const OrderSchema: Schema = new Schema(
 OrderSchema.index({ user: 1, status: 1 });
 OrderSchema.index({ createdAt: -1 });
 OrderSchema.index({ paymentRef: 1 });
+// PERF P0 (audit run 6): vendor orders list does
+// `find({station: {$in: scopedStationIds}, status}).sort({createdAt:-1}).skip().limit()`
+// + `countDocuments(filter)`. Without these compounds, the sort spills
+// to in-memory and HARD-FAILS past 32 MB. Same prefix covers
+// `/vendor/today` station-fanout and admin orders filters.
+OrderSchema.index({ station: 1, status: 1, createdAt: -1 });
+OrderSchema.index({ station: 1, status: 1, deliveredAt: -1 });
+// PERF: rider earnings + history queries on the riderId hot path.
+OrderSchema.index({ riderId: 1, status: 1, createdAt: -1 });
 
 export default mongoose.model<IOrder>("Order", OrderSchema);

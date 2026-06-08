@@ -17,7 +17,7 @@ import {
   PaystackAuthorization,
 } from "../utils/paystack";
 import { notifyUser } from "../utils/notify";
-import { emitToUser } from "../socket";
+import { emitToUser, emitToAdmins } from "../socket";
 import {
   getOrCreateUserWallet,
   getOrCreateSystemWallet,
@@ -698,6 +698,12 @@ router.post("/webhook", async (req, res) => {
               withdrawalId: w._id,
               status: "approved",
             });
+            // P1-3: admin dashboard should reflect transfer success.
+            emitToAdmins("withdrawal:update", {
+              withdrawalId: String(w._id),
+              status: "approved",
+              userId: String(w.user),
+            });
           }
         }
       }
@@ -743,6 +749,15 @@ router.post("/webhook", async (req, res) => {
             emitToUser(w.user.toString(), "withdrawal:update", {
               withdrawalId: w._id,
               status: "failed",
+            });
+            // P1-3: critical ops event — withdrawal failed in prod.
+            // Ops dashboard renders a red banner; admin can intervene.
+            emitToAdmins("withdrawal:failed", {
+              withdrawalId: String(w._id),
+              userId: String(w.user),
+              amount: w.amount,
+              event,
+              transferCode,
             });
             // WS_VS_API #3 — explicit payment:failed for the toast +
             // any UI that wants to react beyond the generic wallet

@@ -26,7 +26,9 @@
  *     them for manual review.
  */
 
-import "dotenv/config";
+import dotenv from "dotenv";
+dotenv.config({ path: ".env.local" });
+dotenv.config(); // fall back to .env if .env.local missing
 import mongoose from "mongoose";
 import Order from "../models/Order";
 import Delivery from "../models/Delivery";

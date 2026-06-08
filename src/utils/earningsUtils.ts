@@ -179,11 +179,26 @@ export async function settleOrderEarnings(orderId: string) {
         meta: { fuelCost, vendorCommission },
       },
     });
-    emitToUser((vendorWallet.user as mongoose.Types.ObjectId).toString(), "earnings:settled", {
+    // Dual-emit during the v7 rider rollout — the rider brief specifies
+    // `earning:settled` (singular) and the new Queue listens for that
+    // shape, but the legacy clients + vendor screens listen for the
+    // plural `earnings:settled`. Drop the plural alias once every client
+    // is on v7.
+    const vendorSettledPayload = {
       orderId,
       amount: vendorTake,
       type: "fuel_sale",
-    });
+    };
+    emitToUser(
+      (vendorWallet.user as mongoose.Types.ObjectId).toString(),
+      "earnings:settled",
+      vendorSettledPayload,
+    );
+    emitToUser(
+      (vendorWallet.user as mongoose.Types.ObjectId).toString(),
+      "earning:settled",
+      vendorSettledPayload,
+    );
     const fresh = await getOrCreateUserWallet(vendorWallet.user as mongoose.Types.ObjectId);
     emitToUser((vendorWallet.user as mongoose.Types.ObjectId).toString(), "wallet:update", {
       available: fresh.available,
@@ -206,11 +221,21 @@ export async function settleOrderEarnings(orderId: string) {
         meta: { deliveryFee, riderCommission },
       },
     });
-    emitToUser(order.riderId.toString(), "earnings:settled", {
+    const riderSettledPayload = {
       orderId,
       amount: riderTake,
       type: "delivery_fee",
-    });
+    };
+    emitToUser(
+      order.riderId.toString(),
+      "earnings:settled",
+      riderSettledPayload,
+    );
+    emitToUser(
+      order.riderId.toString(),
+      "earning:settled",
+      riderSettledPayload,
+    );
     const fresh = await getOrCreateUserWallet(order.riderId);
     emitToUser(order.riderId.toString(), "wallet:update", {
       available: fresh.available,

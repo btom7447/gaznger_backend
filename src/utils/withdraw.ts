@@ -124,6 +124,35 @@ export async function handleWithdrawRequest(
       bankAccount = profile.bankAccount;
     }
 
+    // SECURITY P0 (audit run 5): short-circuit retries.
+    //
+    // The `idempotencyKey({enforce:true})` middleware validates the
+    // header is present + UUID-shaped but does NOT cache the response.
+    // Without this short-circuit, a retried POST creates a fresh
+    // Withdrawal._id → fresh ledger keys (withdrawal:${newId}:fee /
+    // :payout) → second wallet debit + second Paystack transfer.
+    // We persist `idempotencyKey` on the Withdrawal row (unique sparse
+    // index on (user, idempotencyKey)) so a retry resolves to the
+    // existing row.
+    const requestKey = req.idempotencyKey;
+    if (requestKey) {
+      const existing = await Withdrawal.findOne({
+        user: req.userId,
+        idempotencyKey: requestKey,
+      });
+      if (existing) {
+        // Idempotent replay — return the existing row in its current
+        // state. The client's retry was a no-op as designed.
+        return res.status(200).json({
+          message: "Withdrawal already submitted (idempotent replay).",
+          withdrawal: existing.toObject(),
+          status: existing.status,
+          fee: 0, // not re-charging fee on a replay
+          net: existing.amount,
+        });
+      }
+    }
+
     // Gate: balance from wallet (not Earning aggregate)
     const wallet = await getOrCreateUserWallet(req.userId!);
     const fee = cfg.withdrawalFeeNgn;
@@ -139,14 +168,39 @@ export async function handleWithdrawRequest(
     }
 
     // Create the Withdrawal doc up front so we can reference its _id
-    // in Transaction rows.
-    const withdrawal = await Withdrawal.create({
-      user: req.userId,
-      role,
-      amount: amountNum,
-      status: "pending", // flipped to "processing" below if Paystack accepts
-      bankAccount,
-    });
+    // in Transaction rows. The unique sparse index on (user, idempotencyKey)
+    // is the dedup belt; this is the suspenders — if two concurrent
+    // requests race past the findOne above, Mongo rejects the second.
+    let withdrawal;
+    try {
+      withdrawal = await Withdrawal.create({
+        user: req.userId,
+        role,
+        amount: amountNum,
+        status: "pending", // flipped to "processing" below if Paystack accepts
+        bankAccount,
+        idempotencyKey: requestKey,
+      });
+    } catch (createErr: any) {
+      // Race-loser path: the other concurrent request won the create.
+      // Fetch and return what it produced.
+      if (createErr?.code === 11000 && requestKey) {
+        const winner = await Withdrawal.findOne({
+          user: req.userId,
+          idempotencyKey: requestKey,
+        });
+        if (winner) {
+          return res.status(200).json({
+            message: "Withdrawal already submitted (concurrent retry).",
+            withdrawal: winner.toObject(),
+            status: winner.status,
+            fee: 0,
+            net: winner.amount,
+          });
+        }
+      }
+      throw createErr;
+    }
 
     const platformRevenue = await getOrCreateSystemWallet("platform-revenue");
 

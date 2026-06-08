@@ -18,8 +18,11 @@ import {
   leaveDeliveryRoom,
   setDeliveryRider,
 } from "../socket";
+import { emitOrderUpdate } from "../utils/orderEvents";
 import { createRiderPendingEarning, settleOrderEarnings } from "../utils/earningsUtils";
 import Withdrawal from "../models/Withdrawal";
+import RiderInvite from "../models/RiderInvite";
+import { normalizePhone } from "../utils/phone";
 import { listBanks, resolveBankAccount } from "../utils/paystack";
 import { handleWithdrawRequest } from "../utils/withdraw";
 import { moneyLimiter } from "../middleware/moneyLimiter";
@@ -91,11 +94,76 @@ router.post("/setup", requireAuth, requireRider, async (req, res) => {
 router.get("/profile", requireAuth, requireRider, async (req, res) => {
   try {
     const [profile, user] = await Promise.all([
-      RiderProfile.findOne({ user: req.userId }).lean(),
+      // Populate homeStation so the rider profile UI's "Affiliated" card
+      // can render the station name + city without a follow-up GET. Lean
+      // populate keeps the response cheap; we only need the display
+      // fields, not the whole station doc.
+      RiderProfile.findOne({ user: req.userId })
+        .populate({
+          path: "homeStation",
+          select: "name address state location",
+        })
+        .lean(),
       User.findById(req.userId).select("displayName email phone profileImage").lean(),
     ]);
     if (!profile) return res.status(404).json({ message: "Rider profile not found" });
-    res.json({ ...profile, user });
+
+    // Side-load 30-day stats scoped to the rider's home station — drives
+    // the AffiliationCard's stats box. Skipped when freelance (no
+    // homeStation) since there's no station to scope against.
+    let homeStationStats: { trips: number; earnings: number } | null = null;
+    const homeStationId =
+      profile.homeStation &&
+      typeof profile.homeStation === "object" &&
+      "_id" in profile.homeStation
+        ? (profile.homeStation as any)._id
+        : profile.homeStation;
+    if (homeStationId) {
+      const THIRTY_DAYS_AGO = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+      const [tripsCount, earningsAgg] = await Promise.all([
+        Delivery.countDocuments({
+          rider: req.userId,
+          station: homeStationId,
+          status: "delivered",
+          createdAt: { $gte: THIRTY_DAYS_AGO },
+        }),
+        Earning.aggregate([
+          {
+            $match: {
+              user: new mongoose.Types.ObjectId(req.userId),
+              role: "rider",
+              status: "settled",
+              createdAt: { $gte: THIRTY_DAYS_AGO },
+            },
+          },
+          // Join Order to scope by station — earnings model doesn't
+          // carry the station id directly.
+          {
+            $lookup: {
+              from: "orders",
+              localField: "order",
+              foreignField: "_id",
+              as: "_order",
+            },
+          },
+          { $unwind: "$_order" },
+          {
+            $match: {
+              "_order.station": new mongoose.Types.ObjectId(
+                String(homeStationId),
+              ),
+            },
+          },
+          { $group: { _id: null, total: { $sum: "$amount" } } },
+        ]),
+      ]);
+      homeStationStats = {
+        trips: tripsCount,
+        earnings: earningsAgg[0]?.total ?? 0,
+      };
+    }
+
+    res.json({ ...profile, user, homeStationStats });
   } catch (err) {
     res.status(500).json({ message: "Failed to fetch rider profile" });
   }
@@ -120,6 +188,29 @@ router.patch("/availability", requireAuth, requireRider, async (req, res) => {
     if (typeof isAvailable !== "boolean") {
       return res.status(400).json({ message: "isAvailable (boolean) is required" });
     }
+
+    // KYC gate: an unverified rider can flip themselves OFFLINE freely
+    // (so they can correct a stale "online" state from a prior verified
+    // session) but cannot go online without verification. Mirrors the
+    // brief's hard rule: "Verification gates the entire app — every CTA
+    // (go online, accept, withdraw) is disabled" (§1).
+    if (isAvailable) {
+      const profile = await RiderProfile.findOne({ user: req.userId })
+        .select("verificationStatus isVerified")
+        .lean();
+      if (!profile) {
+        return res.status(404).json({ message: "Rider profile not found" });
+      }
+      const verified =
+        profile.verificationStatus === "verified" || profile.isVerified;
+      if (!verified) {
+        return res.status(403).json({
+          message: "Complete verification before going online.",
+          reason: "kyc-pending",
+        });
+      }
+    }
+
     const profile = await RiderProfile.findOneAndUpdate(
       { user: req.userId },
       { isAvailable },
@@ -472,13 +563,20 @@ async function applyRiderTransition(
       });
     }
 
-    let order: { user: { toString(): string } } | null = null;
+    // SYNC P0 (audit run 1): we need the FULL order doc + the station's
+    // vendorId so the dual-emit helper can fan out to both customer
+    // AND vendor. Previously this used .select("user").lean() and
+    // emitToUser only the customer — vendor + admin saw the order
+    // frozen at "Assigned" through every granular state until manual
+    // refocus. We also $inc version so mobile clients can drop stale
+    // events.
+    let order: import("../models/Order").IOrder | null = null;
     try {
       order = await Order.findByIdAndUpdate(
         delivery.order,
-        { status: toOrderStatus },
-        { new: true }
-      ).select("user").lean();
+        { status: toOrderStatus, $inc: { version: 1 } },
+        { new: true },
+      );
     } catch (orderErr) {
       // Rollback the Delivery write so the two stay in lockstep.
       // Without this, customer sees old status while rider sees new.
@@ -492,12 +590,17 @@ async function applyRiderTransition(
     }
 
     if (order) {
-      const customerId = order.user.toString();
-      emitToUser(customerId, "order:update", {
-        orderId: String(delivery.order),
-        status: toOrderStatus,
-      });
+      // Resolve vendorId for dual-emit. One cheap lookup; the index
+      // on GasStation._id makes it ~sub-ms.
+      const station = await GasStation.findById(order.station)
+        .select("vendorId")
+        .lean();
 
+      // SYNC P0-3: dual-emit to customer + vendor with fullOrder
+      // patch so vendor cache updates without a follow-up GET.
+      emitOrderUpdate(order, station?.vendorId);
+
+      const customerId = order.user.toString();
       // Phase 8 — push parity for customer-facing transitions.
       // High-importance state changes that the customer needs to
       // act on (or that visibly change their screen) get a push;
@@ -618,11 +721,17 @@ router.patch("/deliveries/:id/heading-back", requireAuth, requireRider, async (r
 
 // Arrived — pulled up at the customer's gate. Customer-side this
 // flips Track to `almost-there` and fires the lock-screen push.
+//
+// Accepts BOTH `returning` (LPG-Swap after the refill plant) AND
+// `picked_up` (standard PMS/AGO after collecting from the station).
+// The v7 rider design surfaces an explicit "arrived" step on the
+// standard flow too — picked_up → arrived → awaiting_confirmation —
+// instead of collapsing into the legacy /complete shortcut.
 router.patch("/deliveries/:id/arrived", requireAuth, requireRider, async (req, res) => {
   await applyRiderTransition(
     req.userId,
     req.params.id,
-    ["returning"],
+    ["returning", "picked_up"],
     "arrived",
     "arrived",
     "Arrived",
@@ -1169,16 +1278,42 @@ router.get("/ratings", requireAuth, requireRider, async (req, res) => {
       Rating.countDocuments({ order: { $in: deliveredOrderIds } }),
     ]);
 
-    const avgArr = await Rating.aggregate([
+    // Single $facet query: returns both the running average AND the
+    // 5★ → 1★ count distribution in one round trip. The distribution
+    // drives the bar chart on the rider's Ratings screen; client-side
+    // computation from the loaded page is wrong for paginated lists.
+    const [agg] = await Rating.aggregate([
       { $match: { order: { $in: deliveredOrderIds } } },
-      { $group: { _id: null, avg: { $avg: "$score" } } },
+      {
+        $facet: {
+          avg: [{ $group: { _id: null, value: { $avg: "$score" } } }],
+          distribution: [
+            { $group: { _id: "$score", count: { $sum: 1 } } },
+          ],
+        },
+      },
     ]);
-    const averageScore = avgArr[0]?.avg ?? 0;
+    const averageScore = agg?.avg?.[0]?.value ?? 0;
+    const distMap: Record<number, number> = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+    for (const row of agg?.distribution ?? []) {
+      const bucket = Math.max(1, Math.min(5, Math.round(row._id ?? 0)));
+      distMap[bucket] = row.count ?? 0;
+    }
+    // Returned as a 5-tuple [1★, 2★, 3★, 4★, 5★] count so the client
+    // can index directly without an Object.entries round-trip.
+    const distribution = [
+      distMap[1],
+      distMap[2],
+      distMap[3],
+      distMap[4],
+      distMap[5],
+    ];
 
     res.json({
       ratings,
       total,
       averageScore: Math.round(averageScore * 10) / 10,
+      distribution,
       page: pageNum,
       pages: Math.ceil(total / limitNum),
     });
@@ -1220,8 +1355,173 @@ router.post("/rate/:riderId", requireAuth, async (req, res) => {
   }
 });
 
+// ===================== PENDING INVITES (rider-side) =====================
+// An existing rider can have a new RiderInvite minted against their
+// phone by a vendor — we surface those here so the rider can accept or
+// decline from the Profile screen's affiliation card (brief §4.5).
+// `normalizePhone` is shared with the vendor-invite path so a phone
+// stored without a leading `+` still matches.
+router.get("/invites/pending", requireAuth, requireRider, async (req, res) => {
+  try {
+    const user = await User.findById(req.userId).select("phone").lean();
+    const normPhone = normalizePhone(user?.phone);
+    if (!normPhone) return res.json({ invites: [] });
+
+    const invites = await RiderInvite.find({
+      phone: normPhone,
+      status: "pending",
+      expiresAt: { $gt: new Date() },
+    })
+      .populate({ path: "vendor", select: "displayName" })
+      .populate({ path: "station", select: "name address state location" })
+      .sort({ createdAt: -1 })
+      .lean();
+    res.json({ invites });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to fetch pending invites" });
+  }
+});
+
+router.post(
+  "/invites/:id/accept",
+  requireAuth,
+  requireRider,
+  async (req, res) => {
+    try {
+      const user = await User.findById(req.userId).select("phone").lean();
+      const normPhone = normalizePhone(user?.phone);
+      if (!normPhone) {
+        return res.status(400).json({ message: "User has no phone on file" });
+      }
+      const invite = await RiderInvite.findOne({
+        _id: req.params.id,
+        phone: normPhone,
+        status: "pending",
+        expiresAt: { $gt: new Date() },
+      });
+      if (!invite) {
+        return res.status(404).json({ message: "Invite not found or expired" });
+      }
+      invite.status = "accepted";
+      invite.acceptedBy = new mongoose.Types.ObjectId(req.userId);
+      invite.acceptedAt = new Date();
+      await invite.save();
+
+      // Set the rider's home station to the invite target. This is the
+      // permissive variant — replaces any prior homeStation. If we ever
+      // want to require explicit "leave first", add a guard here.
+      await RiderProfile.findOneAndUpdate(
+        { user: req.userId },
+        { $set: { homeStation: invite.station } },
+      );
+      res.json({ message: "Invite accepted", invite });
+    } catch (err) {
+      res.status(500).json({ message: "Failed to accept invite" });
+    }
+  },
+);
+
+router.post(
+  "/invites/:id/decline",
+  requireAuth,
+  requireRider,
+  async (req, res) => {
+    try {
+      const user = await User.findById(req.userId).select("phone").lean();
+      const normPhone = normalizePhone(user?.phone);
+      if (!normPhone) {
+        return res.status(400).json({ message: "User has no phone on file" });
+      }
+      // Decline reuses the existing `revoked` status — the
+      // RiderInvite schema doesn't carry a separate "declined" state
+      // and the vendor-side UI treats revoked + declined identically.
+      const invite = await RiderInvite.findOneAndUpdate(
+        {
+          _id: req.params.id,
+          phone: normPhone,
+          status: "pending",
+        },
+        { $set: { status: "revoked" } },
+        { new: true },
+      );
+      if (!invite) {
+        return res.status(404).json({ message: "Invite not found" });
+      }
+      res.json({ message: "Invite declined", invite });
+    } catch (err) {
+      res.status(500).json({ message: "Failed to decline invite" });
+    }
+  },
+);
+
+// ===================== LEAVE VENDOR (clear home station) =====================
+// Rider drops their affiliation to a vendor. Soft action — does NOT
+// scrub them from the vendor's delivery-history-derived roster, which
+// keeps showing them for 30 days. The brief surfaces that nuance in
+// the confirmation modal copy on the client.
+router.delete("/affiliation", requireAuth, requireRider, async (req, res) => {
+  try {
+    const profile = await RiderProfile.findOneAndUpdate(
+      { user: req.userId },
+      { $unset: { homeStation: "" } },
+      { new: true }
+    );
+    if (!profile) return res.status(404).json({ message: "Rider profile not found" });
+    res.json({ message: "Affiliation cleared", profile });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to clear affiliation" });
+  }
+});
+
+// ===================== PAYOUT HISTORY =====================
+// Separate from /earnings — Payout screen shows withdrawals (Paystack
+// transfers out), not the per-delivery earnings rows. Sourced from the
+// Withdrawal collection which lives in lockstep with the Paystack
+// transfer lifecycle (pending → processing → approved/failed).
+router.get("/payouts", requireAuth, requireRider, async (req, res) => {
+  try {
+    const { page = "1", limit = "20" } = req.query as Record<string, string>;
+    const pageNum = Math.max(1, parseInt(page, 10));
+    const limitNum = Math.min(50, Math.max(1, parseInt(limit, 10)));
+    const skip = (pageNum - 1) * limitNum;
+
+    const [payouts, total] = await Promise.all([
+      Withdrawal.find({ user: req.userId, role: "rider" })
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limitNum)
+        .lean(),
+      Withdrawal.countDocuments({ user: req.userId, role: "rider" }),
+    ]);
+
+    res.json({
+      payouts,
+      total,
+      page: pageNum,
+      pages: Math.ceil(total / limitNum),
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to fetch payout history" });
+  }
+});
+
 // ===================== PUBLIC RIDER INFO (for customer tracking screen) =====================
-// Returns limited public info about a rider — name, vehicle, rating, phone.
+// Returns limited public info about a rider.
+//
+// SECURITY P0 (audit run 5): pre-fix, any authenticated user could
+// enumerate every rider's phone by iterating /public/<riderId>. The
+// 100/min apiLimiter is per-user, not per-rider-ID, so bulk enumeration
+// was trivial. The phone-visibility gate from orders.ts:433-447 is now
+// applied here: phone is only included when the caller has an active
+// order with this rider in a phone-visible state (or is admin).
+const PHONE_VISIBLE_STATUSES = new Set([
+  "picked_up",
+  "in-transit",
+  "arrived",
+  "dispensing",
+  "awaiting_confirmation",
+]);
+
 router.get("/public/:riderId", requireAuth, async (req, res) => {
   try {
     const [profile, user] = await Promise.all([
@@ -1229,19 +1529,35 @@ router.get("/public/:riderId", requireAuth, async (req, res) => {
         .select("vehicleType vehiclePlate vehicleBrand rating")
         .lean(),
       User.findById(req.params.riderId)
-        .select("displayName phone profileImage")
+        .select("displayName phone profileImage role")
         .lean(),
     ]);
     if (!profile || !user) return res.status(404).json({ message: "Rider not found" });
+
+    // Phone-visibility gate. Admin always sees phone. Otherwise the
+    // caller must have an Order where {user=caller, riderId=requested}
+    // in a phone-visible status.
+    const caller = await User.findById(req.userId).select("role").lean();
+    let phoneVisible = caller?.role === "admin";
+    if (!phoneVisible) {
+      const matchingOrder = await Order.findOne({
+        user: req.userId,
+        riderId: req.params.riderId,
+        status: { $in: Array.from(PHONE_VISIBLE_STATUSES) },
+      }).select("_id").lean();
+      phoneVisible = Boolean(matchingOrder);
+    }
+
     res.json({
       displayName: user.displayName,
-      phone: user.phone,
+      phone: phoneVisible ? user.phone : undefined,
       profileImage: user.profileImage,
       vehicleType: profile.vehicleType,
       vehiclePlate: profile.vehiclePlate,
       rating: profile.rating,
     });
   } catch (err) {
+    console.error("[rider/public]", err);
     res.status(500).json({ message: "Failed to fetch rider info" });
   }
 });

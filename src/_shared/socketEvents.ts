@@ -134,4 +134,13 @@ export interface ActiveOrderSetPayload {
 export const Rooms = {
   user: (userId: string) => `user:${userId}`,
   delivery: (deliveryId: string) => `delivery:${deliveryId}`,
+  /**
+   * P1-3 (audit run 1): canonical `admin` broadcast room. Every
+   * authenticated admin socket joins this room on connect (see
+   * `socket.ts` connection handler). Ops events that need ALL admins
+   * notified — `dispute:opened`, `withdrawal:failed`, `reconcile:drift`,
+   * `verification:submitted` — fan out here instead of being emitted
+   * per-user.
+   */
+  admin: "admin",
 } as const;

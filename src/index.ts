@@ -40,6 +40,33 @@ const PROD_REQUIRED_ENV_VARS = [
 ];
 
 /**
+ * Paystack credentials. Required in production but the file accepts
+ * either the legacy single-key (PAYSTACK_SECRET_KEY) or the explicit
+ * test/live pair. We assert at boot that at least one valid pairing
+ * exists in production — see assertPaystackKeys() below.
+ *
+ * SECURITY P0 (audit run 5): without this gate, a prod deploy with no
+ * Paystack key boots successfully and every payment request fails at
+ * runtime with an opaque 500 (or worse — webhook verification would
+ * fail open, since the secret used for HMAC would be "").
+ */
+function assertPaystackKeysInProd() {
+  if (process.env.NODE_ENV !== "production") return;
+  const secret =
+    process.env.PAYSTACK_SECRET_KEY_LIVE ?? process.env.PAYSTACK_SECRET_KEY;
+  const pub =
+    process.env.PAYSTACK_PUBLIC_KEY_LIVE ?? process.env.PAYSTACK_PUBLIC_KEY;
+  if (!secret || !pub) {
+    throw new Error(
+      "Paystack production keys missing: need PAYSTACK_SECRET_KEY_LIVE " +
+        "(or PAYSTACK_SECRET_KEY) AND PAYSTACK_PUBLIC_KEY_LIVE (or " +
+        "PAYSTACK_PUBLIC_KEY). Refusing to boot — payment provider is " +
+        "a launch-blocker feature, not optional.",
+    );
+  }
+}
+
+/**
  * Hard kill-switch date for the prod dev-OTP soft-launch bypass.
  * After this date the server REFUSES to boot when
  * ALLOW_DEV_OTP_IN_PROD=true in production. Buys us a known cliff
@@ -64,6 +91,10 @@ function validateEnv() {
       `Missing required environment variables: ${missing.join(", ")}`
     );
   }
+
+  // Paystack keys are required in prod (asserted separately because the
+  // pairing is "EITHER legacy key OR test/live pair").
+  assertPaystackKeysInProd();
 
   // SECURITY A1 — hard cliff on the prod dev-OTP bypass. If the
   // operator hasn't replaced ALLOW_DEV_OTP_IN_PROD with real WA

@@ -2,7 +2,7 @@ import Wallet from "../models/Wallet";
 import Notification from "../models/Notification";
 import User from "../models/User";
 import { fetchBalance } from "../utils/paystack";
-import { emitToUser } from "../socket";
+import { emitToUser, emitToAdmins } from "../socket";
 
 /**
  * Nightly reconciliation: compare Paystack's NGN balance against the
@@ -72,12 +72,16 @@ export async function reconcileWallets(): Promise<{
       } catch {
         // best-effort
       }
-      emitToUser(a._id.toString(), "reconcile:drift", {
-        paystackBalanceNgn,
-        walletSumNgn,
-        driftNgn,
-      });
     }
+    // P1-3: single fan-out to the admin broadcast room replaces the
+    // per-admin loop. Notification rows still go per-user above so
+    // the inbox surfaces it; the live banner uses the room emit.
+    emitToAdmins("reconcile:drift", {
+      paystackBalanceNgn,
+      walletSumNgn,
+      driftNgn,
+      detectedAt: new Date().toISOString(),
+    });
   } else {
     console.log(
       `[reconcile] OK — Paystack ₦${paystackBalanceNgn.toLocaleString()} vs wallets ₦${walletSumNgn.toLocaleString()} (drift ₦${driftNgn})`

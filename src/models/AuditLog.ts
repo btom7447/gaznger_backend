@@ -11,15 +11,25 @@ export type AuditAction =
   | "user.deactivate"
   | "user.verify"
   | "user.reject"
+  | "user.role_change"
   | "user.message"
   | "user.withdrawal_hold.set"
   | "user.withdrawal_hold.clear"
   | "order.refund"
+  | "order.refund-retry"
   | "withdrawal.approve"
   | "withdrawal.reject"
+  | "withdrawal.retry"
   | "dispute.resolve"
   | "dispute.reject"
-  | "earning.force_settle";
+  | "dispute.refund-retry"
+  | "earning.force_settle"
+  | "rider.force_offline"
+  | "rider.force_online"
+  | "station.verify"
+  | "station.unverify"
+  | "station.active.set"
+  | "station.active.clear";
 
 export interface IAuditLog extends Document {
   actor: mongoose.Types.ObjectId;       // admin user id
@@ -46,15 +56,25 @@ const AuditLogSchema: Schema<IAuditLog> = new Schema(
         "user.deactivate",
         "user.verify",
         "user.reject",
+        "user.role_change",
         "user.message",
         "user.withdrawal_hold.set",
         "user.withdrawal_hold.clear",
         "order.refund",
+        "order.refund-retry",
         "withdrawal.approve",
         "withdrawal.reject",
+        "withdrawal.retry",
         "dispute.resolve",
         "dispute.reject",
+        "dispute.refund-retry",
         "earning.force_settle",
+        "rider.force_offline",
+        "rider.force_online",
+        "station.verify",
+        "station.unverify",
+        "station.active.set",
+        "station.active.clear",
       ],
       required: true,
     },

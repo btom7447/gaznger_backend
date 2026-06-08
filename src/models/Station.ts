@@ -87,5 +87,11 @@ const GasStationSchema: Schema = new Schema(
 
 GasStationSchema.index({ state: 1, lga: 1 });
 GasStationSchema.index({ name: "text", address: "text" });
+// PERF P0 (audit run 6): every vendor dashboard render queries
+// {vendorId} without this index → full-collection scan that scales
+// with total stations across all vendors, not the vendor's own slice.
+// /vendor/today fans out to ~50 unindexed scans per dashboard load.
+GasStationSchema.index({ vendorId: 1 });
+GasStationSchema.index({ vendorId: 1, verified: 1 });
 
 export default mongoose.model<IGasStation>("GasStation", GasStationSchema);
