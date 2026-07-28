@@ -27,6 +27,7 @@ import walletRoutes from "./routes/wallet";
 import disputeRoutes from "./routes/disputes";
 import chatRoutes from "./routes/chats";
 import supportRoutes from "./routes/support";
+import waitlistRoutes from "./routes/waitlist";
 
 import { startCronJobs } from "./jobs";
 import { errorHandler } from "./middleware/errorHandler";
@@ -202,6 +203,12 @@ const apiLimiter = rateLimit({
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", uptime: process.uptime() });
 });
+
+// Public pre-launch waitlist (marketing site). Mounted BEFORE the
+// edge-state gate: the marketing site must keep collecting signups even
+// while the app platform is in a maintenance window. Carries its own
+// strict per-IP limiter inside the route file.
+app.use("/api/waitlist", waitlistRoutes);
 
 // Edge-state gate (maintenance + force-update). Runs after /health so
 // admin tooling can still ping during maintenance windows. Routes after
